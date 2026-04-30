@@ -141,9 +141,16 @@ class ITSELF(nn.Module):
         ).to(dtype=prototype_dtype)                          # [B, D]
         # Fuse prototype query with text representation
         fused = torch.cat([t_context, prototype_query], dim=-1)         # [B, 2D]
-        fusion_dtype = next(self.prototype_fusion.parameters()).dtype
-        if fused.dtype != fusion_dtype:
-            fused = fused.to(dtype=fusion_dtype)
+
+        # Keep all layers inside prototype_fusion on one dtype to avoid
+        # Linear/LayerNorm mixed precision mismatch (Half vs Float).
+        fusion_dtype = prototype_dtype
+        for p in self.prototype_fusion.parameters():
+            if p.dtype != fusion_dtype:
+                self.prototype_fusion = self.prototype_fusion.to(dtype=fusion_dtype)
+                break
+        fused = fused.to(dtype=fusion_dtype)
+
         t_feats_enriched = self.prototype_fusion(fused)                 # [B, D]
         if t_feats_enriched.dtype != original_dtype:
             t_feats_enriched = t_feats_enriched.to(dtype=original_dtype)
