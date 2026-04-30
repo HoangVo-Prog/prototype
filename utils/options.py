@@ -18,6 +18,12 @@ def get_args():
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
     parser.add_argument("--finetune", type=str, default="")
     parser.add_argument("--pretrain", type=str, default="")
+    parser.add_argument("--seed", type=int, default=1, help="base random seed")
+    parser.add_argument("--strict_deterministic", dest="strict_deterministic", action="store_true",
+                        help="enable strict deterministic behavior for CUDA/cuDNN and torch ops")
+    parser.add_argument("--no_strict_deterministic", dest="strict_deterministic", action="store_false",
+                        help="disable strict deterministic behavior")
+    parser.set_defaults(strict_deterministic=True)
 
 
     ######################## model general settings ########################

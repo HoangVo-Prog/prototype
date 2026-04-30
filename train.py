@@ -1,5 +1,7 @@
 import os
 import os.path as op
+# Ensure deterministic cuBLAS kernels when CUDA is used.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import torch
 import numpy as np
 import random
@@ -17,18 +19,27 @@ from utils.comm import get_rank, synchronize
 import warnings
 warnings.filterwarnings("ignore")
 
-def set_seed(seed=1):
+def set_seed(seed=1, strict_deterministic=True):
+    os.environ["PYTHONHASHSEED"] = str(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = strict_deterministic
+    torch.backends.cudnn.benchmark = not strict_deterministic
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    if strict_deterministic:
+        torch.use_deterministic_algorithms(True)
+    else:
+        torch.use_deterministic_algorithms(False)
 
 if __name__ == '__main__':
     args = get_args()
-    set_seed(1+get_rank())
+    local_seed = args.seed + get_rank()
+    set_seed(local_seed, strict_deterministic=args.strict_deterministic)
     name = "ITSELF"
 
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
@@ -45,6 +56,10 @@ if __name__ == '__main__':
     logger = setup_logger('ITSELF', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
     logger.info("Using {} GPUs".format(num_gpus))
     logger.info(str(args).replace(',', '\n'))
+    logger.info(
+        f"Deterministic mode: strict={args.strict_deterministic}, seed={local_seed}, "
+        f"cudnn.benchmark={torch.backends.cudnn.benchmark}"
+    )
     save_train_configs(args.output_dir, args)
     if not os.path.isdir(args.output_dir+'/img'):
         os.makedirs(args.output_dir+'/img')

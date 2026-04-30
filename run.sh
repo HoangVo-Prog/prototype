@@ -6,6 +6,8 @@ python3 train.py \
 --dataset_name $DATASET_NAME \
 --loss_names 'tal+cid' \
 --num_epoch 15 \
+--seed 1 \
+--strict_deterministic \
 --return_all \
 --topk_type 'custom' \
 --modify_k
