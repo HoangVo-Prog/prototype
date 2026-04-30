@@ -87,6 +87,8 @@ def get_args():
                         help="Minimum temperature tau; inference phase approaches argmax selection")
     parser.add_argument("--prototype_total_steps", type=int, default=10 * 145,
                         help="Total training steps over which tau linearly decays from tau_init to tau_min")
+    parser.add_argument("--prototype_precision", type=str, default="fp32", choices=["fp32", "fp16"],
+                        help="Computation precision for prototype module and fusion path")
     
     args = parser.parse_args()
     return args

@@ -6,8 +6,7 @@ python3 train.py \
 --dataset_name $DATASET_NAME \
 --loss_names 'tal+cid' \
 --num_epoch 60 \
---only_global \
 --return_all \
 --topk_type 'custom' \
 --modify_k
-
+# --only_global \

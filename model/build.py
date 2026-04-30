@@ -102,6 +102,7 @@ class ITSELF(nn.Module):
             tau_min=getattr(args, 'prototype_tau_min', 0.05),
             total_steps=prototype_total_steps,
         )
+        self.prototype_precision = getattr(args, 'prototype_precision', 'fp32').lower()
         # Fusion layer: combines text repr with prototype query
         # Input: [t_feats || prototype_query]  ->  Output: embed_dim
         self.prototype_fusion = nn.Sequential(
@@ -124,17 +125,28 @@ class ITSELF(nn.Module):
         """
         Enrich global text features with a visual prototype query.
         """
-        # Cast to float32 for prototype computation
-        i_context = i_feats.float()
+        original_dtype = t_feats.dtype
+        if self.prototype_precision == 'fp16':
+            prototype_dtype = torch.float16
+        else:
+            prototype_dtype = torch.float32
+
+        i_context = i_feats.to(dtype=prototype_dtype)
+        t_context = t_feats.to(dtype=prototype_dtype)
         # Prototype module produces soft/hard query from visual meta matrix
         prototype_query = self.prototype_module(
             visual_context=i_context,
             training=training,
             current_step=current_step,
-        )                                                    # [B, D]
+        ).to(dtype=prototype_dtype)                          # [B, D]
         # Fuse prototype query with text representation
-        fused = torch.cat([t_feats.float(), prototype_query], dim=-1)   # [B, 2D]
+        fused = torch.cat([t_context, prototype_query], dim=-1)         # [B, 2D]
+        fusion_dtype = next(self.prototype_fusion.parameters()).dtype
+        if fused.dtype != fusion_dtype:
+            fused = fused.to(dtype=fusion_dtype)
         t_feats_enriched = self.prototype_fusion(fused)                 # [B, D]
+        if t_feats_enriched.dtype != original_dtype:
+            t_feats_enriched = t_feats_enriched.to(dtype=original_dtype)
         return t_feats_enriched
   
     def _set_task(self):
