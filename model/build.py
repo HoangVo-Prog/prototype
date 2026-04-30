@@ -3,7 +3,8 @@ from model import objectives
 from .clip_model import Transformer, LayerNorm, build_CLIP_from_openai_pretrained, convert_weights,tokenize
 import torch
 import torch.nn as nn
-from .grab import TexualEmbeddingLayer, VisualEmbeddingLayer, VisualPrototypeModule
+from .grab import TexualEmbeddingLayer, VisualEmbeddingLayer
+from .prototype import VisualPrototypeModule
 from torch.cuda.amp import autocast
 
 
