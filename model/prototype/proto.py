@@ -9,13 +9,15 @@ class VisualPrototypeModule(nn.Module):
 
     def __init__(self, num_prototypes: int = 64, embed_dim: int = 512,
                  tau_init: float = 1.0, tau_min: float = 0.05,
-                 total_steps: int = 10 * 145):
+                 total_steps: int = 10 * 145,
+                 use_parameter_free_self_attention: bool = True):
         super().__init__()
         self.num_prototypes = num_prototypes
         self.embed_dim = embed_dim
         self.tau_min = tau_min
         self.tau_init = tau_init
         self.total_steps = total_steps
+        self.use_parameter_free_self_attention = use_parameter_free_self_attention
 
         # Learnable visual meta matrix  Q ∈ R^{N x D}
         self.visual_meta_matrix = nn.Parameter(
@@ -43,6 +45,8 @@ class VisualPrototypeModule(nn.Module):
         Returns Q* ∈ R^{N x D}.
         """
         Q = self.visual_meta_matrix                   # [N, D]
+        if not self.use_parameter_free_self_attention:
+            return Q
         QQT = torch.mm(Q, Q.t())                      # [N, N]
         Q_star = torch.mm(QQT, Q)                     # [N, D]
         return Q_star

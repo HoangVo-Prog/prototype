@@ -95,12 +95,15 @@ class ITSELF(nn.Module):
                 self.texual_emb_layer = TexualEmbeddingLayer(ratio=args.select_ratio)
 
         prototype_total_steps = getattr(args, 'prototype_total_steps', 10 * 145)
+        self.use_prototype = getattr(args, 'use_prototype', True)
+        self.use_parameter_free_self_attention = getattr(args, 'use_parameter_free_self_attention', True)
         self.prototype_module = VisualPrototypeModule(
             num_prototypes=getattr(args, 'num_prototypes', 64),
             embed_dim=self.embed_dim,
             tau_init=getattr(args, 'prototype_tau_init', 1.0),
             tau_min=getattr(args, 'prototype_tau_min', 0.05),
             total_steps=prototype_total_steps,
+            use_parameter_free_self_attention=self.use_parameter_free_self_attention,
         )
         self.prototype_precision = getattr(args, 'prototype_precision', 'fp32').lower()
         # Fusion layer: combines text repr with prototype query
@@ -125,6 +128,9 @@ class ITSELF(nn.Module):
         """
         Enrich global text features with a visual prototype query.
         """
+        if not self.use_prototype:
+            return t_feats
+
         original_dtype = t_feats.dtype
         if self.prototype_precision == 'fp16':
             prototype_dtype = torch.float16

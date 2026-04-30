@@ -89,6 +89,16 @@ def get_args():
                         help="Total training steps over which tau linearly decays from tau_init to tau_min")
     parser.add_argument("--prototype_precision", type=str, default="fp32", choices=["fp32", "fp16"],
                         help="Computation precision for prototype module and fusion path")
+    parser.add_argument("--use_prototype", dest="use_prototype", action="store_true",
+                        help="Enable prototype enrichment for global text features")
+    parser.add_argument("--no_use_prototype", dest="use_prototype", action="store_false",
+                        help="Disable prototype enrichment")
+    parser.set_defaults(use_prototype=False)
+    parser.add_argument("--use_parameter_free_self_attention", dest="use_parameter_free_self_attention", action="store_true",
+                        help="Use parameter-free self-attention Q*=(Q Q^T)Q in prototype module")
+    parser.add_argument("--no_use_parameter_free_self_attention", dest="use_parameter_free_self_attention", action="store_false",
+                        help="Use raw prototype matrix Q directly (no parameter-free self-attention)")
+    parser.set_defaults(use_parameter_free_self_attention=False)
     
     args = parser.parse_args()
     return args
