@@ -97,22 +97,23 @@ class ITSELF(nn.Module):
         prototype_total_steps = getattr(args, 'prototype_total_steps', 10 * 145)
         self.use_prototype = getattr(args, 'use_prototype', True)
         self.use_parameter_free_self_attention = getattr(args, 'use_parameter_free_self_attention', True)
-        self.prototype_module = VisualPrototypeModule(
-            num_prototypes=getattr(args, 'num_prototypes', 64),
-            embed_dim=self.embed_dim,
-            tau_init=getattr(args, 'prototype_tau_init', 1.0),
-            tau_min=getattr(args, 'prototype_tau_min', 0.05),
-            total_steps=prototype_total_steps,
-            use_parameter_free_self_attention=self.use_parameter_free_self_attention,
-        )
         self.prototype_precision = getattr(args, 'prototype_precision', 'fp32').lower()
-        # Fusion layer: combines text repr with prototype query
-        # Input: [t_feats || prototype_query]  ->  Output: embed_dim
-        self.prototype_fusion = nn.Sequential(
-            nn.Linear(2 * self.embed_dim, self.embed_dim),
-            nn.LayerNorm(self.embed_dim),
-            nn.GELU(),
-        )
+        if self.use_prototype:
+            self.prototype_module = VisualPrototypeModule(
+                num_prototypes=getattr(args, 'num_prototypes', 64),
+                embed_dim=self.embed_dim,
+                tau_init=getattr(args, 'prototype_tau_init', 1.0),
+                tau_min=getattr(args, 'prototype_tau_min', 0.05),
+                total_steps=prototype_total_steps,
+                use_parameter_free_self_attention=self.use_parameter_free_self_attention,
+            )
+            # Fusion layer: combines text repr with prototype query
+            # Input: [t_feats || prototype_query]  ->  Output: embed_dim
+            self.prototype_fusion = nn.Sequential(
+                nn.Linear(2 * self.embed_dim, self.embed_dim),
+                nn.LayerNorm(self.embed_dim),
+                nn.GELU(),
+            )
                 
         self.logit_scale = torch.ones([]) * (1 / args.temperature) 
 
