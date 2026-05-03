@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 from datasets.sampler import RandomIdentitySampler
 from datasets.sampler_ddp import RandomIdentitySampler_DDP
 import random
-from utils.comm import get_world_size, get_rank
+from utils.comm import get_world_size
 import numpy as np
 from .bases import ImageDataset, TextDataset, ImageTextDataset
 
@@ -69,12 +69,6 @@ def collate(batch):
     return batch_tensor_dict
 
 
-def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-
 def build_dataloader(args, tranforms=None):
     logger = logging.getLogger("IRRA.dataset")
 
@@ -83,12 +77,7 @@ def build_dataloader(args, tranforms=None):
     if args.dataset_name == 'Flickr' or args.dataset_name == 'MSCOCO':
         args.img_size = (224,224)
     num_classes = len(dataset.train_id_container)
-    seed = getattr(args, "seed", 1) + get_rank()
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    loader_generator = torch.Generator()
-    loader_generator.manual_seed(seed)
+    random.seed(42)
     ds1 = dataset.train
     all_text = []
     all_id = []
@@ -129,8 +118,6 @@ def build_dataloader(args, tranforms=None):
                                               dataset.train, args.batch_size,
                                               args.num_instance),
                                           num_workers=num_workers,
-                                          worker_init_fn=seed_worker,
-                                          generator=loader_generator,
                                           collate_fn=collate)
         elif args.sampler == 'random':
             # TODO add distributed condition
@@ -139,8 +126,6 @@ def build_dataloader(args, tranforms=None):
                                       batch_size=args.batch_size,
                                       shuffle=True,
                                       num_workers=num_workers,
-                                      worker_init_fn=seed_worker,
-                                      generator=loader_generator,
                                       collate_fn=collate)
         else:
             logger.error('unsupported sampler! expected softmax or triplet but got {}'.format(args.sampler))
@@ -156,15 +141,11 @@ def build_dataloader(args, tranforms=None):
         val_img_loader = DataLoader(val_img_set,
                                     batch_size=args.batch_size,
                                     shuffle=False,
-                                    num_workers=num_workers,
-                                    worker_init_fn=seed_worker,
-                                    generator=loader_generator)
+                                    num_workers=num_workers)
         val_txt_loader = DataLoader(val_txt_set,
                                     batch_size=args.batch_size,
                                     shuffle=False,
-                                    num_workers=num_workers,
-                                    worker_init_fn=seed_worker,
-                                    generator=loader_generator)
+                                    num_workers=num_workers)
 
         return train_loader, val_img_loader, val_txt_loader, num_classes
 
@@ -186,15 +167,11 @@ def build_dataloader(args, tranforms=None):
         test_img_loader = DataLoader(test_img_set,
                                      batch_size=args.test_batch_size,
                                      shuffle=False,
-                                     num_workers=num_workers,
-                                     worker_init_fn=seed_worker,
-                                     generator=loader_generator)
+                                     num_workers=num_workers)
         test_txt_loader = DataLoader(test_txt_set,
                                      batch_size=args.test_batch_size,
                                      shuffle=False,
-                                     num_workers=num_workers,
-                                     worker_init_fn=seed_worker,
-                                     generator=loader_generator)
+                                     num_workers=num_workers)
         test_img_loader.test_img_set = test_img_set
         test_txt_loader.test_txt_set = test_txt_set
         

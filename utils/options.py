@@ -77,8 +77,7 @@ def get_args():
     parser.add_argument("--average_attn_weights", type=bool, default=True)
     parser.add_argument("--modify_k", action='store_true')
 
-
-    ### Prototype Module 
+    ### Prototype Module
     parser.add_argument("--num_prototypes", type=int, default=64,
                         help="N: number of visual prototype vectors in the visual meta matrix")
     parser.add_argument("--prototype_tau_init", type=float, default=1.0,
@@ -99,6 +98,6 @@ def get_args():
     parser.add_argument("--no_use_parameter_free_self_attention", dest="use_parameter_free_self_attention", action="store_false",
                         help="Use raw prototype matrix Q directly (no parameter-free self-attention)")
     parser.set_defaults(use_parameter_free_self_attention=False)
-    
+
     args = parser.parse_args()
     return args

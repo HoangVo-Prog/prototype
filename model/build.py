@@ -37,6 +37,23 @@ def weights_init_classifier(m):
         if m.bias:
             nn.init.constant_(m.bias, 0.0)
 
+
+def build_prototype_module(args, embed_dim):
+    """
+    Phase-2 scaffolding only: constructor hook for the prototype module.
+    This path is intentionally not connected to model forward behavior yet.
+    """
+    prototype_total_steps = getattr(args, 'prototype_total_steps', 10 * 145)
+    use_parameter_free_self_attention = getattr(args, 'use_parameter_free_self_attention', True)
+    return VisualPrototypeModule(
+        num_prototypes=getattr(args, 'num_prototypes', 64),
+        embed_dim=embed_dim,
+        tau_init=getattr(args, 'prototype_tau_init', 1.0),
+        tau_min=getattr(args, 'prototype_tau_min', 0.05),
+        total_steps=prototype_total_steps,
+        use_parameter_free_self_attention=use_parameter_free_self_attention,
+    )
+
 class TextEncoder(nn.Module):
     def __init__(self, clip_model):
         super().__init__()
@@ -94,41 +111,19 @@ class ITSELF(nn.Module):
                 self.visul_emb_layer = VisualEmbeddingLayer(ratio=args.select_ratio)
                 self.texual_emb_layer = TexualEmbeddingLayer(ratio=args.select_ratio)
 
-        prototype_total_steps = getattr(args, 'prototype_total_steps', 10 * 145)
-        self.use_prototype = getattr(args, 'use_prototype', True)
-        self.use_parameter_free_self_attention = getattr(args, 'use_parameter_free_self_attention', True)
+        self.use_prototype = getattr(args, 'use_prototype', False)
         self.prototype_precision = getattr(args, 'prototype_precision', 'fp32').lower()
         if self.use_prototype:
-            self.prototype_module = VisualPrototypeModule(
-                num_prototypes=getattr(args, 'num_prototypes', 64),
-                embed_dim=self.embed_dim,
-                tau_init=getattr(args, 'prototype_tau_init', 1.0),
-                tau_min=getattr(args, 'prototype_tau_min', 0.05),
-                total_steps=prototype_total_steps,
-                use_parameter_free_self_attention=self.use_parameter_free_self_attention,
-            )
-            # Fusion layer: combines text repr with prototype query
-            # Input: [t_feats || prototype_query]  ->  Output: embed_dim
+            self.prototype_module = build_prototype_module(args, self.embed_dim)
             self.prototype_fusion = nn.Sequential(
                 nn.Linear(2 * self.embed_dim, self.embed_dim),
                 nn.LayerNorm(self.embed_dim),
                 nn.GELU(),
             )
-                
+
         self.logit_scale = torch.ones([]) * (1 / args.temperature) 
 
-    
-    # ------------------------------------------------------------------
-    # Prototype-enriched text representation
-    # ------------------------------------------------------------------
-    def apply_prototype(self,
-                        t_feats: torch.Tensor,
-                        i_feats: torch.Tensor,
-                        training: bool = True,
-                        current_step: int = None) -> torch.Tensor:
-        """
-        Enrich global text features with a visual prototype query.
-        """
+    def apply_prototype(self, t_feats, i_feats, training=True, current_step=None):
         if not self.use_prototype:
             return t_feats
 
@@ -140,29 +135,25 @@ class ITSELF(nn.Module):
 
         i_context = i_feats.to(dtype=prototype_dtype)
         t_context = t_feats.to(dtype=prototype_dtype)
-        # Prototype module produces soft/hard query from visual meta matrix
         prototype_query = self.prototype_module(
             visual_context=i_context,
             training=training,
             current_step=current_step,
-        ).to(dtype=prototype_dtype)                          # [B, D]
-        # Fuse prototype query with text representation
-        fused = torch.cat([t_context, prototype_query], dim=-1)         # [B, 2D]
+        ).to(dtype=prototype_dtype)
+        fused = torch.cat([t_context, prototype_query], dim=-1)
 
-        # Keep all layers inside prototype_fusion on one dtype to avoid
-        # Linear/LayerNorm mixed precision mismatch (Half vs Float).
         fusion_dtype = prototype_dtype
-        for p in self.prototype_fusion.parameters():
-            if p.dtype != fusion_dtype:
+        for param in self.prototype_fusion.parameters():
+            if param.dtype != fusion_dtype:
                 self.prototype_fusion = self.prototype_fusion.to(dtype=fusion_dtype)
                 break
         fused = fused.to(dtype=fusion_dtype)
 
-        t_feats_enriched = self.prototype_fusion(fused)                 # [B, D]
+        t_feats_enriched = self.prototype_fusion(fused)
         if t_feats_enriched.dtype != original_dtype:
             t_feats_enriched = t_feats_enriched.to(dtype=original_dtype)
         return t_feats_enriched
-  
+
     def _set_task(self):
         loss_names = self.args.loss_names
         self.current_task = [l.strip() for l in loss_names.split('+')]
@@ -255,6 +246,12 @@ class ITSELF(nn.Module):
             image_feats, atten_i, text_feats, atten_t = self.base_model(images, caption_ids, return_all=True, average_attn_weights = self.args.average_attn_weights)
             i_feats = image_feats[:, 0, :].float()
             t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
+            t_feats = self.apply_prototype(
+                t_feats=t_feats,
+                i_feats=i_feats,
+                training=self.training,
+                current_step=current_step,
+            )
             if self.args.topk_type == 'mean':
                 atten_i = torch.stack(atten_i, dim=0)
                 atten_t = torch.stack(atten_t, dim=0)
@@ -305,19 +302,15 @@ class ITSELF(nn.Module):
             i_feats = image_feats[:, 0, :].float()
             # i_feats = image_feats.float() # for CLIP ResNet visual model
             t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
+            t_feats = self.apply_prototype(
+                t_feats=t_feats,
+                i_feats=i_feats,
+                training=self.training,
+                current_step=current_step,
+            )
             if not self.args.only_global:
                 i_grab_f = self.visul_emb_layer(image_feats, atten_i)
                 t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
-
-        # ------------------------------------------------------------------
-        # Prototype Module: enrich global text features with visual
-        is_training = self.training
-        t_feats = self.apply_prototype(
-            t_feats=t_feats,
-            i_feats=i_feats,
-            training=is_training,
-            current_step=current_step,
-        )
 
         if 'cid' in self.current_task:
             S = objectives.cosine_similarity_matrix(i_feats, t_feats)
