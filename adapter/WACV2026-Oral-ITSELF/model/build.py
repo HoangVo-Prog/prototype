@@ -112,6 +112,7 @@ class ITSELF(nn.Module):
                 self.texual_emb_layer = TexualEmbeddingLayer(ratio=args.select_ratio)
 
         self.use_prototype = getattr(args, 'use_prototype', False)
+        self.prototype_precision = getattr(args, 'prototype_precision', 'fp32').lower()
         if self.use_prototype:
             self.prototype_module = build_prototype_module(args, self.embed_dim)
             self.prototype_fusion = nn.Sequential(
@@ -126,13 +127,32 @@ class ITSELF(nn.Module):
         if not self.use_prototype:
             return t_feats
 
+        original_dtype = t_feats.dtype
+        if self.prototype_precision == 'fp16':
+            prototype_dtype = torch.float16
+        else:
+            prototype_dtype = torch.float32
+
+        i_context = i_feats.to(dtype=prototype_dtype)
+        t_context = t_feats.to(dtype=prototype_dtype)
         prototype_query = self.prototype_module(
-            visual_context=i_feats.float(),
+            visual_context=i_context,
             training=training,
             current_step=current_step,
-        )
-        fused = torch.cat([t_feats.float(), prototype_query.float()], dim=-1)
-        return self.prototype_fusion(fused).to(dtype=t_feats.dtype)
+        ).to(dtype=prototype_dtype)
+        fused = torch.cat([t_context, prototype_query], dim=-1)
+
+        fusion_dtype = prototype_dtype
+        for param in self.prototype_fusion.parameters():
+            if param.dtype != fusion_dtype:
+                self.prototype_fusion = self.prototype_fusion.to(dtype=fusion_dtype)
+                break
+        fused = fused.to(dtype=fusion_dtype)
+
+        t_feats_enriched = self.prototype_fusion(fused)
+        if t_feats_enriched.dtype != original_dtype:
+            t_feats_enriched = t_feats_enriched.to(dtype=original_dtype)
+        return t_feats_enriched
 
     def _set_task(self):
         loss_names = self.args.loss_names
