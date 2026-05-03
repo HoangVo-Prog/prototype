@@ -1,5 +1,7 @@
 import os
 import os.path as op
+import subprocess
+import sys
 import torch
 import numpy as np
 import random
@@ -28,6 +30,26 @@ def set_seed(seed=1):
 
 if __name__ == '__main__':
     args = get_args()
+    if args.nohup and os.environ.get("NOHUP_RELAUNCHED") != "1":
+        filtered_argv = [arg for arg in sys.argv[1:] if arg != "--nohup"]
+        cmd = ["nohup", sys.executable, "train.py", *filtered_argv]
+        env = os.environ.copy()
+        env["NOHUP_RELAUNCHED"] = "1"
+        os.makedirs("logs", exist_ok=True)
+        nohup_log_path = op.join("logs", f"{time.strftime('%Y-%d-%H-%M', time.localtime())}.out")
+        with open(nohup_log_path, "ab") as nohup_log:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=nohup_log,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                env=env,
+                close_fds=True,
+                start_new_session=True,
+            )
+        print(f"Started background training with PID {proc.pid}. Logs: {nohup_log_path}")
+        sys.exit(0)
+
     set_seed(1+get_rank())
     name = "ITSELF"
 
