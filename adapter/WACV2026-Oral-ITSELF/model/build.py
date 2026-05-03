@@ -4,6 +4,7 @@ from .clip_model import Transformer, LayerNorm, build_CLIP_from_openai_pretraine
 import torch
 import torch.nn as nn
 from .grab import TexualEmbeddingLayer, VisualEmbeddingLayer
+from .prototype import VisualPrototypeModule
 from torch.cuda.amp import autocast
 
 
@@ -35,6 +36,23 @@ def weights_init_classifier(m):
         nn.init.normal_(m.weight, std=0.001)
         if m.bias:
             nn.init.constant_(m.bias, 0.0)
+
+
+def build_prototype_module(args, embed_dim):
+    """
+    Phase-2 scaffolding only: constructor hook for the prototype module.
+    This path is intentionally not connected to model forward behavior yet.
+    """
+    prototype_total_steps = getattr(args, 'prototype_total_steps', 10 * 145)
+    use_parameter_free_self_attention = getattr(args, 'use_parameter_free_self_attention', True)
+    return VisualPrototypeModule(
+        num_prototypes=getattr(args, 'num_prototypes', 64),
+        embed_dim=embed_dim,
+        tau_init=getattr(args, 'prototype_tau_init', 1.0),
+        tau_min=getattr(args, 'prototype_tau_min', 0.05),
+        total_steps=prototype_total_steps,
+        use_parameter_free_self_attention=use_parameter_free_self_attention,
+    )
 
 class TextEncoder(nn.Module):
     def __init__(self, clip_model):
