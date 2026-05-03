@@ -110,9 +110,30 @@ class ITSELF(nn.Module):
                 nn.init.constant_(self.classifier_id_grab.bias.data, val=0.0)
                 self.visul_emb_layer = VisualEmbeddingLayer(ratio=args.select_ratio)
                 self.texual_emb_layer = TexualEmbeddingLayer(ratio=args.select_ratio)
-                
+
+        self.use_prototype = getattr(args, 'use_prototype', False)
+        if self.use_prototype:
+            self.prototype_module = build_prototype_module(args, self.embed_dim)
+            self.prototype_fusion = nn.Sequential(
+                nn.Linear(2 * self.embed_dim, self.embed_dim),
+                nn.LayerNorm(self.embed_dim),
+                nn.GELU(),
+            )
+
         self.logit_scale = torch.ones([]) * (1 / args.temperature) 
-  
+
+    def apply_prototype(self, t_feats, i_feats, training=True, current_step=None):
+        if not self.use_prototype:
+            return t_feats
+
+        prototype_query = self.prototype_module(
+            visual_context=i_feats.float(),
+            training=training,
+            current_step=current_step,
+        )
+        fused = torch.cat([t_feats.float(), prototype_query.float()], dim=-1)
+        return self.prototype_fusion(fused).to(dtype=t_feats.dtype)
+
     def _set_task(self):
         loss_names = self.args.loss_names
         self.current_task = [l.strip() for l in loss_names.split('+')]
@@ -205,6 +226,12 @@ class ITSELF(nn.Module):
             image_feats, atten_i, text_feats, atten_t = self.base_model(images, caption_ids, return_all=True, average_attn_weights = self.args.average_attn_weights)
             i_feats = image_feats[:, 0, :].float()
             t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
+            t_feats = self.apply_prototype(
+                t_feats=t_feats,
+                i_feats=i_feats,
+                training=self.training,
+                current_step=current_step,
+            )
             if self.args.topk_type == 'mean':
                 atten_i = torch.stack(atten_i, dim=0)
                 atten_t = torch.stack(atten_t, dim=0)
@@ -255,6 +282,12 @@ class ITSELF(nn.Module):
             i_feats = image_feats[:, 0, :].float()
             # i_feats = image_feats.float() # for CLIP ResNet visual model
             t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
+            t_feats = self.apply_prototype(
+                t_feats=t_feats,
+                i_feats=i_feats,
+                training=self.training,
+                current_step=current_step,
+            )
             if not self.args.only_global:
                 i_grab_f = self.visul_emb_layer(image_feats, atten_i)
                 t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
