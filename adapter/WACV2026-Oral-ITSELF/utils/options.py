@@ -76,6 +76,28 @@ def get_args():
     parser.add_argument("--layer_index", type=int, default=-1, help='which layer attention to use: [0, 11]')
     parser.add_argument("--average_attn_weights", type=bool, default=True)
     parser.add_argument("--modify_k", action='store_true')
-    
+
+    ### Prototype Module
+    parser.add_argument("--num_prototypes", type=int, default=64,
+                        help="N: number of visual prototype vectors in the visual meta matrix")
+    parser.add_argument("--prototype_tau_init", type=float, default=1.0,
+                        help="Initial temperature tau for prototype softmax weighting (decays to tau_min)")
+    parser.add_argument("--prototype_tau_min", type=float, default=0.05,
+                        help="Minimum temperature tau; inference phase approaches argmax selection")
+    parser.add_argument("--prototype_total_steps", type=int, default=10 * 145,
+                        help="Total training steps over which tau linearly decays from tau_init to tau_min")
+    parser.add_argument("--prototype_precision", type=str, default="fp32", choices=["fp32", "fp16"],
+                        help="Computation precision for prototype module and fusion path")
+    parser.add_argument("--use_prototype", dest="use_prototype", action="store_true",
+                        help="Enable prototype enrichment for global text features")
+    parser.add_argument("--no_use_prototype", dest="use_prototype", action="store_false",
+                        help="Disable prototype enrichment")
+    parser.set_defaults(use_prototype=False)
+    parser.add_argument("--use_parameter_free_self_attention", dest="use_parameter_free_self_attention", action="store_true",
+                        help="Use parameter-free self-attention Q*=(Q Q^T)Q in prototype module")
+    parser.add_argument("--no_use_parameter_free_self_attention", dest="use_parameter_free_self_attention", action="store_false",
+                        help="Use raw prototype matrix Q directly (no parameter-free self-attention)")
+    parser.set_defaults(use_parameter_free_self_attention=False)
+
     args = parser.parse_args()
     return args

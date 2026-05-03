@@ -5,7 +5,8 @@ python3 train.py \
 --output_dir 'ITSELF' \
 --dataset_name $DATASET_NAME \
 --loss_names 'tal+cid' \
---num_epoch 60 \
+--num_epoch 15 \
+--batch_size 64 \
 --return_all \
 --topk_type 'custom' \
 --modify_k
