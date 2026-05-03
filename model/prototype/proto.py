@@ -60,7 +60,10 @@ class VisualPrototypeModule(nn.Module):
             self.update_tau(current_step)
 
         q_star = self._compute_query_group()
-        scores = torch.matmul(visual_context, q_star.t()) / self.tau
+        # Keep all prototype ops on a single dtype/device (fp16 path included).
+        q_star = q_star.to(dtype=visual_context.dtype, device=visual_context.device)
+        tau = self.tau.to(dtype=visual_context.dtype, device=visual_context.device)
+        scores = torch.matmul(visual_context, q_star.t()) / tau
         weights = torch.softmax(scores, dim=-1)
 
         if training:
