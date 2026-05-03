@@ -36,7 +36,7 @@ if __name__ == '__main__':
         env = os.environ.copy()
         env["NOHUP_RELAUNCHED"] = "1"
         os.makedirs("logs", exist_ok=True)
-        nohup_log_path = op.join("logs", f"{time.strftime('%Y-%d-%H-%M', time.localtime())}.out")
+        nohup_log_path = op.join("logs", f"{time.strftime('%Y%m%d_%H%M%S', time.localtime())}.log")
         with open(nohup_log_path, "ab") as nohup_log:
             proc = subprocess.Popen(
                 cmd,
