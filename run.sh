@@ -9,5 +9,6 @@ python3 train.py \
 --batch_size 64 \
 --return_all \
 --topk_type 'custom' \
---modify_k
+--modify_k \
+--nohup
 # --only_global 
