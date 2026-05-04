@@ -121,9 +121,39 @@ class Evaluator():
 
     def eval(self, model, i2t_metric=False):
         qfeats, gfeats, qids, gids = self._compute_embedding(model)
-        qfeats = F.normalize(qfeats, p=2, dim=1) # text features
-        gfeats = F.normalize(gfeats, p=2, dim=1) # image features
-        sims_global = qfeats @ gfeats.t()
+        
+        if getattr(model, 'use_prototype', False):
+            device = next(model.parameters()).device
+            gfeats_dev = gfeats.to(device)
+            qfeats_dev = qfeats.to(device)
+            sims_global = torch.zeros((qfeats.size(0), gfeats.size(0)))
+            
+            q_chunk_size = getattr(self.args, 'q_chunk_size', 100)
+            for i in range(0, qfeats.size(0), q_chunk_size):
+                q_chunk = qfeats_dev[i:i+q_chunk_size]
+                B = q_chunk.size(0)
+                
+                g_chunk_size = getattr(self.args, 'g_chunk_size', 1000)
+                for j in range(0, gfeats.size(0), g_chunk_size):
+                    g_chunk = gfeats_dev[j:j+g_chunk_size]
+                    K = g_chunk.size(0)
+                    
+                    q_exp = q_chunk.unsqueeze(1).expand(B, K, -1).reshape(-1, q_chunk.size(-1))
+                    g_exp = g_chunk.unsqueeze(0).expand(B, K, -1).reshape(-1, g_chunk.size(-1))
+                    
+                    with torch.no_grad():
+                        t_enriched = model.apply_prototype(q_exp, g_exp, training=False)
+                    
+                    t_enriched = t_enriched.view(B, K, -1)
+                    t_enriched_norm = F.normalize(t_enriched, p=2, dim=-1)
+                    g_norm = F.normalize(g_chunk, p=2, dim=-1)
+                    
+                    sim = (t_enriched_norm * g_norm.unsqueeze(0)).sum(dim=-1)
+                    sims_global[i:i+B, j:j+K] = sim.cpu()
+        else:
+            qfeats = F.normalize(qfeats, p=2, dim=1) # text features
+            gfeats = F.normalize(gfeats, p=2, dim=1) # image features
+            sims_global = qfeats @ gfeats.t()
 
         if not self.args.only_global:
             vq_feats, vg_feats, _, _ = self._compute_embedding_grab(model)
