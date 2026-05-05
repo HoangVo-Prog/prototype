@@ -31,11 +31,21 @@ class VisualPrototypeModule(nn.Module):
         # Learnable visual meta matrix Q in R^{N x D}
         self.visual_meta_matrix = nn.Parameter(torch.empty(num_prototypes, embed_dim))
         nn.init.uniform_(self.visual_meta_matrix, -0.1, 0.1)
+        
+        if self.prototype_init == "random":
+            nn.init.uniform_(self.visual_meta_matrix, -0.1, 0.1)
+        elif self.prototype_init == "xavier":
+            nn.init.xavier_uniform_(self.visual_meta_matrix)
+        elif self.prototype_init == "kaiming":
+            nn.init.kaiming_uniform_(self.visual_meta_matrix, nonlinearity="relu")
+        elif self.prototype_init == "kmeans":
+            nn.init.uniform_(self.visual_meta_matrix, -0.1, 0.1)
+        else:
+            raise ValueError(f"Unsupported prototype_init: {self.prototype_init}")
 
         self.register_buffer("tau", torch.tensor(tau_init))
         self.register_buffer("_kmeans_initialized", torch.tensor(False, dtype=torch.bool))
-        if self.prototype_init not in {"random", "kmeans"}:
-            raise ValueError(f"Unsupported prototype_init: {self.prototype_init}")
+        
 
     @torch.no_grad()
     def _maybe_kmeans_init(self, visual_context: torch.Tensor):
