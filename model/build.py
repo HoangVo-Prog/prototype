@@ -51,6 +51,7 @@ def build_prototype_module(args, embed_dim):
         tau_init=getattr(args, 'prototype_tau_init', 1.0),
         tau_min=getattr(args, 'prototype_tau_min', 0.05),
         total_steps=prototype_total_steps,
+        prototype_init=getattr(args, 'prototype_init', 'random'),
         use_parameter_free_self_attention=use_parameter_free_self_attention,
         infer_hard_query=getattr(args, 'infer_hard_query', False),
     )

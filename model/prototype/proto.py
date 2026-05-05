@@ -23,6 +23,7 @@ class VisualPrototypeModule(nn.Module):
         self.tau_min = tau_min
         self.tau_init = tau_init
         self.total_steps = total_steps
+        self.prototype_init = prototype_init.lower()
         self.use_parameter_free_self_attention = use_parameter_free_self_attention
         self.infer_hard_query = infer_hard_query
 
@@ -31,6 +32,38 @@ class VisualPrototypeModule(nn.Module):
         nn.init.uniform_(self.visual_meta_matrix, -0.1, 0.1)
 
         self.register_buffer("tau", torch.tensor(tau_init))
+        self.register_buffer("_kmeans_initialized", torch.tensor(False, dtype=torch.bool))
+        if self.prototype_init not in {"random", "kmeans"}:
+            raise ValueError(f"Unsupported prototype_init: {self.prototype_init}")
+
+    @torch.no_grad()
+    def _maybe_kmeans_init(self, visual_context: torch.Tensor):
+        if self.prototype_init != "kmeans" or self._kmeans_initialized.item():
+            return
+        if visual_context.ndim != 2 or visual_context.size(0) == 0:
+            return
+
+        data = visual_context.detach().to(dtype=torch.float32)
+        num_samples = data.size(0)
+        k = self.num_prototypes
+        if num_samples >= k:
+            init_idx = torch.randperm(num_samples, device=data.device)[:k]
+        else:
+            init_idx = torch.randint(0, num_samples, (k,), device=data.device)
+        centers = data[init_idx].clone()
+
+        for _ in range(10):
+            distances = torch.cdist(data, centers, p=2)
+            assign = distances.argmin(dim=1)
+            for i in range(k):
+                members = data[assign == i]
+                if members.numel() > 0:
+                    centers[i] = members.mean(dim=0)
+
+        self.visual_meta_matrix.data.copy_(
+            centers.to(dtype=self.visual_meta_matrix.dtype, device=self.visual_meta_matrix.device)
+        )
+        self._kmeans_initialized.fill_(True)
 
     def update_tau(self, current_step: int):
         """Linearly decay tau from tau_init to tau_min over total_steps."""
@@ -60,6 +93,7 @@ class VisualPrototypeModule(nn.Module):
         """
         if current_step is not None:
             self.update_tau(current_step)
+        self._maybe_kmeans_init(visual_context)
 
         q_star = self._compute_query_group()
         # Keep all prototype ops on a single dtype/device (fp16 path included).
