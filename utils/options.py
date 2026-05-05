@@ -108,6 +108,8 @@ def get_args():
 
     parser.add_argument("--q_chunk_size", type=int, default=100, help="chunk size for text queries during prototype evaluation")
     parser.add_argument("--g_chunk_size", type=int, default=1000, help="chunk size for gallery images during prototype evaluation")
+    parser.add_argument("--pair_chunk_size", type=int, default=32768,
+                        help="micro-batch size for flattened query-gallery pairs during prototype evaluation")
 
     args = parser.parse_args()
     return args

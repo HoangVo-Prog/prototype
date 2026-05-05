@@ -129,6 +129,7 @@ class Evaluator():
             sims_global = torch.zeros((qfeats.size(0), gfeats.size(0)))
             
             q_chunk_size = getattr(self.args, 'q_chunk_size', 100)
+            pair_chunk_size = getattr(self.args, 'pair_chunk_size', 32768)
             for i in range(0, qfeats.size(0), q_chunk_size):
                 q_chunk = qfeats_dev[i:i+q_chunk_size]
                 B = q_chunk.size(0)
@@ -137,18 +138,27 @@ class Evaluator():
                 for j in range(0, gfeats.size(0), g_chunk_size):
                     g_chunk = gfeats_dev[j:j+g_chunk_size]
                     K = g_chunk.size(0)
-                    
+
+                    # Micro-batch prototype enrichment to avoid OOM from full B*K expansion.
                     q_exp = q_chunk.unsqueeze(1).expand(B, K, -1).reshape(-1, q_chunk.size(-1))
                     g_exp = g_chunk.unsqueeze(0).expand(B, K, -1).reshape(-1, g_chunk.size(-1))
-                    
+                    num_pairs = q_exp.size(0)
+
+                    sim_flat = torch.empty(num_pairs, device=device)
+                    g_norm_flat = F.normalize(g_exp, p=2, dim=-1)
+
                     with torch.no_grad():
-                        t_enriched = model.apply_prototype(q_exp, g_exp, training=False)
-                    
-                    t_enriched = t_enriched.view(B, K, -1)
-                    t_enriched_norm = F.normalize(t_enriched, p=2, dim=-1)
-                    g_norm = F.normalize(g_chunk, p=2, dim=-1)
-                    
-                    sim = (t_enriched_norm * g_norm.unsqueeze(0)).sum(dim=-1)
+                        for start in range(0, num_pairs, pair_chunk_size):
+                            end = min(start + pair_chunk_size, num_pairs)
+                            t_enriched = model.apply_prototype(
+                                q_exp[start:end],
+                                g_exp[start:end],
+                                training=False,
+                            )
+                            t_enriched_norm = F.normalize(t_enriched, p=2, dim=-1)
+                            sim_flat[start:end] = (t_enriched_norm * g_norm_flat[start:end]).sum(dim=-1)
+
+                    sim = sim_flat.view(B, K)
                     sims_global[i:i+B, j:j+K] = sim.cpu()
         else:
             qfeats = F.normalize(qfeats, p=2, dim=1) # text features
