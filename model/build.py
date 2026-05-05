@@ -124,24 +124,23 @@ class ITSELF(nn.Module):
 
         self.logit_scale = torch.ones([]) * (1 / args.temperature) 
 
-    def apply_prototype(self, t_feats, i_feats, training=True, current_step=None):
+    def apply_prototype(self, i_feats, training=True, current_step=None):
         if not self.use_prototype:
-            return t_feats
+            return i_feats
 
-        original_dtype = t_feats.dtype
+        original_dtype = i_feats.dtype
         if self.prototype_precision == 'fp16':
             prototype_dtype = torch.float16
         else:
             prototype_dtype = torch.float32
 
         i_context = i_feats.to(dtype=prototype_dtype)
-        t_context = t_feats.to(dtype=prototype_dtype)
         prototype_query = self.prototype_module(
             visual_context=i_context,
             training=training,
             current_step=current_step,
         ).to(dtype=prototype_dtype)
-        fused = torch.cat([t_context, prototype_query], dim=-1)
+        fused = torch.cat([i_context, prototype_query], dim=-1)
 
         fusion_dtype = prototype_dtype
         for param in self.prototype_fusion.parameters():
@@ -150,10 +149,10 @@ class ITSELF(nn.Module):
                 break
         fused = fused.to(dtype=fusion_dtype)
 
-        t_feats_enriched = self.prototype_fusion(fused)
-        if t_feats_enriched.dtype != original_dtype:
-            t_feats_enriched = t_feats_enriched.to(dtype=original_dtype)
-        return t_feats_enriched
+        i_feats_enriched = self.prototype_fusion(fused)
+        if i_feats_enriched.dtype != original_dtype:
+            i_feats_enriched = i_feats_enriched.to(dtype=original_dtype)
+        return i_feats_enriched
 
     def _set_task(self):
         loss_names = self.args.loss_names
@@ -247,8 +246,7 @@ class ITSELF(nn.Module):
             image_feats, atten_i, text_feats, atten_t = self.base_model(images, caption_ids, return_all=True, average_attn_weights = self.args.average_attn_weights)
             i_feats = image_feats[:, 0, :].float()
             t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
-            t_feats = self.apply_prototype(
-                t_feats=t_feats,
+            i_feats = self.apply_prototype(
                 i_feats=i_feats,
                 training=self.training,
                 current_step=current_step,
@@ -303,8 +301,7 @@ class ITSELF(nn.Module):
             i_feats = image_feats[:, 0, :].float()
             # i_feats = image_feats.float() # for CLIP ResNet visual model
             t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
-            t_feats = self.apply_prototype(
-                t_feats=t_feats,
+            i_feats = self.apply_prototype(
                 i_feats=i_feats,
                 training=self.training,
                 current_step=current_step,
