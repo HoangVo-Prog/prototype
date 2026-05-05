@@ -10,5 +10,6 @@ python3 train.py \
 --return_all \
 --topk_type 'custom' \
 --modify_k \
+--infer_hard_query \
 --nohup
 # --only_global 

@@ -85,7 +85,7 @@ def get_args():
     parser.add_argument("--prototype_tau_init", type=float, default=1.0,
                         help="Initial temperature tau for prototype softmax weighting (decays to tau_min)")
     parser.add_argument("--prototype_tau_min", type=float, default=0.05,
-                        help="Minimum temperature tau; inference phase approaches argmax selection")
+                        help="Minimum temperature tau for prototype softmax weighting")
     parser.add_argument("--prototype_total_steps", type=int, default=10 * 145,
                         help="Total training steps over which tau linearly decays from tau_init to tau_min")
     parser.add_argument("--prototype_precision", type=str, default="fp32", choices=["fp32", "fp16"],
@@ -100,6 +100,8 @@ def get_args():
     parser.add_argument("--no_use_parameter_free_self_attention", dest="use_parameter_free_self_attention", action="store_false",
                         help="Use raw prototype matrix Q directly (no parameter-free self-attention)")
     parser.set_defaults(use_parameter_free_self_attention=False)
+    parser.add_argument("--infer_hard_query", action="store_true",
+                        help="Use hard argmax prototype query at inference; default is soft weighted-sum")
 
     parser.add_argument("--q_chunk_size", type=int, default=100, help="chunk size for text queries during prototype evaluation")
     parser.add_argument("--g_chunk_size", type=int, default=1000, help="chunk size for gallery images during prototype evaluation")

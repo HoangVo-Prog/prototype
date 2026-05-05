@@ -52,6 +52,7 @@ def build_prototype_module(args, embed_dim):
         tau_min=getattr(args, 'prototype_tau_min', 0.05),
         total_steps=prototype_total_steps,
         use_parameter_free_self_attention=use_parameter_free_self_attention,
+        infer_hard_query=getattr(args, 'infer_hard_query', False),
     )
 
 class TextEncoder(nn.Module):

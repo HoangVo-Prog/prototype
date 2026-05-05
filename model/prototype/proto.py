@@ -15,6 +15,7 @@ class VisualPrototypeModule(nn.Module):
         tau_min: float = 0.05,
         total_steps: int = 10 * 145,
         use_parameter_free_self_attention: bool = True,
+        infer_hard_query: bool = False,
     ):
         super().__init__()
         self.num_prototypes = num_prototypes
@@ -23,6 +24,7 @@ class VisualPrototypeModule(nn.Module):
         self.tau_init = tau_init
         self.total_steps = total_steps
         self.use_parameter_free_self_attention = use_parameter_free_self_attention
+        self.infer_hard_query = infer_hard_query
 
         # Learnable visual meta matrix Q in R^{N x D}
         self.visual_meta_matrix = nn.Parameter(torch.empty(num_prototypes, embed_dim))
@@ -66,8 +68,8 @@ class VisualPrototypeModule(nn.Module):
         scores = torch.matmul(visual_context, q_star.t()) / tau
         weights = torch.softmax(scores, dim=-1)
 
-        if training:
-            return torch.matmul(weights, q_star)
+        if (not training) and self.infer_hard_query:
+            indices = weights.argmax(dim=-1)
+            return q_star[indices]
 
-        indices = weights.argmax(dim=-1)
-        return q_star[indices]
+        return torch.matmul(weights, q_star)
