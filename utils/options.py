@@ -88,8 +88,9 @@ def get_args():
                         help="Minimum temperature tau for prototype softmax weighting")
     parser.add_argument("--prototype_total_steps", type=int, default=10 * 145,
                         help="Total training steps over which tau linearly decays from tau_init to tau_min")
-    parser.add_argument("--prototype_init", type=str, default="random", choices=["random", "kmeans"],
-                        help="Initialization mode for prototype vectors: random or kmeans")
+    parser.add_argument("--prototype_init", type=str, default="random",
+                        choices=["random", "kmeans", "xavier", "kaiming"],
+                        help="Initialization mode for prototype vectors: random, kmeans, xavier, or kaiming")
     parser.add_argument("--prototype_precision", type=str, default="fp32", choices=["fp32", "fp16"],
                         help="Computation precision for prototype module and fusion path")
     parser.add_argument("--use_prototype", dest="use_prototype", action="store_true",
