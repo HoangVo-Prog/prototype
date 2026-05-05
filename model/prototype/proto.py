@@ -14,6 +14,7 @@ class VisualPrototypeModule(nn.Module):
         tau_init: float = 1.0,
         tau_min: float = 0.05,
         total_steps: int = 10 * 145,
+        prototype_init: str = "random",
         use_parameter_free_self_attention: bool = True,
         infer_hard_query: bool = False,
     ):
