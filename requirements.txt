@@ -1,6 +1,5 @@
 torch
-skcikit-learn
-
+scikit-learn
 scikit-image
 opencv-python
 
