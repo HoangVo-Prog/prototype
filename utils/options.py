@@ -118,6 +118,10 @@ def get_args():
     parser.add_argument("--g_chunk_size", type=int, default=1000, help="chunk size for gallery images during prototype evaluation")
     parser.add_argument("--pair_chunk_size", type=int, default=32768,
                         help="micro-batch size for flattened query-gallery pairs during prototype evaluation")
+    parser.add_argument("--use_div_loss", action="store_true",
+                        help="Enable prototype diversity loss during training")
+    parser.add_argument("--div_loss_weight", type=float, default=1.0,
+                        help="Weight applied to the prototype diversity loss")
 
     args = parser.parse_args()
     return args

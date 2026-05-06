@@ -1,4 +1,5 @@
 import logging
+import math
 import time
 import torch
 from utils.meter import AverageMeter
@@ -55,6 +56,36 @@ def _get_prototype_grad_norm(model):
     if grad is None:
         return None
     return float(grad.detach().norm().item())
+
+
+def _get_prototype_param(model):
+    target_model = model.module if hasattr(model, "module") else model
+    if not getattr(target_model, "use_prototype", False):
+        return None
+    return target_model.prototype_module.visual_meta_matrix
+
+
+def _get_loss_grad_norm(loss_value, parameter):
+    if loss_value is None or parameter is None:
+        return None
+
+    grads = torch.autograd.grad(
+        loss_value,
+        parameter,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    grad = grads[0]
+    if grad is None:
+        return None
+    return float(grad.detach().norm().item())
+
+
+def _get_console_metric(scalar_metrics, key, default=float("nan")):
+    value = scalar_metrics.get(key, default)
+    if value is None:
+        return default
+    return value
 
 
 
@@ -126,6 +157,15 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             for key, value in prototype_step_metrics.items():
                 reduced_metrics[key] = torch.tensor(value, device=device, dtype=torch.float32)
 
+            if should_log_step:
+                prototype_param = _get_prototype_param(model)
+                for loss_key in ("cid_loss", "tal_loss"):
+                    loss_grad_norm = _get_loss_grad_norm(ret.get(loss_key), prototype_param)
+                    if loss_grad_norm is not None:
+                        reduced_metrics[f"{loss_key}_grad_norm"] = torch.tensor(
+                            loss_grad_norm, device=device, dtype=torch.float32
+                        )
+
             optimizer.zero_grad()
             total_loss.backward()
             prototype_grad_norm = _get_prototype_grad_norm(model)
@@ -148,16 +188,31 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
             if should_log_step and get_rank() == 0:
                 info_str = f"Epoch[{epoch}] Iteration[{n_iter + 1}/{len(train_loader)}]"
-                # log loss and acc info
-                for k, v in meters.items():
-                    if v.avg > 0:
-                        info_str += f", {k}: {v.avg:.4f}"
+                console_keys = (
+                    "loss",
+                    "tal_loss",
+                    "cid_loss",
+                    "div_loss",
+                    "tal_loss_grad_norm",
+                    "cid_loss_grad_norm",
+                    "prototype_grad_norm",
+                )
+                for key in console_keys:
+                    metric_value = _get_console_metric(scalar_metrics, key)
+                    if math.isnan(metric_value):
+                        info_str += f", {key}: nan"
+                    else:
+                        info_str += f", {key}: {metric_value:.4f}"
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)
 
                 train_log_metrics = {
                     "train/loss": scalar_metrics["loss"],
                     "train/lr": scheduler.get_lr()[0],
+                    "train/div_loss": _get_console_metric(scalar_metrics, "div_loss"),
+                    "train/tal_loss_grad_norm": _get_console_metric(scalar_metrics, "tal_loss_grad_norm"),
+                    "train/cid_loss_grad_norm": _get_console_metric(scalar_metrics, "cid_loss_grad_norm"),
+                    "train/prototype_grad_norm": _get_console_metric(scalar_metrics, "prototype_grad_norm"),
                 }
                 for key, value in scalar_metrics.items():
                     if key == "loss":
@@ -169,18 +224,24 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                     elif key.startswith("prototype_"):
                         train_log_metrics[f"train/{key}"] = value
 
-                tracker.add_scalars(train_log_metrics, current_steps)
+                tracker.add_tb_scalars(train_log_metrics, current_steps)
+                tracker.log_with_step_metric(train_log_metrics, "train/step", current_steps)
 
         if get_rank() == 0:
             epoch_metrics = {
                 "epoch/lr": scheduler.get_lr()[0],
+                "epoch/div_loss": meters["div_loss"].avg if "div_loss" in meters else float("nan"),
+                "epoch/tal_loss_grad_norm": meters["tal_loss_grad_norm"].avg if "tal_loss_grad_norm" in meters else float("nan"),
+                "epoch/cid_loss_grad_norm": meters["cid_loss_grad_norm"].avg if "cid_loss_grad_norm" in meters else float("nan"),
+                "epoch/prototype_grad_norm": meters["prototype_grad_norm"].avg if "prototype_grad_norm" in meters else float("nan"),
             }
             if "temperature" in meters:
                 epoch_metrics["epoch/temperature"] = meters["temperature"].avg
             for key, meter in meters.items():
                 if meter.avg > 0 and (key.endswith("_loss") or key == "loss"):
                     epoch_metrics[f"epoch/{key}"] = meter.avg
-            tracker.add_scalars(epoch_metrics, epoch)
+            tracker.add_tb_scalars(epoch_metrics, epoch)
+            tracker.log_with_step_metric(epoch_metrics, "epoch", epoch)
 
         scheduler.step()
         if get_rank() == 0:
@@ -213,7 +274,8 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 for metric_name, metric_value in eval_result.get("prototype_diagnostics", {}).items():
                     val_log_metrics[f"val/{metric_name}"] = metric_value
                 val_log_metrics["val/best_R1"] = best_top1
-                tracker.add_scalars(val_log_metrics, epoch)
+                tracker.add_tb_scalars(val_log_metrics, epoch)
+                tracker.log_with_step_metric(val_log_metrics, "epoch", epoch)
                 tracker.update_summary({"best_R1": best_top1, "val/best_R1": best_top1})
                 
  

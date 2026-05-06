@@ -13,6 +13,7 @@ class ExperimentTracker:
         self.logger = logging.getLogger("ITSELF.tracker")
         self.enabled = False
         self.run = None
+        self._wandb = None
 
         if not getattr(args, "wandb", False) or get_rank() != 0:
             return
@@ -23,6 +24,7 @@ class ExperimentTracker:
             self.logger.warning("W&B requested but wandb is not installed; disabling W&B logging.")
             return
 
+        self._wandb = wandb
         self._login_wandb(wandb)
 
         tags = getattr(args, "wandb_tags", None) or []
@@ -36,8 +38,19 @@ class ExperimentTracker:
             dir=args.output_dir,
             config=vars(args),
         )
+        self._define_wandb_metrics()
         self.logger.info("Initialized W&B run '%s'", run_name)
         self.enabled = self.run is not None
+
+    def _define_wandb_metrics(self):
+        if self.run is None or self._wandb is None:
+            return
+
+        self._wandb.define_metric("train/step")
+        self._wandb.define_metric("epoch")
+        self._wandb.define_metric("train/*", step_metric="train/step")
+        self._wandb.define_metric("epoch/*", step_metric="epoch")
+        self._wandb.define_metric("val/*", step_metric="epoch")
 
     def _login_wandb(self, wandb):
         api_key = (
@@ -127,6 +140,18 @@ class ExperimentTracker:
         if payload:
             self.run.log(payload, step=step)
 
+    def log_with_step_metric(self, metrics, step_metric_name, step_metric_value):
+        if not self.enabled:
+            return
+
+        payload = {step_metric_name: step_metric_value}
+        for name, value in metrics.items():
+            scalar = self._as_scalar(value)
+            if scalar is not None:
+                payload[name] = scalar
+        if len(payload) > 1:
+            self.run.log(payload)
+
     def add_scalar(self, name, value, step):
         if self.tb_writer is not None:
             scalar = self._as_scalar(value)
@@ -137,6 +162,10 @@ class ExperimentTracker:
         for name, value in metrics.items():
             self.add_scalar(name, value, step)
         self.log_scalars(metrics, step=step)
+
+    def add_tb_scalars(self, metrics, step):
+        for name, value in metrics.items():
+            self.add_scalar(name, value, step)
 
     def update_summary(self, metrics):
         if not self.enabled:

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from .grab import TexualEmbeddingLayer, VisualEmbeddingLayer
 from .prototype import VisualPrototypeModule
+from .prototype.losses import compute_diversity_loss
 from torch.cuda.amp import autocast
 
 
@@ -114,6 +115,8 @@ class ITSELF(nn.Module):
                 self.texual_emb_layer = TexualEmbeddingLayer(ratio=args.select_ratio)
 
         self.use_prototype = getattr(args, 'use_prototype', False)
+        self.use_div_loss = getattr(args, 'use_div_loss', False)
+        self.div_loss_weight = getattr(args, 'div_loss_weight', 1.0)
         self.prototype_precision = getattr(args, 'prototype_precision', 'fp32').lower()
         if self.use_prototype:
             self.prototype_module = build_prototype_module(args, self.embed_dim)
@@ -386,6 +389,9 @@ class ITSELF(nn.Module):
                 ret.update({'tal_loss': TAL_global_loss + TAL_grab_loss}) 
             else:
                 ret.update({'tal_loss': TAL_global_loss})
+
+        if self.use_div_loss and self.use_prototype:
+            ret.update({'div_loss': self.div_loss_weight * compute_diversity_loss(self.prototype_module._compute_query_group())})
 
         return ret
 
