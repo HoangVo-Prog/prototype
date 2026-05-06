@@ -19,6 +19,10 @@ from utils.comm import get_rank, synchronize
 import warnings
 warnings.filterwarnings("ignore")
 
+
+def _format_param_count(count):
+    return f"{count / 1_000_000.0:.2f}M"
+
 def set_seed(seed=1):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -74,8 +78,7 @@ if __name__ == '__main__':
         
     train_loader, val_img_loader, val_txt_loader, num_classes = build_dataloader(args)
     model = build_model(args, num_classes)
-    logger.info('Total params: %2.fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
-    model.to(device)
+    checkpointer = Checkpointer(model, save_dir=args.output_dir, save_to_disk=get_rank() == 0)
     if args.finetune:
         logger.info("loading {} model".format(args.finetune))
         param_dict = torch.load(args.finetune,map_location='cpu')['model']
@@ -84,6 +87,22 @@ if __name__ == '__main__':
             param_dict[refine_k] = param_dict[k].detach().clone()
             del param_dict[k]
         model.load_state_dict(param_dict, False)
+    if args.load_backbone_ckpt:
+        checkpointer.load_backbone(args.load_backbone_ckpt, strict=False)
+    if args.load_prototype_ckpt:
+        checkpointer.load_prototype(args.load_prototype_ckpt, strict=False)
+
+    param_summary = model.get_parameter_summary()
+    logger.info(
+        "Params | total: %s | trainable: %s | backbone: %s trainable / %s total | prototype: %s trainable / %s total",
+        _format_param_count(param_summary["total"]),
+        _format_param_count(param_summary["trainable"]),
+        _format_param_count(param_summary["backbone_trainable"]),
+        _format_param_count(param_summary["backbone_total"]),
+        _format_param_count(param_summary["prototype_trainable"]),
+        _format_param_count(param_summary["prototype_total"]),
+    )
+    model.to(device)
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model,

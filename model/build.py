@@ -1,4 +1,5 @@
 import copy
+import os
 from model import objectives
 from .clip_model import Transformer, LayerNorm, build_CLIP_from_openai_pretrained, convert_weights,tokenize
 import torch
@@ -127,6 +128,124 @@ class ITSELF(nn.Module):
                 self.vision_prototype_enrichment = VisualPrototypeEnrichment(self.embed_dim)
 
         self.logit_scale = torch.ones([]) * (1 / args.temperature) 
+
+    def count_parameters(self, trainable_only=False, module_name=None):
+        if module_name is None:
+            parameters = self.parameters()
+        else:
+            module = getattr(self, module_name, None)
+            if module is None:
+                return 0
+            parameters = module.parameters()
+
+        if trainable_only:
+            return sum(p.numel() for p in parameters if p.requires_grad)
+        return sum(p.numel() for p in parameters)
+
+    def get_parameter_summary(self):
+        summary = {
+            "total": self.count_parameters(trainable_only=False),
+            "trainable": self.count_parameters(trainable_only=True),
+            "backbone_total": self.count_parameters(trainable_only=False, module_name="base_model"),
+            "backbone_trainable": self.count_parameters(trainable_only=True, module_name="base_model"),
+            "prototype_total": self.count_parameters(trainable_only=False, module_name="prototype_module"),
+            "prototype_trainable": self.count_parameters(trainable_only=True, module_name="prototype_module"),
+        }
+        return summary
+
+    @staticmethod
+    def _set_requires_grad(module, requires_grad):
+        if module is None:
+            return
+        for parameter in module.parameters():
+            parameter.requires_grad = requires_grad
+
+    def freeze_backbone(self):
+        self._set_requires_grad(self.base_model, False)
+
+    def unfreeze_backbone(self):
+        self._set_requires_grad(self.base_model, True)
+
+    def freeze_prototype(self):
+        if self.use_prototype:
+            self._set_requires_grad(self.prototype_module, False)
+
+    def unfreeze_prototype(self):
+        if self.use_prototype:
+            self._set_requires_grad(self.prototype_module, True)
+
+    def export_prototype_state(self):
+        if not self.use_prototype:
+            raise RuntimeError("Prototype module is disabled; nothing to export.")
+
+        return {
+            "num_prototypes": self.prototype_module.num_prototypes,
+            "embed_dim": self.prototype_module.embed_dim,
+            "prototype_state_dict": self.prototype_module.state_dict(),
+        }
+
+    def save_prototype_checkpoint(self, path, extra=None):
+        if not self.use_prototype:
+            raise RuntimeError("Prototype module is disabled; cannot save prototype checkpoint.")
+
+        checkpoint = self.export_prototype_state()
+        if extra:
+            checkpoint.update(extra)
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        torch.save(checkpoint, path)
+
+    def load_prototype_checkpoint(self, path, strict=True, map_location="cpu"):
+        if not self.use_prototype:
+            raise RuntimeError("Prototype module is disabled; cannot load prototype checkpoint.")
+
+        checkpoint = torch.load(path, map_location=map_location)
+        prototype_state_dict = None
+
+        if isinstance(checkpoint, dict):
+            if "prototype_state_dict" in checkpoint:
+                prototype_state_dict = checkpoint["prototype_state_dict"]
+            elif "prototype_module" in checkpoint and isinstance(checkpoint["prototype_module"], dict):
+                prototype_state_dict = checkpoint["prototype_module"]
+            elif "model" in checkpoint and isinstance(checkpoint["model"], dict):
+                prototype_state_dict = {
+                    key[len("prototype_module."):]: value
+                    for key, value in checkpoint["model"].items()
+                    if key.startswith("prototype_module.")
+                }
+            elif all(isinstance(key, str) for key in checkpoint.keys()):
+                prototype_state_dict = checkpoint
+
+        if not prototype_state_dict:
+            raise KeyError(f"No prototype weights found in checkpoint: {path}")
+
+        self.prototype_module.load_state_dict(prototype_state_dict, strict=strict)
+        return checkpoint
+
+    def load_backbone_checkpoint(self, path, strict=True, map_location="cpu"):
+        checkpoint = torch.load(path, map_location=map_location)
+        backbone_state_dict = None
+
+        if isinstance(checkpoint, dict):
+            if "backbone_state_dict" in checkpoint:
+                backbone_state_dict = checkpoint["backbone_state_dict"]
+            elif "base_model" in checkpoint and isinstance(checkpoint["base_model"], dict):
+                backbone_state_dict = checkpoint["base_model"]
+            elif "model" in checkpoint and isinstance(checkpoint["model"], dict):
+                backbone_state_dict = {
+                    key[len("base_model."):]: value
+                    for key, value in checkpoint["model"].items()
+                    if key.startswith("base_model.")
+                }
+            elif all(isinstance(key, str) for key in checkpoint.keys()):
+                backbone_state_dict = checkpoint
+
+        if not backbone_state_dict:
+            raise KeyError(f"No backbone weights found in checkpoint: {path}")
+
+        self.base_model.load_state_dict(backbone_state_dict, strict=strict)
+        return checkpoint
 
     def apply_prototype(self, t_feats, i_feats, training=True, current_step=None, return_stats=False):
         if not self.use_prototype:
@@ -397,6 +516,10 @@ class ITSELF(nn.Module):
 
 def build_model(args, num_classes=11003):
     model = ITSELF(args, num_classes)
+    if getattr(args, "freeze_backbone", False):
+        model.freeze_backbone()
+    if getattr(args, "freeze_prototype", False):
+        model.freeze_prototype()
     convert_weights(model)
 
     return model

@@ -25,6 +25,9 @@ class Checkpointer:
             logger = logging.getLogger(__name__)
         self.logger = logger
 
+    def _get_model(self):
+        return self.model.module if hasattr(self.model, "module") else self.model
+
     def save(self, name, **kwargs):
         if not self.save_dir:
             return
@@ -32,6 +35,7 @@ class Checkpointer:
         if not self.save_to_disk:
             return
 
+        save_prototype = kwargs.pop("save_prototype", False)
         data = {}
         data["model"] = self.model.state_dict()
         if self.optimizer is not None:
@@ -43,6 +47,12 @@ class Checkpointer:
         save_file = os.path.join(self.save_dir, "{}.pth".format(name))
         self.logger.info("Saving checkpoint to {}".format(save_file))
         torch.save(data, save_file)
+
+        model = self._get_model()
+        if save_prototype:
+            prototype_save_file = os.path.join(self.save_dir, f"{name}_prototype.pth")
+            self.logger.info("Saving prototype checkpoint to {}".format(prototype_save_file))
+            model.save_prototype_checkpoint(prototype_save_file, extra=kwargs)
 
     def load(self, f=None):
         if not f:
@@ -69,6 +79,22 @@ class Checkpointer:
             self.scheduler.load_state_dict(checkpoint.pop("scheduler"))
         # return any further checkpoint data
         return checkpoint
+
+    def load_prototype(self, f=None, strict=True):
+        if not f:
+            self.logger.info("No prototype checkpoint found.")
+            return {}
+        self.logger.info("Loading prototype checkpoint from {}".format(f))
+        model = self._get_model()
+        return model.load_prototype_checkpoint(f, strict=strict)
+
+    def load_backbone(self, f=None, strict=True):
+        if not f:
+            self.logger.info("No backbone checkpoint found.")
+            return {}
+        self.logger.info("Loading backbone checkpoint from {}".format(f))
+        model = self._get_model()
+        return model.load_backbone_checkpoint(f, strict=strict)
 
     def _load_file(self, f):
         return torch.load(f, map_location=torch.device("cpu"))

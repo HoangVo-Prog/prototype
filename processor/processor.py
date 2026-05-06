@@ -275,7 +275,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 if best_top1 < top1:
                     best_top1 = top1
                     arguments["epoch"] = epoch
-                    checkpointer.save("best", **arguments)
+                    checkpointer.save("best", save_prototype=args.save_prototype_ckpt, **arguments)
 
                 val_log_metrics = {}
                 for branch_name, branch_metrics in eval_result["metrics"].items():
