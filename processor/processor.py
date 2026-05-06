@@ -1,11 +1,60 @@
 import logging
-import os
 import time
 import torch
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
-from utils.comm import get_rank, synchronize
+from utils.comm import get_rank, reduce_dict, synchronize
 from torch.utils.tensorboard import SummaryWriter
+from utils.tracking import ExperimentTracker
+
+
+def _to_float(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if hasattr(value, "detach"):
+        detached = value.detach()
+        if detached.numel() == 1:
+            return float(detached.item())
+    return None
+
+
+def _extract_prototype_scalars(prototype_stats):
+    if not prototype_stats:
+        return {}
+
+    metrics = {}
+    for source_key, target_key in (
+        ("routing_entropy", "prototype_routing_entropy"),
+        ("effective_routing", "prototype_effective_routing"),
+        ("assignment_compactness", "prototype_assignment_compactness"),
+    ):
+        value = prototype_stats.get(source_key)
+        if value is not None:
+            metrics[target_key] = float(value.mean().item())
+
+    for source_key, target_key in (
+        ("prototype_usage_occupancy", "prototype_usage_occupancy"),
+        ("prototype_usage_fraction", "prototype_usage_fraction"),
+        ("prototype_bank_nn_distance", "prototype_bank_nn_distance"),
+        ("prototype_tau", "prototype_tau"),
+    ):
+        value = prototype_stats.get(source_key)
+        scalar = _to_float(value)
+        if scalar is not None:
+            metrics[target_key] = scalar
+
+    return metrics
+
+
+def _get_prototype_grad_norm(model):
+    target_model = model.module if hasattr(model, "module") else model
+    if not getattr(target_model, "use_prototype", False):
+        return None
+
+    grad = target_model.prototype_module.visual_meta_matrix.grad
+    if grad is None:
+        return None
+    return float(grad.detach().norm().item())
 
 
 
@@ -19,18 +68,15 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     arguments = {}
     arguments["num_epoch"] = num_epoch
     arguments["iteration"] = 0
+    arguments["epoch"] = start_epoch - 1
 
     logger = logging.getLogger("ITSELF.train")
     logger.info('start training')
 
-    meters = {
-        "loss": AverageMeter(),
-        "supid_loss": AverageMeter(),
-        "cotrl_loss": AverageMeter(),
-        "cid_loss": AverageMeter(),
-    }
+    meters = {}
 
-    tb_writer = SummaryWriter(log_dir=args.output_dir)
+    tb_writer = SummaryWriter(log_dir=args.output_dir) if get_rank() == 0 else None
+    tracker = ExperimentTracker(args, tb_writer=tb_writer)
 
     best_top1 = 0.0
     evaluator.eval(model.eval())
@@ -51,21 +97,56 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         for n_iter, batch in enumerate(train_loader):
             current_steps += 1
             batch = {k: v.to(device) for k, v in batch.items()}
+            should_log_step = (n_iter + 1) % log_period == 0
             if args.modify_k:
-                ret = model(batch, epoch, current_step=current_steps)
+                ret = model(
+                    batch,
+                    epoch,
+                    current_step=current_steps,
+                    return_prototype_stats=should_log_step,
+                )
             else:
-                ret = model(batch, epoch)
+                ret = model(
+                    batch,
+                    epoch,
+                    return_prototype_stats=should_log_step,
+                )
             total_loss = sum([v for k, v in ret.items() if "loss" in k])
             batch_size = batch['images'].shape[0]
-            meters['loss'].update(total_loss.item(), batch_size)
-            meters['supid_loss'].update(ret.get('supid_loss', 0), batch_size)
-            meters['cotrl_loss'].update(ret.get('cotrl_loss', 0), batch_size)
-            meters['cid_loss'].update(ret.get('cid_loss', 0), batch_size)
+
+            reduced_metrics = {"loss": total_loss.detach()}
+            for key, value in ret.items():
+                if "loss" in key or key == "temperature":
+                    if hasattr(value, "detach"):
+                        reduced_metrics[key] = value.detach()
+                    elif isinstance(value, (int, float)):
+                        reduced_metrics[key] = torch.tensor(value, device=device, dtype=torch.float32)
+
+            prototype_step_metrics = _extract_prototype_scalars(ret.get("prototype_stats"))
+            for key, value in prototype_step_metrics.items():
+                reduced_metrics[key] = torch.tensor(value, device=device, dtype=torch.float32)
+
             optimizer.zero_grad()
             total_loss.backward()
+            prototype_grad_norm = _get_prototype_grad_norm(model)
+            if prototype_grad_norm is not None:
+                reduced_metrics["prototype_grad_norm"] = torch.tensor(
+                    prototype_grad_norm, device=device, dtype=torch.float32
+                )
             optimizer.step()
             synchronize()
-            if (n_iter + 1) % log_period == 0:
+
+            reduced_metrics = reduce_dict(reduced_metrics, average=True)
+            scalar_metrics = {
+                key: float(value.item()) if hasattr(value, "item") else float(value)
+                for key, value in reduced_metrics.items()
+            }
+
+            for key, value in scalar_metrics.items():
+                meter = meters.setdefault(key, AverageMeter())
+                meter.update(value, batch_size)
+
+            if should_log_step and get_rank() == 0:
                 info_str = f"Epoch[{epoch}] Iteration[{n_iter + 1}/{len(train_loader)}]"
                 # log loss and acc info
                 for k, v in meters.items():
@@ -74,11 +155,32 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)
 
-        tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
-        tb_writer.add_scalar('temperature', ret['temperature'], epoch)
-        for k, v in meters.items():
-            if v.avg > 0:
-                tb_writer.add_scalar(k, v.avg, epoch)
+                train_log_metrics = {
+                    "train/loss": scalar_metrics["loss"],
+                    "train/lr": scheduler.get_lr()[0],
+                }
+                for key, value in scalar_metrics.items():
+                    if key == "loss":
+                        continue
+                    if key.endswith("_loss"):
+                        train_log_metrics[f"train/{key}"] = value
+                    elif key == "temperature":
+                        train_log_metrics["train/temperature"] = value
+                    elif key.startswith("prototype_"):
+                        train_log_metrics[f"train/{key}"] = value
+
+                tracker.add_scalars(train_log_metrics, current_steps)
+
+        if get_rank() == 0:
+            epoch_metrics = {
+                "epoch/lr": scheduler.get_lr()[0],
+            }
+            if "temperature" in meters:
+                epoch_metrics["epoch/temperature"] = meters["temperature"].avg
+            for key, meter in meters.items():
+                if meter.avg > 0 and (key.endswith("_loss") or key == "loss"):
+                    epoch_metrics[f"epoch/{key}"] = meter.avg
+            tracker.add_scalars(epoch_metrics, epoch)
 
         scheduler.step()
         if get_rank() == 0:
@@ -93,19 +195,31 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             if get_rank() == 0:
                 logger.info("Validation Results - Epoch: {}".format(epoch))
                 if args.distributed:
-                    top1 = evaluator.eval(model.module.eval())
+                    eval_result = evaluator.eval(model.module.eval())
                 else:
-                    top1 = evaluator.eval(model.eval())
+                    eval_result = evaluator.eval(model.eval())
+                top1 = eval_result["best_top1"]
                 now_top1 = max(now_top1,top1)
                 torch.cuda.empty_cache()
                 if best_top1 < top1:
                     best_top1 = top1
                     arguments["epoch"] = epoch
                     checkpointer.save("best", **arguments)
+
+                val_log_metrics = {}
+                for branch_name, branch_metrics in eval_result["metrics"].items():
+                    for metric_name, metric_value in branch_metrics.items():
+                        val_log_metrics[f"val/{branch_name}/{metric_name}"] = metric_value
+                for metric_name, metric_value in eval_result.get("prototype_diagnostics", {}).items():
+                    val_log_metrics[f"val/{metric_name}"] = metric_value
+                val_log_metrics["val/best_R1"] = best_top1
+                tracker.add_scalars(val_log_metrics, epoch)
+                tracker.update_summary({"best_R1": best_top1, "val/best_R1": best_top1})
                 
  
     if get_rank() == 0:
         logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
+    tracker.finish()
 
                    
 def do_inference(model, test_img_loader, test_txt_loader, args):

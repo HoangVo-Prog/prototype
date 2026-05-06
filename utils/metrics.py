@@ -119,8 +119,22 @@ class Evaluator():
         gfeats = torch.cat(gfeats, 0)
         return qfeats.cpu(), gfeats.cpu(), qids.cpu(), gids.cpu()
 
+    @staticmethod
+    def _metric_dict_from_row(metric_row):
+        return {
+            "R1": float(metric_row[1]),
+            "R5": float(metric_row[2]),
+            "R10": float(metric_row[3]),
+            "mAP": float(metric_row[4]),
+            "mINP": float(metric_row[5]),
+            "rSum": float(metric_row[6]),
+        }
+
     def eval(self, model, i2t_metric=False):
         qfeats, gfeats, qids, gids = self._compute_embedding(model)
+        prototype_eval_stats = defaultdict(float)
+        prototype_eval_count = 0
+        prototype_assignment_hist = None
         
         if getattr(model, 'use_prototype', False):
             device = next(model.parameters()).device
@@ -150,13 +164,32 @@ class Evaluator():
                     with torch.no_grad():
                         for start in range(0, num_pairs, pair_chunk_size):
                             end = min(start + pair_chunk_size, num_pairs)
-                            t_enriched = model.apply_prototype(
+                            t_enriched, prototype_stats = model.apply_prototype(
                                 q_exp[start:end],
                                 g_exp[start:end],
                                 training=False,
+                                return_stats=True,
                             )
                             t_enriched_norm = F.normalize(t_enriched, p=2, dim=-1)
                             sim_flat[start:end] = (t_enriched_norm * g_norm_flat[start:end]).sum(dim=-1)
+                            if prototype_stats is not None:
+                                chunk_size = end - start
+                                prototype_eval_count += chunk_size
+                                prototype_eval_stats["prototype_routing_entropy"] += float(prototype_stats["routing_entropy"].mean().item()) * chunk_size
+                                prototype_eval_stats["prototype_effective_routing"] += float(prototype_stats["effective_routing"].mean().item()) * chunk_size
+                                prototype_eval_stats["prototype_assignment_compactness"] += float(prototype_stats["assignment_compactness"].mean().item()) * chunk_size
+                                prototype_eval_stats["prototype_bank_nn_distance"] += float(prototype_stats["prototype_bank_nn_distance"].item()) * chunk_size
+                                assigned_indices = prototype_stats["assigned_indices"].view(-1).to(torch.long)
+                                if prototype_assignment_hist is None:
+                                    prototype_assignment_hist = torch.zeros(
+                                        model.prototype_module.num_prototypes,
+                                        dtype=torch.long,
+                                        device=assigned_indices.device,
+                                    )
+                                prototype_assignment_hist += torch.bincount(
+                                    assigned_indices,
+                                    minlength=model.prototype_module.num_prototypes,
+                                )
 
                     sim = sim_flat.view(B, K)
                     sims_global[i:i+B, j:j+K] = sim.cpu()
@@ -195,11 +228,13 @@ class Evaluator():
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP","rSum"])
 
         top1 = 0
+        metrics_by_branch = {}
 
         for key in sims_dict.keys():
             sims = sims_dict[key]
             rs = get_metrics(sims, qids, gids, f'{key}-t2i',False)
             table.add_row(rs)
+            metrics_by_branch[key] = self._metric_dict_from_row(rs)
             if i2t_metric:
                 i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=sims.t(), q_pids=gids, g_pids=qids, max_rank=10, get_mAP=True)
                 i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
@@ -216,4 +251,19 @@ class Evaluator():
         self.logger.info('\n' + str(table))
         self.logger.info('\n' + "best R1 = " + str(top1))
 
-        return top1
+        prototype_metrics = {}
+        if prototype_eval_count > 0:
+            prototype_metrics = {
+                key: value / prototype_eval_count for key, value in prototype_eval_stats.items()
+            }
+            if prototype_assignment_hist is not None:
+                used = int((prototype_assignment_hist > 0).sum().item())
+                total = int(prototype_assignment_hist.numel())
+                prototype_metrics["prototype_usage_occupancy"] = used
+                prototype_metrics["prototype_usage_fraction"] = used / total if total > 0 else 0.0
+
+        return {
+            "best_top1": float(top1),
+            "metrics": metrics_by_branch,
+            "prototype_diagnostics": prototype_metrics,
+        }

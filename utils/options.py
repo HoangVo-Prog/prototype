@@ -11,8 +11,8 @@ def get_args():
     parser.add_argument("--local_rank", default=0, type=int)
     parser.add_argument("--output_dir", default="run_logs")
     parser.add_argument("--name", default="ITSELF", help="experiment name to save")
-    parser.add_argument("--log_period", default=20)
-    parser.add_argument("--eval_period", default=1)
+    parser.add_argument("--log_period", default=50, type=int)
+    parser.add_argument("--eval_period", default=1, type=int)
     parser.add_argument("--nohup", action="store_true",
                         help="Relaunch this training command with nohup in background")
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
@@ -78,6 +78,14 @@ def get_args():
     parser.add_argument("--layer_index", type=int, default=-1, help='which layer attention to use: [0, 11]')
     parser.add_argument("--average_attn_weights", type=bool, default=True)
     parser.add_argument("--modify_k", action='store_true')
+
+    ### Weights & Biases
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging on rank 0")
+    parser.add_argument("--wandb_project", type=str, default="ITSELF")
+    parser.add_argument("--wandb_entity", type=str, default="")
+    parser.add_argument("--wandb_run_name", type=str, default="")
+    parser.add_argument("--wandb_tags", nargs="*", default=[])
+    parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline"])
 
     ### Prototype Module
     parser.add_argument("--num_prototypes", type=int, default=64,

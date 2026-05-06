@@ -125,8 +125,10 @@ class ITSELF(nn.Module):
 
         self.logit_scale = torch.ones([]) * (1 / args.temperature) 
 
-    def apply_prototype(self, t_feats, i_feats, training=True, current_step=None):
+    def apply_prototype(self, t_feats, i_feats, training=True, current_step=None, return_stats=False):
         if not self.use_prototype:
+            if return_stats:
+                return t_feats, None
             return t_feats
 
         original_dtype = t_feats.dtype
@@ -137,11 +139,18 @@ class ITSELF(nn.Module):
 
         i_context = i_feats.to(dtype=prototype_dtype)
         t_context = t_feats.to(dtype=prototype_dtype)
-        prototype_query = self.prototype_module(
+        prototype_result = self.prototype_module(
             visual_context=i_context,
             training=training,
             current_step=current_step,
-        ).to(dtype=prototype_dtype)
+            return_stats=return_stats,
+        )
+        if return_stats:
+            prototype_query, prototype_stats = prototype_result
+        else:
+            prototype_query = prototype_result
+            prototype_stats = None
+        prototype_query = prototype_query.to(dtype=prototype_dtype)
         fused = torch.cat([t_context, prototype_query], dim=-1)
 
         fusion_dtype = prototype_dtype
@@ -154,6 +163,8 @@ class ITSELF(nn.Module):
         t_feats_enriched = self.prototype_fusion(fused)
         if t_feats_enriched.dtype != original_dtype:
             t_feats_enriched = t_feats_enriched.to(dtype=original_dtype)
+        if return_stats:
+            return t_feats_enriched, prototype_stats
         return t_feats_enriched
 
     def _set_task(self):
@@ -229,7 +240,7 @@ class ITSELF(nn.Module):
 
         return result  # [B, N, N]
 
-    def forward(self, batch, epoch=None, current_step=None):
+    def forward(self, batch, epoch=None, current_step=None, return_prototype_stats=False):
         ret = dict()
         device = "cuda"
 
@@ -248,12 +259,18 @@ class ITSELF(nn.Module):
             image_feats, atten_i, text_feats, atten_t = self.base_model(images, caption_ids, return_all=True, average_attn_weights = self.args.average_attn_weights)
             i_feats = image_feats[:, 0, :].float()
             t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
-            t_feats = self.apply_prototype(
+            prototype_result = self.apply_prototype(
                 t_feats=t_feats,
                 i_feats=i_feats,
                 training=self.training,
                 current_step=current_step,
+                return_stats=return_prototype_stats,
             )
+            if return_prototype_stats:
+                t_feats, prototype_stats = prototype_result
+                ret["prototype_stats"] = prototype_stats
+            else:
+                t_feats = prototype_result
             if self.args.topk_type == 'mean':
                 atten_i = torch.stack(atten_i, dim=0)
                 atten_t = torch.stack(atten_t, dim=0)
@@ -304,12 +321,18 @@ class ITSELF(nn.Module):
             i_feats = image_feats[:, 0, :].float()
             # i_feats = image_feats.float() # for CLIP ResNet visual model
             t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
-            t_feats = self.apply_prototype(
+            prototype_result = self.apply_prototype(
                 t_feats=t_feats,
                 i_feats=i_feats,
                 training=self.training,
                 current_step=current_step,
+                return_stats=return_prototype_stats,
             )
+            if return_prototype_stats:
+                t_feats, prototype_stats = prototype_result
+                ret["prototype_stats"] = prototype_stats
+            else:
+                t_feats = prototype_result
             if not self.args.only_global:
                 i_grab_f = self.visul_emb_layer(image_feats, atten_i)
                 t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)

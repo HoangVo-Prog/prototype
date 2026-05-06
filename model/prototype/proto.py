@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class VisualPrototypeModule(nn.Module):
@@ -95,7 +96,8 @@ class VisualPrototypeModule(nn.Module):
         visual_context: torch.Tensor,
         training: bool = True,
         current_step: int = None,
-    ) -> torch.Tensor:
+        return_stats: bool = False,
+    ):
         """
         Produce a prototype query vector for each sample in the batch.
         """
@@ -109,9 +111,48 @@ class VisualPrototypeModule(nn.Module):
         tau = self.tau.to(dtype=visual_context.dtype, device=visual_context.device)
         scores = torch.matmul(visual_context, q_star.t()) / tau
         weights = torch.softmax(scores, dim=-1)
+        assigned_indices = weights.argmax(dim=-1)
+
+        if return_stats:
+            eps = torch.finfo(weights.dtype).eps
+            routing_entropy = -(weights * weights.clamp_min(eps).log()).sum(dim=-1)
+            effective_routing = routing_entropy.exp()
+            normalized_context = F.normalize(visual_context, p=2, dim=-1)
+            normalized_q_star = F.normalize(q_star, p=2, dim=-1)
+            assigned_prototypes = normalized_q_star[assigned_indices]
+            assignment_compactness = 1.0 - (normalized_context * assigned_prototypes).sum(dim=-1)
+
+            prototype_bank = normalized_q_star
+            if prototype_bank.size(0) > 1:
+                pairwise_distances = 1.0 - torch.matmul(prototype_bank, prototype_bank.t())
+                pairwise_distances.fill_diagonal_(float("inf"))
+                nearest_neighbor_distance = pairwise_distances.min(dim=-1).values.mean()
+            else:
+                nearest_neighbor_distance = torch.zeros(
+                    (), dtype=weights.dtype, device=weights.device
+                )
+
+            stats = {
+                "weights": weights.detach(),
+                "assigned_indices": assigned_indices.detach(),
+                "routing_entropy": routing_entropy.detach(),
+                "effective_routing": effective_routing.detach(),
+                "assignment_compactness": assignment_compactness.detach(),
+                "prototype_usage_occupancy": assigned_indices.unique().numel(),
+                "prototype_usage_fraction": assigned_indices.unique().numel() / self.num_prototypes,
+                "prototype_bank_nn_distance": nearest_neighbor_distance.detach(),
+                "prototype_tau": self.tau.detach().clone(),
+            }
+        else:
+            stats = None
 
         if (not training) and self.infer_hard_query:
-            indices = weights.argmax(dim=-1)
-            return q_star[indices]
+            prototype_query = q_star[assigned_indices]
+            if return_stats:
+                return prototype_query, stats
+            return prototype_query
 
-        return torch.matmul(weights, q_star)
+        prototype_query = torch.matmul(weights, q_star)
+        if return_stats:
+            return prototype_query, stats
+        return prototype_query
