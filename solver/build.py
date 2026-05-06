@@ -55,6 +55,11 @@ def build_optimizer(args, model):
 
 
 def build_lr_scheduler(args, optimizer):
+    lr_total_epochs = getattr(args, "lr_total_epochs", None)
+    if lr_total_epochs is None:
+        lr_total_epochs = args.num_epoch
+    if args.lrscheduler != "step" and lr_total_epochs <= args.warmup_epochs:
+        raise ValueError("--lr_total_epochs must be greater than --warmup_epochs for continuous LR schedulers")
     return LRSchedulerWithWarmup(
         optimizer,
         milestones=args.milestones,
@@ -62,7 +67,7 @@ def build_lr_scheduler(args, optimizer):
         warmup_factor=args.warmup_factor,
         warmup_epochs=args.warmup_epochs,
         warmup_method=args.warmup_method,
-        total_epochs=args.num_epoch,
+        total_epochs=lr_total_epochs,
         mode=args.lrscheduler,
         target_lr=args.target_lr,
         power=args.power,
