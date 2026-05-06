@@ -88,6 +88,13 @@ def _get_console_metric(scalar_metrics, key, default=float("nan")):
     return value
 
 
+def _get_meter_avg(meters, key, default=float("nan")):
+    meter = meters.get(key)
+    if meter is None or meter.count == 0:
+        return default
+    return float(meter.avg)
+
+
 
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
              scheduler, checkpointer):
@@ -199,7 +206,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                     "prototype_grad_norm",
                 )
                 for key in console_keys:
-                    metric_value = _get_console_metric(scalar_metrics, key)
+                    metric_value = _get_meter_avg(meters, key)
                     if math.isnan(metric_value):
                         info_str += f", {key}: nan"
                     else:
@@ -208,23 +215,23 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 logger.info(info_str)
 
                 train_log_metrics = {
-                    "train/loss": scalar_metrics["loss"],
+                    "train/loss": _get_meter_avg(meters, "loss"),
                     "train/lr": scheduler.get_lr()[0],
-                    "train/div_loss": _get_console_metric(scalar_metrics, "div_loss"),
-                    "train/tal_loss_grad_norm": _get_console_metric(scalar_metrics, "tal_loss_grad_norm"),
-                    "train/cid_loss_grad_norm": _get_console_metric(scalar_metrics, "cid_loss_grad_norm"),
-                    "train/div_loss_grad_norm": _get_console_metric(scalar_metrics, "div_loss_grad_norm"),
-                    "train/prototype_grad_norm": _get_console_metric(scalar_metrics, "prototype_grad_norm"),
+                    "train/div_loss": _get_meter_avg(meters, "div_loss"),
+                    "train/tal_loss_grad_norm": _get_meter_avg(meters, "tal_loss_grad_norm"),
+                    "train/cid_loss_grad_norm": _get_meter_avg(meters, "cid_loss_grad_norm"),
+                    "train/div_loss_grad_norm": _get_meter_avg(meters, "div_loss_grad_norm"),
+                    "train/prototype_grad_norm": _get_meter_avg(meters, "prototype_grad_norm"),
                 }
-                for key, value in scalar_metrics.items():
+                for key in scalar_metrics.keys():
                     if key == "loss":
                         continue
                     if key.endswith("_loss"):
-                        train_log_metrics[f"train/{key}"] = value
+                        train_log_metrics[f"train/{key}"] = _get_meter_avg(meters, key)
                     elif key == "temperature":
-                        train_log_metrics["train/temperature"] = value
+                        train_log_metrics["train/temperature"] = _get_meter_avg(meters, key)
                     elif key.startswith("prototype_"):
-                        train_log_metrics[f"train/{key}"] = value
+                        train_log_metrics[f"train/{key}"] = _get_meter_avg(meters, key)
 
                 tracker.add_tb_scalars(train_log_metrics, current_steps)
                 tracker.log_with_step_metric(train_log_metrics, "train/step", current_steps)
