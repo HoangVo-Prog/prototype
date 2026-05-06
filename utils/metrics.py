@@ -135,64 +135,89 @@ class Evaluator():
         prototype_eval_stats = defaultdict(float)
         prototype_eval_count = 0
         prototype_assignment_hist = None
+        prototype_side = getattr(model, "prototype_enrich_side", "text")
         
         if getattr(model, 'use_prototype', False):
             device = next(model.parameters()).device
             gfeats_dev = gfeats.to(device)
             qfeats_dev = qfeats.to(device)
-            sims_global = torch.zeros((qfeats.size(0), gfeats.size(0)))
-            
-            q_chunk_size = getattr(self.args, 'q_chunk_size', 100)
-            pair_chunk_size = getattr(self.args, 'pair_chunk_size', 32768)
-            for i in range(0, qfeats.size(0), q_chunk_size):
-                q_chunk = qfeats_dev[i:i+q_chunk_size]
-                B = q_chunk.size(0)
-                
-                g_chunk_size = getattr(self.args, 'g_chunk_size', 1000)
-                for j in range(0, gfeats.size(0), g_chunk_size):
-                    g_chunk = gfeats_dev[j:j+g_chunk_size]
-                    K = g_chunk.size(0)
 
-                    # Micro-batch prototype enrichment to avoid OOM from full B*K expansion.
-                    q_exp = q_chunk.unsqueeze(1).expand(B, K, -1).reshape(-1, q_chunk.size(-1))
-                    g_exp = g_chunk.unsqueeze(0).expand(B, K, -1).reshape(-1, g_chunk.size(-1))
-                    num_pairs = q_exp.size(0)
+            if prototype_side == "vision":
+                with torch.no_grad():
+                    dummy_text = gfeats_dev
+                    _, gfeats_enriched, prototype_stats = model.apply_prototype(
+                        dummy_text,
+                        gfeats_dev,
+                        training=False,
+                        return_stats=True,
+                    )
+                qfeats_norm = F.normalize(qfeats_dev, p=2, dim=1)
+                gfeats_norm = F.normalize(gfeats_enriched, p=2, dim=1)
+                sims_global = (qfeats_norm @ gfeats_norm.t()).cpu()
+                if prototype_stats is not None:
+                    chunk_size = gfeats_enriched.size(0)
+                    prototype_eval_count += chunk_size
+                    prototype_eval_stats["prototype_routing_entropy"] += float(prototype_stats["routing_entropy"].mean().item()) * chunk_size
+                    prototype_eval_stats["prototype_effective_routing"] += float(prototype_stats["effective_routing"].mean().item()) * chunk_size
+                    prototype_eval_stats["prototype_assignment_compactness"] += float(prototype_stats["assignment_compactness"].mean().item()) * chunk_size
+                    prototype_eval_stats["prototype_bank_nn_distance"] += float(prototype_stats["prototype_bank_nn_distance"].item()) * chunk_size
+                    assigned_indices = prototype_stats["assigned_indices"].view(-1).to(torch.long)
+                    prototype_assignment_hist = torch.bincount(
+                        assigned_indices,
+                        minlength=model.prototype_module.num_prototypes,
+                    )
+            else:
+                sims_global = torch.zeros((qfeats.size(0), gfeats.size(0)))
+                q_chunk_size = getattr(self.args, 'q_chunk_size', 100)
+                pair_chunk_size = getattr(self.args, 'pair_chunk_size', 32768)
+                for i in range(0, qfeats.size(0), q_chunk_size):
+                    q_chunk = qfeats_dev[i:i+q_chunk_size]
+                    B = q_chunk.size(0)
+                    
+                    g_chunk_size = getattr(self.args, 'g_chunk_size', 1000)
+                    for j in range(0, gfeats.size(0), g_chunk_size):
+                        g_chunk = gfeats_dev[j:j+g_chunk_size]
+                        K = g_chunk.size(0)
 
-                    sim_flat = torch.empty(num_pairs, device=device)
-                    g_norm_flat = F.normalize(g_exp, p=2, dim=-1)
+                        q_exp = q_chunk.unsqueeze(1).expand(B, K, -1).reshape(-1, q_chunk.size(-1))
+                        g_exp = g_chunk.unsqueeze(0).expand(B, K, -1).reshape(-1, g_chunk.size(-1))
+                        num_pairs = q_exp.size(0)
 
-                    with torch.no_grad():
-                        for start in range(0, num_pairs, pair_chunk_size):
-                            end = min(start + pair_chunk_size, num_pairs)
-                            t_enriched, prototype_stats = model.apply_prototype(
-                                q_exp[start:end],
-                                g_exp[start:end],
-                                training=False,
-                                return_stats=True,
-                            )
-                            t_enriched_norm = F.normalize(t_enriched, p=2, dim=-1)
-                            sim_flat[start:end] = (t_enriched_norm * g_norm_flat[start:end]).sum(dim=-1)
-                            if prototype_stats is not None:
-                                chunk_size = end - start
-                                prototype_eval_count += chunk_size
-                                prototype_eval_stats["prototype_routing_entropy"] += float(prototype_stats["routing_entropy"].mean().item()) * chunk_size
-                                prototype_eval_stats["prototype_effective_routing"] += float(prototype_stats["effective_routing"].mean().item()) * chunk_size
-                                prototype_eval_stats["prototype_assignment_compactness"] += float(prototype_stats["assignment_compactness"].mean().item()) * chunk_size
-                                prototype_eval_stats["prototype_bank_nn_distance"] += float(prototype_stats["prototype_bank_nn_distance"].item()) * chunk_size
-                                assigned_indices = prototype_stats["assigned_indices"].view(-1).to(torch.long)
-                                if prototype_assignment_hist is None:
-                                    prototype_assignment_hist = torch.zeros(
-                                        model.prototype_module.num_prototypes,
-                                        dtype=torch.long,
-                                        device=assigned_indices.device,
-                                    )
-                                prototype_assignment_hist += torch.bincount(
-                                    assigned_indices,
-                                    minlength=model.prototype_module.num_prototypes,
+                        sim_flat = torch.empty(num_pairs, device=device)
+
+                        with torch.no_grad():
+                            for start in range(0, num_pairs, pair_chunk_size):
+                                end = min(start + pair_chunk_size, num_pairs)
+                                t_enriched, i_enriched, prototype_stats = model.apply_prototype(
+                                    q_exp[start:end],
+                                    g_exp[start:end],
+                                    training=False,
+                                    return_stats=True,
                                 )
+                                t_enriched_norm = F.normalize(t_enriched, p=2, dim=-1)
+                                i_enriched_norm = F.normalize(i_enriched, p=2, dim=-1)
+                                sim_flat[start:end] = (t_enriched_norm * i_enriched_norm).sum(dim=-1)
+                                if prototype_stats is not None:
+                                    chunk_size = end - start
+                                    prototype_eval_count += chunk_size
+                                    prototype_eval_stats["prototype_routing_entropy"] += float(prototype_stats["routing_entropy"].mean().item()) * chunk_size
+                                    prototype_eval_stats["prototype_effective_routing"] += float(prototype_stats["effective_routing"].mean().item()) * chunk_size
+                                    prototype_eval_stats["prototype_assignment_compactness"] += float(prototype_stats["assignment_compactness"].mean().item()) * chunk_size
+                                    prototype_eval_stats["prototype_bank_nn_distance"] += float(prototype_stats["prototype_bank_nn_distance"].item()) * chunk_size
+                                    assigned_indices = prototype_stats["assigned_indices"].view(-1).to(torch.long)
+                                    if prototype_assignment_hist is None:
+                                        prototype_assignment_hist = torch.zeros(
+                                            model.prototype_module.num_prototypes,
+                                            dtype=torch.long,
+                                            device=assigned_indices.device,
+                                        )
+                                    prototype_assignment_hist += torch.bincount(
+                                        assigned_indices,
+                                        minlength=model.prototype_module.num_prototypes,
+                                    )
 
-                    sim = sim_flat.view(B, K)
-                    sims_global[i:i+B, j:j+K] = sim.cpu()
+                        sim = sim_flat.view(B, K)
+                        sims_global[i:i+B, j:j+K] = sim.cpu()
         else:
             qfeats = F.normalize(qfeats, p=2, dim=1) # text features
             gfeats = F.normalize(gfeats, p=2, dim=1) # image features

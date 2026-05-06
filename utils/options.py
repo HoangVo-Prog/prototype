@@ -106,6 +106,9 @@ def get_args():
     parser.add_argument("--no_use_prototype", dest="use_prototype", action="store_false",
                         help="Disable prototype enrichment")
     parser.set_defaults(use_prototype=False)
+    parser.add_argument("--prototype_enrich_side", type=str, default="text",
+                        choices=["text", "vision", "both"],
+                        help="Choose which feature branch is enriched by prototype routing")
     parser.add_argument("--use_parameter_free_self_attention", dest="use_parameter_free_self_attention", action="store_true",
                         help="Use parameter-free self-attention Q*=(Q Q^T)Q in prototype module")
     parser.add_argument("--no_use_parameter_free_self_attention", dest="use_parameter_free_self_attention", action="store_false",

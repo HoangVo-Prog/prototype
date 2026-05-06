@@ -4,7 +4,7 @@ from .clip_model import Transformer, LayerNorm, build_CLIP_from_openai_pretraine
 import torch
 import torch.nn as nn
 from .grab import TexualEmbeddingLayer, VisualEmbeddingLayer
-from .prototype import VisualPrototypeModule
+from .prototype import PrototypeFusion, VisualPrototypeEnrichment, VisualPrototypeModule
 from .prototype.losses import compute_diversity_loss
 from torch.cuda.amp import autocast
 
@@ -117,31 +117,29 @@ class ITSELF(nn.Module):
         self.use_prototype = getattr(args, 'use_prototype', False)
         self.use_div_loss = getattr(args, 'use_div_loss', False)
         self.div_loss_weight = getattr(args, 'div_loss_weight', 1.0)
+        self.prototype_enrich_side = getattr(args, 'prototype_enrich_side', 'text').lower()
         self.prototype_precision = getattr(args, 'prototype_precision', 'fp32').lower()
         if self.use_prototype:
             self.prototype_module = build_prototype_module(args, self.embed_dim)
-            self.prototype_fusion = nn.Sequential(
-                nn.Linear(2 * self.embed_dim, self.embed_dim),
-                nn.LayerNorm(self.embed_dim),
-                nn.GELU(),
-            )
+            if self.prototype_enrich_side in {"text", "both"}:
+                self.text_prototype_fusion = PrototypeFusion(self.embed_dim)
+            if self.prototype_enrich_side in {"vision", "both"}:
+                self.vision_prototype_enrichment = VisualPrototypeEnrichment(self.embed_dim)
 
         self.logit_scale = torch.ones([]) * (1 / args.temperature) 
 
     def apply_prototype(self, t_feats, i_feats, training=True, current_step=None, return_stats=False):
         if not self.use_prototype:
             if return_stats:
-                return t_feats, None
-            return t_feats
+                return t_feats, i_feats, None
+            return t_feats, i_feats
 
-        original_dtype = t_feats.dtype
         if self.prototype_precision == 'fp16':
             prototype_dtype = torch.float16
         else:
             prototype_dtype = torch.float32
 
         i_context = i_feats.to(dtype=prototype_dtype)
-        t_context = t_feats.to(dtype=prototype_dtype)
         prototype_result = self.prototype_module(
             visual_context=i_context,
             training=training,
@@ -154,21 +152,23 @@ class ITSELF(nn.Module):
             prototype_query = prototype_result
             prototype_stats = None
         prototype_query = prototype_query.to(dtype=prototype_dtype)
-        fused = torch.cat([t_context, prototype_query], dim=-1)
+        t_feats_enriched = t_feats
+        i_feats_enriched = i_feats
 
-        fusion_dtype = prototype_dtype
-        for param in self.prototype_fusion.parameters():
-            if param.dtype != fusion_dtype:
-                self.prototype_fusion = self.prototype_fusion.to(dtype=fusion_dtype)
-                break
-        fused = fused.to(dtype=fusion_dtype)
+        if self.prototype_enrich_side in {"text", "both"}:
+            t_feats_enriched = self.text_prototype_fusion(
+                t_feats,
+                prototype_query,
+            )
+        if self.prototype_enrich_side in {"vision", "both"}:
+            i_feats_enriched = self.vision_prototype_enrichment(
+                i_feats,
+                prototype_query,
+            )
 
-        t_feats_enriched = self.prototype_fusion(fused)
-        if t_feats_enriched.dtype != original_dtype:
-            t_feats_enriched = t_feats_enriched.to(dtype=original_dtype)
         if return_stats:
-            return t_feats_enriched, prototype_stats
-        return t_feats_enriched
+            return t_feats_enriched, i_feats_enriched, prototype_stats
+        return t_feats_enriched, i_feats_enriched
 
     def _set_task(self):
         loss_names = self.args.loss_names
@@ -270,10 +270,10 @@ class ITSELF(nn.Module):
                 return_stats=return_prototype_stats,
             )
             if return_prototype_stats:
-                t_feats, prototype_stats = prototype_result
+                t_feats, i_feats, prototype_stats = prototype_result
                 ret["prototype_stats"] = prototype_stats
             else:
-                t_feats = prototype_result
+                t_feats, i_feats = prototype_result
             if self.args.topk_type == 'mean':
                 atten_i = torch.stack(atten_i, dim=0)
                 atten_t = torch.stack(atten_t, dim=0)
@@ -332,10 +332,10 @@ class ITSELF(nn.Module):
                 return_stats=return_prototype_stats,
             )
             if return_prototype_stats:
-                t_feats, prototype_stats = prototype_result
+                t_feats, i_feats, prototype_stats = prototype_result
                 ret["prototype_stats"] = prototype_stats
             else:
-                t_feats = prototype_result
+                t_feats, i_feats = prototype_result
             if not self.args.only_global:
                 i_grab_f = self.visul_emb_layer(image_feats, atten_i)
                 t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
