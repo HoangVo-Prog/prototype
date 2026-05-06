@@ -11,7 +11,7 @@ def get_args():
     parser.add_argument("--local_rank", default=0, type=int)
     parser.add_argument("--output_dir", default="run_logs")
     parser.add_argument("--name", default="ITSELF", help="experiment name to save")
-    parser.add_argument("--log_period", default=50, type=int)
+    parser.add_argument("--log_period", default=20, type=int)
     parser.add_argument("--eval_period", default=1, type=int)
     parser.add_argument("--nohup", action="store_true",
                         help="Relaunch this training command with nohup in background")

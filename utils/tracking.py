@@ -1,6 +1,7 @@
 import logging
 import os
 from pathlib import Path
+from time import localtime, strftime
 
 from utils.comm import get_rank
 
@@ -25,15 +26,17 @@ class ExperimentTracker:
         self._login_wandb(wandb)
 
         tags = getattr(args, "wandb_tags", None) or []
+        run_name = args.wandb_run_name or strftime("%Y%m%d_%H%M%S", localtime())
         self.run = wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity or None,
-            name=args.wandb_run_name or None,
+            name=run_name,
             tags=tags,
             mode=args.wandb_mode,
             dir=args.output_dir,
             config=vars(args),
         )
+        self.logger.info("Initialized W&B run '%s'", run_name)
         self.enabled = self.run is not None
 
     def _login_wandb(self, wandb):

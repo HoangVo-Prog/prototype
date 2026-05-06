@@ -11,5 +11,6 @@ python3 train.py \
 --topk_type 'custom' \
 --modify_k \
 --infer_hard_query \
---nohup
+--nohup \
+--wandb
 # --only_global 
