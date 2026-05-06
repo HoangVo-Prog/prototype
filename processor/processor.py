@@ -159,7 +159,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
             if should_log_step:
                 prototype_param = _get_prototype_param(model)
-                for loss_key in ("cid_loss", "tal_loss"):
+                for loss_key in ("cid_loss", "tal_loss", "div_loss"):
                     loss_grad_norm = _get_loss_grad_norm(ret.get(loss_key), prototype_param)
                     if loss_grad_norm is not None:
                         reduced_metrics[f"{loss_key}_grad_norm"] = torch.tensor(
@@ -195,6 +195,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                     "div_loss",
                     "tal_loss_grad_norm",
                     "cid_loss_grad_norm",
+                    "div_loss_grad_norm",
                     "prototype_grad_norm",
                 )
                 for key in console_keys:
@@ -212,6 +213,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                     "train/div_loss": _get_console_metric(scalar_metrics, "div_loss"),
                     "train/tal_loss_grad_norm": _get_console_metric(scalar_metrics, "tal_loss_grad_norm"),
                     "train/cid_loss_grad_norm": _get_console_metric(scalar_metrics, "cid_loss_grad_norm"),
+                    "train/div_loss_grad_norm": _get_console_metric(scalar_metrics, "div_loss_grad_norm"),
                     "train/prototype_grad_norm": _get_console_metric(scalar_metrics, "prototype_grad_norm"),
                 }
                 for key, value in scalar_metrics.items():
@@ -233,6 +235,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 "epoch/div_loss": meters["div_loss"].avg if "div_loss" in meters else float("nan"),
                 "epoch/tal_loss_grad_norm": meters["tal_loss_grad_norm"].avg if "tal_loss_grad_norm" in meters else float("nan"),
                 "epoch/cid_loss_grad_norm": meters["cid_loss_grad_norm"].avg if "cid_loss_grad_norm" in meters else float("nan"),
+                "epoch/div_loss_grad_norm": meters["div_loss_grad_norm"].avg if "div_loss_grad_norm" in meters else float("nan"),
                 "epoch/prototype_grad_norm": meters["prototype_grad_norm"].avg if "prototype_grad_norm" in meters else float("nan"),
             }
             if "temperature" in meters:
