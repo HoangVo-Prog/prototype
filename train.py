@@ -105,15 +105,15 @@ if __name__ == '__main__':
 
     param_summary = model.get_parameter_summary()
     logger.info(
-        "Params | total: %s | trainable: %s | backbone: %s trainable / %s total | prototype: %s trainable / %s total | other: %s trainable / %s total",
+        "Params | total: %s | trainable: %s | clip: %s trainable / %s total | retrieval: %s trainable / %s total | prototype: %s trainable / %s total",
         _format_param_count(param_summary["total"]),
         _format_param_count(param_summary["trainable"]),
-        _format_param_count(param_summary["backbone_trainable"]),
-        _format_param_count(param_summary["backbone_total"]),
+        _format_param_count(param_summary["clip_trainable"]),
+        _format_param_count(param_summary["clip_total"]),
+        _format_param_count(param_summary["retrieval_trainable"]),
+        _format_param_count(param_summary["retrieval_total"]),
         _format_param_count(param_summary["prototype_trainable"]),
         _format_param_count(param_summary["prototype_total"]),
-        _format_param_count(param_summary["other_trainable"]),
-        _format_param_count(param_summary["other_total"]),
     )
     logger.info(
         "Params | backbone modules: %s",

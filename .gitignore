@@ -219,3 +219,4 @@ __marimo__/
 AGENTS.md
 .codex
 docs/*
+ckpt/*

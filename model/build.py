@@ -252,11 +252,35 @@ class ITSELF(nn.Module):
             if not any(name.startswith(prefix) for prefix in prototype_prefixes)
         )
 
+    def count_clip_parameters(self, trainable_only=False):
+        return self.count_parameters(trainable_only=trainable_only, module_name="base_model")
+
+    def count_retrieval_parameters(self, trainable_only=False):
+        prototype_prefixes = self._prototype_prefixes()
+        if trainable_only:
+            return sum(
+                parameter.numel()
+                for name, parameter in self.named_parameters()
+                if not name.startswith("base_model.")
+                and not any(name.startswith(prefix) for prefix in prototype_prefixes)
+                and parameter.requires_grad
+            )
+        return sum(
+            parameter.numel()
+            for name, parameter in self.named_parameters()
+            if not name.startswith("base_model.")
+            and not any(name.startswith(prefix) for prefix in prototype_prefixes)
+        )
+
     def get_parameter_summary(self):
         total = self.count_parameters(trainable_only=False)
         trainable = self.count_parameters(trainable_only=True)
         backbone_total = self.count_backbone_parameters(trainable_only=False)
         backbone_trainable = self.count_backbone_parameters(trainable_only=True)
+        clip_total = self.count_clip_parameters(trainable_only=False)
+        clip_trainable = self.count_clip_parameters(trainable_only=True)
+        retrieval_total = self.count_retrieval_parameters(trainable_only=False)
+        retrieval_trainable = self.count_retrieval_parameters(trainable_only=True)
         prototype_total = self.count_prototype_parameters(trainable_only=False)
         prototype_trainable = self.count_prototype_parameters(trainable_only=True)
         summary = {
@@ -264,6 +288,10 @@ class ITSELF(nn.Module):
             "trainable": trainable,
             "backbone_total": backbone_total,
             "backbone_trainable": backbone_trainable,
+            "clip_total": clip_total,
+            "clip_trainable": clip_trainable,
+            "retrieval_total": retrieval_total,
+            "retrieval_trainable": retrieval_trainable,
             "prototype_total": prototype_total,
             "prototype_trainable": prototype_trainable,
             "other_total": total - backbone_total - prototype_total,
@@ -294,17 +322,23 @@ class ITSELF(nn.Module):
         for parameter in module.parameters():
             parameter.requires_grad = requires_grad
 
-    def freeze_backbone(self):
+    def freeze_clip(self):
+        self._set_requires_grad(self.base_model, False)
+
+    def unfreeze_clip(self):
+        self._set_requires_grad(self.base_model, True)
+
+    def freeze_retrieval(self):
         prototype_module_names = set(self._prototype_module_names())
         for module_name, module in self.named_children():
-            if module_name in prototype_module_names:
+            if module_name in prototype_module_names or module_name == "base_model":
                 continue
             self._set_requires_grad(module, False)
 
-    def unfreeze_backbone(self):
+    def unfreeze_retrieval(self):
         prototype_module_names = set(self._prototype_module_names())
         for module_name, module in self.named_children():
-            if module_name in prototype_module_names:
+            if module_name in prototype_module_names or module_name == "base_model":
                 continue
             self._set_requires_grad(module, True)
 
@@ -710,8 +744,10 @@ class ITSELF(nn.Module):
 
 def build_model(args, num_classes=11003):
     model = ITSELF(args, num_classes)
-    if getattr(args, "freeze_backbone", False):
-        model.freeze_backbone()
+    if getattr(args, "freeze_clip", False):
+        model.freeze_clip()
+    if getattr(args, "freeze_retrieval", False):
+        model.freeze_retrieval()
     if getattr(args, "freeze_prototype", False):
         model.freeze_prototype()
     convert_weights(model)

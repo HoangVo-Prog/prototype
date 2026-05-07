@@ -28,8 +28,10 @@ def get_args():
                         help="Save a backbone-only checkpoint containing all non-prototype weights")
     parser.add_argument("--save_prototype_ckpt", action="store_true",
                         help="Save a prototype-only checkpoint containing prototype-related weights")
-    parser.add_argument("--freeze_backbone", action="store_true",
-                        help="Freeze all non-prototype modules before building the optimizer")
+    parser.add_argument("--freeze_clip", action="store_true",
+                        help="Freeze the CLIP image/text embedding backbone (`base_model`) before building the optimizer")
+    parser.add_argument("--freeze_retrieval", action="store_true",
+                        help="Freeze all non-CLIP, non-prototype retrieval modules before building the optimizer")
     parser.add_argument("--freeze_prototype", action="store_true",
                         help="Freeze all prototype-related modules before building the optimizer")
 
