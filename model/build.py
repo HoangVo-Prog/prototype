@@ -1,4 +1,5 @@
 import copy
+import logging
 import os
 from model import objectives
 from .clip_model import Transformer, LayerNorm, build_CLIP_from_openai_pretrained, convert_weights,tokenize
@@ -8,6 +9,26 @@ from .grab import TexualEmbeddingLayer, VisualEmbeddingLayer
 from .prototype import PrototypeFusion, VisualPrototypeEnrichment, VisualPrototypeModule
 from .prototype.losses import compute_diversity_loss
 from torch.cuda.amp import autocast
+
+
+logger = logging.getLogger(__name__)
+
+
+def _log_checkpoint_load_status(component_name, path, source_name, load_result):
+    missing_keys = list(getattr(load_result, "missing_keys", []))
+    unexpected_keys = list(getattr(load_result, "unexpected_keys", []))
+    logger.info(
+        "Loaded %s checkpoint from %s using `%s` (%d missing keys, %d unexpected keys)",
+        component_name,
+        path,
+        source_name,
+        len(missing_keys),
+        len(unexpected_keys),
+    )
+    if missing_keys:
+        logger.warning("%s checkpoint missing keys: %s", component_name, missing_keys)
+    if unexpected_keys:
+        logger.warning("%s checkpoint unexpected keys: %s", component_name, unexpected_keys)
 
 
 def l2norm(X, dim=-1, eps=1e-8):
@@ -143,15 +164,39 @@ class ITSELF(nn.Module):
         return sum(p.numel() for p in parameters)
 
     def get_parameter_summary(self):
+        total = self.count_parameters(trainable_only=False)
+        trainable = self.count_parameters(trainable_only=True)
+        backbone_total = self.count_parameters(trainable_only=False, module_name="base_model")
+        backbone_trainable = self.count_parameters(trainable_only=True, module_name="base_model")
+        prototype_total = self.count_parameters(trainable_only=False, module_name="prototype_module")
+        prototype_trainable = self.count_parameters(trainable_only=True, module_name="prototype_module")
         summary = {
-            "total": self.count_parameters(trainable_only=False),
-            "trainable": self.count_parameters(trainable_only=True),
-            "backbone_total": self.count_parameters(trainable_only=False, module_name="base_model"),
-            "backbone_trainable": self.count_parameters(trainable_only=True, module_name="base_model"),
-            "prototype_total": self.count_parameters(trainable_only=False, module_name="prototype_module"),
-            "prototype_trainable": self.count_parameters(trainable_only=True, module_name="prototype_module"),
+            "total": total,
+            "trainable": trainable,
+            "backbone_total": backbone_total,
+            "backbone_trainable": backbone_trainable,
+            "prototype_total": prototype_total,
+            "prototype_trainable": prototype_trainable,
+            "other_total": total - backbone_total - prototype_total,
+            "other_trainable": trainable - backbone_trainable - prototype_trainable,
         }
         return summary
+
+    def get_non_backbone_prototype_parameter_breakdown(self):
+        excluded_modules = {"base_model", "prototype_module"}
+        breakdown = {}
+        for module_name, module in self.named_children():
+            if module_name in excluded_modules:
+                continue
+            total = sum(parameter.numel() for parameter in module.parameters())
+            trainable = sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
+            if total == 0 and trainable == 0:
+                continue
+            breakdown[module_name] = {
+                "total": total,
+                "trainable": trainable,
+            }
+        return breakdown
 
     @staticmethod
     def _set_requires_grad(module, requires_grad):
@@ -202,49 +247,61 @@ class ITSELF(nn.Module):
 
         checkpoint = torch.load(path, map_location=map_location)
         prototype_state_dict = None
+        source_name = None
 
         if isinstance(checkpoint, dict):
             if "prototype_state_dict" in checkpoint:
                 prototype_state_dict = checkpoint["prototype_state_dict"]
+                source_name = "prototype_state_dict"
             elif "prototype_module" in checkpoint and isinstance(checkpoint["prototype_module"], dict):
                 prototype_state_dict = checkpoint["prototype_module"]
+                source_name = "prototype_module"
             elif "model" in checkpoint and isinstance(checkpoint["model"], dict):
                 prototype_state_dict = {
                     key[len("prototype_module."):]: value
                     for key, value in checkpoint["model"].items()
                     if key.startswith("prototype_module.")
                 }
+                source_name = "model.prototype_module"
             elif all(isinstance(key, str) for key in checkpoint.keys()):
                 prototype_state_dict = checkpoint
+                source_name = "raw_state_dict"
 
         if not prototype_state_dict:
             raise KeyError(f"No prototype weights found in checkpoint: {path}")
 
-        self.prototype_module.load_state_dict(prototype_state_dict, strict=strict)
+        load_result = self.prototype_module.load_state_dict(prototype_state_dict, strict=strict)
+        _log_checkpoint_load_status("prototype", path, source_name or "unknown", load_result)
         return checkpoint
 
     def load_backbone_checkpoint(self, path, strict=True, map_location="cpu"):
         checkpoint = torch.load(path, map_location=map_location)
         backbone_state_dict = None
+        source_name = None
 
         if isinstance(checkpoint, dict):
             if "backbone_state_dict" in checkpoint:
                 backbone_state_dict = checkpoint["backbone_state_dict"]
+                source_name = "backbone_state_dict"
             elif "base_model" in checkpoint and isinstance(checkpoint["base_model"], dict):
                 backbone_state_dict = checkpoint["base_model"]
+                source_name = "base_model"
             elif "model" in checkpoint and isinstance(checkpoint["model"], dict):
                 backbone_state_dict = {
                     key[len("base_model."):]: value
                     for key, value in checkpoint["model"].items()
                     if key.startswith("base_model.")
                 }
+                source_name = "model.base_model"
             elif all(isinstance(key, str) for key in checkpoint.keys()):
                 backbone_state_dict = checkpoint
+                source_name = "raw_state_dict"
 
         if not backbone_state_dict:
             raise KeyError(f"No backbone weights found in checkpoint: {path}")
 
-        self.base_model.load_state_dict(backbone_state_dict, strict=strict)
+        load_result = self.base_model.load_state_dict(backbone_state_dict, strict=strict)
+        _log_checkpoint_load_status("backbone", path, source_name or "unknown", load_result)
         return checkpoint
 
     def apply_prototype(self, t_feats, i_feats, training=True, current_step=None, return_stats=False):

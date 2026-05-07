@@ -23,6 +23,17 @@ warnings.filterwarnings("ignore")
 def _format_param_count(count):
     return f"{count / 1_000_000.0:.2f}M"
 
+
+def _format_module_breakdown(breakdown):
+    if not breakdown:
+        return "none"
+    parts = []
+    for module_name, counts in breakdown.items():
+        parts.append(
+            f"{module_name}: {_format_param_count(counts['trainable'])} trainable / {_format_param_count(counts['total'])} total"
+        )
+    return " | ".join(parts)
+
 def set_seed(seed=1):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -94,13 +105,22 @@ if __name__ == '__main__':
 
     param_summary = model.get_parameter_summary()
     logger.info(
-        "Params | total: %s | trainable: %s | backbone: %s trainable / %s total | prototype: %s trainable / %s total",
+        "Params | total: %s | trainable: %s | backbone: %s trainable / %s total | prototype: %s trainable / %s total | other: %s trainable / %s total",
         _format_param_count(param_summary["total"]),
         _format_param_count(param_summary["trainable"]),
         _format_param_count(param_summary["backbone_trainable"]),
         _format_param_count(param_summary["backbone_total"]),
         _format_param_count(param_summary["prototype_trainable"]),
         _format_param_count(param_summary["prototype_total"]),
+        _format_param_count(param_summary["other_trainable"]),
+        _format_param_count(param_summary["other_total"]),
+    )
+    logger.info(
+        "Params | non-backbone/prototype modules: %s",
+        _format_module_breakdown(model.get_non_backbone_prototype_parameter_breakdown()),
+    )
+    logger.info(
+        "Checkpoint scope | --load_backbone_ckpt loads only `base_model.*` weights | --load_prototype_ckpt loads only `prototype_module.*` weights"
     )
     model.to(device)
     if args.distributed:
