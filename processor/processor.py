@@ -62,11 +62,14 @@ def _get_prototype_param(model):
     target_model = model.module if hasattr(model, "module") else model
     if not getattr(target_model, "use_prototype", False):
         return None
-    return target_model.prototype_module.visual_meta_matrix
+    parameter = target_model.prototype_module.visual_meta_matrix
+    if not parameter.requires_grad:
+        return None
+    return parameter
 
 
 def _get_loss_grad_norm(loss_value, parameter):
-    if loss_value is None or parameter is None:
+    if loss_value is None or parameter is None or not parameter.requires_grad:
         return None
 
     grads = torch.autograd.grad(
