@@ -14,12 +14,12 @@ from torch.cuda.amp import autocast
 logger = logging.getLogger(__name__)
 
 LEGACY_KEY_PREFIX_RENAMES = (
-    ("classifier_tse.", "classifier_global."),
-    ("mlp_tse.", "mlp_global."),
-    ("classifier_id_tse.", "classifier_id_global."),
-    ("classifier_bge.", "classifier_grab."),
-    ("mlp_bge.", "mlp_grab."),
-    ("classifier_id_bge.", "classifier_id_grab."),
+    ("classifier_bge.", "classifier_global."),
+    ("mlp_bge.", "mlp_global."),
+    ("classifier_id_bge.", "classifier_id_global."),
+    ("classifier_tse.", "classifier_grab."),
+    ("mlp_tse.", "mlp_grab."),
+    ("classifier_id_tse.", "classifier_id_grab."),
     ("prototype_fusion.", "text_prototype_fusion.fusion."),
 )
 
