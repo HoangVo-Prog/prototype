@@ -23,21 +23,44 @@ def _filter_keys_by_prefix(keys, ignored_prefixes=None):
     ]
 
 
-def _log_checkpoint_load_status(component_name, path, source_name, load_result, ignored_prefixes=None):
-    missing_keys = _filter_keys_by_prefix(getattr(load_result, "missing_keys", []), ignored_prefixes)
-    unexpected_keys = _filter_keys_by_prefix(getattr(load_result, "unexpected_keys", []), ignored_prefixes)
+def _load_matching_state_dict(module, loaded_state_dict, ignored_target_prefixes=None):
+    current_state_dict = module.state_dict()
+    allowed_target_keys = _filter_keys_by_prefix(current_state_dict.keys(), ignored_target_prefixes)
+    filtered_state_dict = {}
+    skipped_source_keys = []
+    shape_mismatched_keys = []
+
+    for key, value in loaded_state_dict.items():
+        if key not in current_state_dict:
+            skipped_source_keys.append(key)
+            continue
+        if current_state_dict[key].shape != value.shape:
+            shape_mismatched_keys.append(key)
+            continue
+        filtered_state_dict[key] = value
+
+    current_state_dict.update(filtered_state_dict)
+    module.load_state_dict(current_state_dict, strict=True)
+
+    return {
+        "loaded_keys": sorted(filtered_state_dict.keys()),
+        "skipped_source_keys": sorted(skipped_source_keys),
+        "shape_mismatched_keys": sorted(shape_mismatched_keys),
+        "target_keys_kept": sorted(set(allowed_target_keys) - set(filtered_state_dict.keys())),
+    }
+
+
+def _log_checkpoint_load_status(component_name, path, source_name, load_stats):
     logger.info(
-        "Loaded %s checkpoint from %s using `%s` (%d missing keys, %d unexpected keys)",
+        "Loaded %s checkpoint from %s using `%s` (%d tensors loaded, %d current tensors kept, %d checkpoint tensors skipped, %d shape mismatches)",
         component_name,
         path,
         source_name,
-        len(missing_keys),
-        len(unexpected_keys),
+        len(load_stats["loaded_keys"]),
+        len(load_stats["target_keys_kept"]),
+        len(load_stats["skipped_source_keys"]),
+        len(load_stats["shape_mismatched_keys"]),
     )
-    if missing_keys:
-        logger.warning("%s checkpoint missing keys: %s", component_name, missing_keys)
-    if unexpected_keys:
-        logger.warning("%s checkpoint unexpected keys: %s", component_name, unexpected_keys)
 
 
 def l2norm(X, dim=-1, eps=1e-8):
@@ -315,8 +338,19 @@ class ITSELF(nn.Module):
         if not prototype_state_dict:
             raise KeyError(f"No prototype weights found in checkpoint: {path}")
 
-        load_result = self.prototype_module.load_state_dict(prototype_state_dict, strict=strict)
-        _log_checkpoint_load_status("prototype", path, source_name or "unknown", load_result)
+        load_stats = _load_matching_state_dict(self.prototype_module, prototype_state_dict)
+        _log_checkpoint_load_status("prototype", path, source_name or "unknown", load_stats)
+        if strict and (
+            load_stats["target_keys_kept"]
+            or load_stats["skipped_source_keys"]
+            or load_stats["shape_mismatched_keys"]
+        ):
+            raise RuntimeError(
+                f"Error(s) in loading prototype checkpoint for {path}: "
+                f"kept={load_stats['target_keys_kept']}, "
+                f"skipped={load_stats['skipped_source_keys']}, "
+                f"shape_mismatched={load_stats['shape_mismatched_keys']}"
+            )
         return checkpoint
 
     def load_backbone_checkpoint(self, path, strict=True, map_location="cpu"):
@@ -348,20 +382,18 @@ class ITSELF(nn.Module):
         if not backbone_state_dict:
             raise KeyError(f"No backbone weights found in checkpoint: {path}")
 
-        load_result = self.load_state_dict(backbone_state_dict, strict=False)
-        _log_checkpoint_load_status(
-            "backbone",
-            path,
-            source_name or "unknown",
-            load_result,
-            ignored_prefixes=["prototype_module."],
-        )
-        filtered_missing_keys = _filter_keys_by_prefix(load_result.missing_keys, ignored_prefixes=["prototype_module."])
-        filtered_unexpected_keys = _filter_keys_by_prefix(load_result.unexpected_keys, ignored_prefixes=["prototype_module."])
-        if strict and (filtered_missing_keys or filtered_unexpected_keys):
+        load_stats = _load_matching_state_dict(self, backbone_state_dict, ignored_target_prefixes=["prototype_module."])
+        _log_checkpoint_load_status("backbone", path, source_name or "unknown", load_stats)
+        if strict and (
+            load_stats["target_keys_kept"]
+            or load_stats["skipped_source_keys"]
+            or load_stats["shape_mismatched_keys"]
+        ):
             raise RuntimeError(
                 f"Error(s) in loading backbone checkpoint for {path}: "
-                f"missing keys={filtered_missing_keys}, unexpected keys={filtered_unexpected_keys}"
+                f"kept={load_stats['target_keys_kept']}, "
+                f"skipped={load_stats['skipped_source_keys']}, "
+                f"shape_mismatched={load_stats['shape_mismatched_keys']}"
             )
         return checkpoint
 

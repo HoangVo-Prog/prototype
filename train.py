@@ -120,7 +120,7 @@ if __name__ == '__main__':
         _format_module_breakdown(model.get_backbone_parameter_breakdown()),
     )
     logger.info(
-        "Checkpoint scope | --load_backbone_ckpt loads all non-prototype weights | --load_prototype_ckpt loads only `prototype_module.*` weights | --save_backbone_ckpt saves all non-prototype weights"
+        "Checkpoint scope | --load_backbone_ckpt loads matching non-prototype weights and keeps unmatched current modules initialized | --load_prototype_ckpt loads matching `prototype_module.*` weights | --save_backbone_ckpt saves all non-prototype weights"
     )
     model.to(device)
     if args.distributed:
