@@ -21,13 +21,15 @@ def get_args():
     parser.add_argument("--finetune", type=str, default="")
     parser.add_argument("--pretrain", type=str, default="")
     parser.add_argument("--load_backbone_ckpt", type=str, default="",
-                        help="Load backbone weights from a backbone-only or full model checkpoint")
+                        help="Load all non-prototype weights from a backbone-only or full model checkpoint")
     parser.add_argument("--load_prototype_ckpt", type=str, default="",
                         help="Load prototype weights from a prototype-only or full model checkpoint")
+    parser.add_argument("--save_backbone_ckpt", action="store_true",
+                        help="Save a backbone-only checkpoint containing all non-prototype weights")
     parser.add_argument("--save_prototype_ckpt", action="store_true",
                         help="Save a prototype-only checkpoint alongside each saved model checkpoint")
     parser.add_argument("--freeze_backbone", action="store_true",
-                        help="Freeze the CLIP backbone before building the optimizer")
+                        help="Freeze all non-prototype modules before building the optimizer")
     parser.add_argument("--freeze_prototype", action="store_true",
                         help="Freeze the prototype module before building the optimizer")
 

@@ -36,6 +36,7 @@ class Checkpointer:
             return
 
         save_prototype = kwargs.pop("save_prototype", False)
+        save_backbone = kwargs.pop("save_backbone", False)
         data = {}
         data["model"] = self.model.state_dict()
         if self.optimizer is not None:
@@ -49,6 +50,10 @@ class Checkpointer:
         torch.save(data, save_file)
 
         model = self._get_model()
+        if save_backbone:
+            backbone_save_file = os.path.join(self.save_dir, f"{name}_backbone.pth")
+            self.logger.info("Saving backbone checkpoint to {}".format(backbone_save_file))
+            model.save_backbone_checkpoint(backbone_save_file, extra=kwargs)
         if save_prototype:
             prototype_save_file = os.path.join(self.save_dir, f"{name}_prototype.pth")
             self.logger.info("Saving prototype checkpoint to {}".format(prototype_save_file))

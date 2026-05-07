@@ -116,11 +116,11 @@ if __name__ == '__main__':
         _format_param_count(param_summary["other_total"]),
     )
     logger.info(
-        "Params | non-backbone/prototype modules: %s",
-        _format_module_breakdown(model.get_non_backbone_prototype_parameter_breakdown()),
+        "Params | backbone modules: %s",
+        _format_module_breakdown(model.get_backbone_parameter_breakdown()),
     )
     logger.info(
-        "Checkpoint scope | --load_backbone_ckpt loads only `base_model.*` weights | --load_prototype_ckpt loads only `prototype_module.*` weights"
+        "Checkpoint scope | --load_backbone_ckpt loads all non-prototype weights | --load_prototype_ckpt loads only `prototype_module.*` weights | --save_backbone_ckpt saves all non-prototype weights"
     )
     model.to(device)
     if args.distributed:

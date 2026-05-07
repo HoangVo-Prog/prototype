@@ -14,9 +14,18 @@ from torch.cuda.amp import autocast
 logger = logging.getLogger(__name__)
 
 
-def _log_checkpoint_load_status(component_name, path, source_name, load_result):
-    missing_keys = list(getattr(load_result, "missing_keys", []))
-    unexpected_keys = list(getattr(load_result, "unexpected_keys", []))
+def _filter_keys_by_prefix(keys, ignored_prefixes=None):
+    if not ignored_prefixes:
+        return list(keys)
+    return [
+        key for key in keys
+        if not any(key.startswith(prefix) for prefix in ignored_prefixes)
+    ]
+
+
+def _log_checkpoint_load_status(component_name, path, source_name, load_result, ignored_prefixes=None):
+    missing_keys = _filter_keys_by_prefix(getattr(load_result, "missing_keys", []), ignored_prefixes)
+    unexpected_keys = _filter_keys_by_prefix(getattr(load_result, "unexpected_keys", []), ignored_prefixes)
     logger.info(
         "Loaded %s checkpoint from %s using `%s` (%d missing keys, %d unexpected keys)",
         component_name,
@@ -163,11 +172,24 @@ class ITSELF(nn.Module):
             return sum(p.numel() for p in parameters if p.requires_grad)
         return sum(p.numel() for p in parameters)
 
+    def count_backbone_parameters(self, trainable_only=False):
+        if trainable_only:
+            return sum(
+                parameter.numel()
+                for name, parameter in self.named_parameters()
+                if not name.startswith("prototype_module.") and parameter.requires_grad
+            )
+        return sum(
+            parameter.numel()
+            for name, parameter in self.named_parameters()
+            if not name.startswith("prototype_module.")
+        )
+
     def get_parameter_summary(self):
         total = self.count_parameters(trainable_only=False)
         trainable = self.count_parameters(trainable_only=True)
-        backbone_total = self.count_parameters(trainable_only=False, module_name="base_model")
-        backbone_trainable = self.count_parameters(trainable_only=True, module_name="base_model")
+        backbone_total = self.count_backbone_parameters(trainable_only=False)
+        backbone_trainable = self.count_backbone_parameters(trainable_only=True)
         prototype_total = self.count_parameters(trainable_only=False, module_name="prototype_module")
         prototype_trainable = self.count_parameters(trainable_only=True, module_name="prototype_module")
         summary = {
@@ -182,11 +204,10 @@ class ITSELF(nn.Module):
         }
         return summary
 
-    def get_non_backbone_prototype_parameter_breakdown(self):
-        excluded_modules = {"base_model", "prototype_module"}
+    def get_backbone_parameter_breakdown(self):
         breakdown = {}
         for module_name, module in self.named_children():
-            if module_name in excluded_modules:
+            if module_name == "prototype_module":
                 continue
             total = sum(parameter.numel() for parameter in module.parameters())
             trainable = sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
@@ -206,10 +227,16 @@ class ITSELF(nn.Module):
             parameter.requires_grad = requires_grad
 
     def freeze_backbone(self):
-        self._set_requires_grad(self.base_model, False)
+        for module_name, module in self.named_children():
+            if module_name == "prototype_module":
+                continue
+            self._set_requires_grad(module, False)
 
     def unfreeze_backbone(self):
-        self._set_requires_grad(self.base_model, True)
+        for module_name, module in self.named_children():
+            if module_name == "prototype_module":
+                continue
+            self._set_requires_grad(module, True)
 
     def freeze_prototype(self):
         if self.use_prototype:
@@ -234,6 +261,24 @@ class ITSELF(nn.Module):
             raise RuntimeError("Prototype module is disabled; cannot save prototype checkpoint.")
 
         checkpoint = self.export_prototype_state()
+        if extra:
+            checkpoint.update(extra)
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        torch.save(checkpoint, path)
+
+    def export_backbone_state(self):
+        return {
+            "backbone_state_dict": {
+                key: value
+                for key, value in self.state_dict().items()
+                if not key.startswith("prototype_module.")
+            }
+        }
+
+    def save_backbone_checkpoint(self, path, extra=None):
+        checkpoint = self.export_backbone_state()
         if extra:
             checkpoint.update(extra)
         directory = os.path.dirname(path)
@@ -284,15 +329,18 @@ class ITSELF(nn.Module):
                 backbone_state_dict = checkpoint["backbone_state_dict"]
                 source_name = "backbone_state_dict"
             elif "base_model" in checkpoint and isinstance(checkpoint["base_model"], dict):
-                backbone_state_dict = checkpoint["base_model"]
-                source_name = "base_model"
+                backbone_state_dict = {
+                    f"base_model.{key}": value
+                    for key, value in checkpoint["base_model"].items()
+                }
+                source_name = "base_model (legacy backbone-only)"
             elif "model" in checkpoint and isinstance(checkpoint["model"], dict):
                 backbone_state_dict = {
-                    key[len("base_model."):]: value
+                    key: value
                     for key, value in checkpoint["model"].items()
-                    if key.startswith("base_model.")
+                    if not key.startswith("prototype_module.")
                 }
-                source_name = "model.base_model"
+                source_name = "model (all non-prototype modules)"
             elif all(isinstance(key, str) for key in checkpoint.keys()):
                 backbone_state_dict = checkpoint
                 source_name = "raw_state_dict"
@@ -300,8 +348,21 @@ class ITSELF(nn.Module):
         if not backbone_state_dict:
             raise KeyError(f"No backbone weights found in checkpoint: {path}")
 
-        load_result = self.base_model.load_state_dict(backbone_state_dict, strict=strict)
-        _log_checkpoint_load_status("backbone", path, source_name or "unknown", load_result)
+        load_result = self.load_state_dict(backbone_state_dict, strict=False)
+        _log_checkpoint_load_status(
+            "backbone",
+            path,
+            source_name or "unknown",
+            load_result,
+            ignored_prefixes=["prototype_module."],
+        )
+        filtered_missing_keys = _filter_keys_by_prefix(load_result.missing_keys, ignored_prefixes=["prototype_module."])
+        filtered_unexpected_keys = _filter_keys_by_prefix(load_result.unexpected_keys, ignored_prefixes=["prototype_module."])
+        if strict and (filtered_missing_keys or filtered_unexpected_keys):
+            raise RuntimeError(
+                f"Error(s) in loading backbone checkpoint for {path}: "
+                f"missing keys={filtered_missing_keys}, unexpected keys={filtered_unexpected_keys}"
+            )
         return checkpoint
 
     def apply_prototype(self, t_feats, i_feats, training=True, current_step=None, return_stats=False):
