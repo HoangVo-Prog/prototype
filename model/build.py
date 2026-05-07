@@ -13,6 +13,16 @@ from torch.cuda.amp import autocast
 
 logger = logging.getLogger(__name__)
 
+LEGACY_KEY_PREFIX_RENAMES = (
+    ("classifier_tse.", "classifier_global."),
+    ("mlp_tse.", "mlp_global."),
+    ("classifier_id_tse.", "classifier_id_global."),
+    ("classifier_bge.", "classifier_grab."),
+    ("mlp_bge.", "mlp_grab."),
+    ("classifier_id_bge.", "classifier_id_grab."),
+    ("prototype_fusion.", "text_prototype_fusion.fusion."),
+)
+
 
 def _filter_keys_by_prefix(keys, ignored_prefixes=None):
     if not ignored_prefixes:
@@ -23,43 +33,52 @@ def _filter_keys_by_prefix(keys, ignored_prefixes=None):
     ]
 
 
-def _load_matching_state_dict(module, loaded_state_dict, ignored_target_prefixes=None):
-    current_state_dict = module.state_dict()
-    allowed_target_keys = _filter_keys_by_prefix(current_state_dict.keys(), ignored_target_prefixes)
-    filtered_state_dict = {}
-    skipped_source_keys = []
-    shape_mismatched_keys = []
+def _rename_legacy_key(key):
+    for source_prefix, target_prefix in LEGACY_KEY_PREFIX_RENAMES:
+        if key.startswith(source_prefix):
+            return f"{target_prefix}{key[len(source_prefix):]}"
+    return key
 
+
+def _normalize_checkpoint_state_dict(loaded_state_dict, add_prefix=None):
+    normalized_state_dict = {}
     for key, value in loaded_state_dict.items():
-        if key not in current_state_dict:
-            skipped_source_keys.append(key)
-            continue
-        if current_state_dict[key].shape != value.shape:
-            shape_mismatched_keys.append(key)
-            continue
-        filtered_state_dict[key] = value
+        normalized_key = _rename_legacy_key(key)
+        if add_prefix and not normalized_key.startswith(add_prefix):
+            normalized_key = f"{add_prefix}{normalized_key}"
+        normalized_state_dict[normalized_key] = value
+    return normalized_state_dict
 
-    current_state_dict.update(filtered_state_dict)
+
+def _load_scoped_state_dict(module, scoped_state_dict, allowed_target_keys):
+    current_state_dict = module.state_dict()
+    scoped_target_keys = set(allowed_target_keys)
+    source_keys = set(scoped_state_dict.keys())
+    missing_keys = sorted(scoped_target_keys - source_keys)
+    unexpected_keys = sorted(source_keys - scoped_target_keys)
+    shape_mismatched_keys = sorted(
+        key for key in scoped_target_keys & source_keys
+        if current_state_dict[key].shape != scoped_state_dict[key].shape
+    )
+
+    if missing_keys or unexpected_keys or shape_mismatched_keys:
+        raise RuntimeError(
+            "Scoped checkpoint mismatch: "
+            f"missing={missing_keys}, unexpected={unexpected_keys}, shape_mismatched={shape_mismatched_keys}"
+        )
+
+    current_state_dict.update(scoped_state_dict)
     module.load_state_dict(current_state_dict, strict=True)
-
-    return {
-        "loaded_keys": sorted(filtered_state_dict.keys()),
-        "skipped_source_keys": sorted(skipped_source_keys),
-        "shape_mismatched_keys": sorted(shape_mismatched_keys),
-        "target_keys_kept": sorted(set(allowed_target_keys) - set(filtered_state_dict.keys())),
-    }
+    return sorted(scoped_target_keys)
 
 
-def _log_checkpoint_load_status(component_name, path, source_name, load_stats):
+def _log_checkpoint_load_status(component_name, path, source_name, loaded_keys):
     logger.info(
-        "Loaded %s checkpoint from %s using `%s` (%d tensors loaded, %d current tensors kept, %d checkpoint tensors skipped, %d shape mismatches)",
+        "Loaded %s checkpoint from %s using `%s` (%d tensors loaded)",
         component_name,
         path,
         source_name,
-        len(load_stats["loaded_keys"]),
-        len(load_stats["target_keys_kept"]),
-        len(load_stats["skipped_source_keys"]),
-        len(load_stats["shape_mismatched_keys"]),
+        len(loaded_keys),
     )
 
 
@@ -195,17 +214,42 @@ class ITSELF(nn.Module):
             return sum(p.numel() for p in parameters if p.requires_grad)
         return sum(p.numel() for p in parameters)
 
-    def count_backbone_parameters(self, trainable_only=False):
+    def _prototype_module_names(self):
+        module_names = []
+        for module_name in ("prototype_module", "text_prototype_fusion", "vision_prototype_enrichment"):
+            if getattr(self, module_name, None) is not None:
+                module_names.append(module_name)
+        return tuple(module_names)
+
+    def _prototype_prefixes(self):
+        return tuple(f"{module_name}." for module_name in self._prototype_module_names())
+
+    def count_prototype_parameters(self, trainable_only=False):
+        prototype_prefixes = self._prototype_prefixes()
         if trainable_only:
             return sum(
                 parameter.numel()
                 for name, parameter in self.named_parameters()
-                if not name.startswith("prototype_module.") and parameter.requires_grad
+                if any(name.startswith(prefix) for prefix in prototype_prefixes) and parameter.requires_grad
             )
         return sum(
             parameter.numel()
             for name, parameter in self.named_parameters()
-            if not name.startswith("prototype_module.")
+            if any(name.startswith(prefix) for prefix in prototype_prefixes)
+        )
+
+    def count_backbone_parameters(self, trainable_only=False):
+        prototype_prefixes = self._prototype_prefixes()
+        if trainable_only:
+            return sum(
+                parameter.numel()
+                for name, parameter in self.named_parameters()
+                if not any(name.startswith(prefix) for prefix in prototype_prefixes) and parameter.requires_grad
+            )
+        return sum(
+            parameter.numel()
+            for name, parameter in self.named_parameters()
+            if not any(name.startswith(prefix) for prefix in prototype_prefixes)
         )
 
     def get_parameter_summary(self):
@@ -213,8 +257,8 @@ class ITSELF(nn.Module):
         trainable = self.count_parameters(trainable_only=True)
         backbone_total = self.count_backbone_parameters(trainable_only=False)
         backbone_trainable = self.count_backbone_parameters(trainable_only=True)
-        prototype_total = self.count_parameters(trainable_only=False, module_name="prototype_module")
-        prototype_trainable = self.count_parameters(trainable_only=True, module_name="prototype_module")
+        prototype_total = self.count_prototype_parameters(trainable_only=False)
+        prototype_trainable = self.count_prototype_parameters(trainable_only=True)
         summary = {
             "total": total,
             "trainable": trainable,
@@ -228,9 +272,10 @@ class ITSELF(nn.Module):
         return summary
 
     def get_backbone_parameter_breakdown(self):
+        prototype_module_names = set(self._prototype_module_names())
         breakdown = {}
         for module_name, module in self.named_children():
-            if module_name == "prototype_module":
+            if module_name in prototype_module_names:
                 continue
             total = sum(parameter.numel() for parameter in module.parameters())
             trainable = sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
@@ -250,24 +295,26 @@ class ITSELF(nn.Module):
             parameter.requires_grad = requires_grad
 
     def freeze_backbone(self):
+        prototype_module_names = set(self._prototype_module_names())
         for module_name, module in self.named_children():
-            if module_name == "prototype_module":
+            if module_name in prototype_module_names:
                 continue
             self._set_requires_grad(module, False)
 
     def unfreeze_backbone(self):
+        prototype_module_names = set(self._prototype_module_names())
         for module_name, module in self.named_children():
-            if module_name == "prototype_module":
+            if module_name in prototype_module_names:
                 continue
             self._set_requires_grad(module, True)
 
     def freeze_prototype(self):
-        if self.use_prototype:
-            self._set_requires_grad(self.prototype_module, False)
+        for module_name in self._prototype_module_names():
+            self._set_requires_grad(getattr(self, module_name, None), False)
 
     def unfreeze_prototype(self):
-        if self.use_prototype:
-            self._set_requires_grad(self.prototype_module, True)
+        for module_name in self._prototype_module_names():
+            self._set_requires_grad(getattr(self, module_name, None), True)
 
     def export_prototype_state(self):
         if not self.use_prototype:
@@ -276,7 +323,11 @@ class ITSELF(nn.Module):
         return {
             "num_prototypes": self.prototype_module.num_prototypes,
             "embed_dim": self.prototype_module.embed_dim,
-            "prototype_state_dict": self.prototype_module.state_dict(),
+            "prototype_state_dict": {
+                key: value
+                for key, value in self.state_dict().items()
+                if any(key.startswith(prefix) for prefix in self._prototype_prefixes())
+            },
         }
 
     def save_prototype_checkpoint(self, path, extra=None):
@@ -296,7 +347,7 @@ class ITSELF(nn.Module):
             "backbone_state_dict": {
                 key: value
                 for key, value in self.state_dict().items()
-                if not key.startswith("prototype_module.")
+                if not any(key.startswith(prefix) for prefix in self._prototype_prefixes())
             }
         }
 
@@ -319,38 +370,36 @@ class ITSELF(nn.Module):
 
         if isinstance(checkpoint, dict):
             if "prototype_state_dict" in checkpoint:
-                prototype_state_dict = checkpoint["prototype_state_dict"]
+                prototype_state_dict = _normalize_checkpoint_state_dict(checkpoint["prototype_state_dict"])
                 source_name = "prototype_state_dict"
             elif "prototype_module" in checkpoint and isinstance(checkpoint["prototype_module"], dict):
-                prototype_state_dict = checkpoint["prototype_module"]
+                prototype_state_dict = _normalize_checkpoint_state_dict(
+                    checkpoint["prototype_module"],
+                    add_prefix="prototype_module.",
+                )
                 source_name = "prototype_module"
             elif "model" in checkpoint and isinstance(checkpoint["model"], dict):
-                prototype_state_dict = {
-                    key[len("prototype_module."):]: value
-                    for key, value in checkpoint["model"].items()
-                    if key.startswith("prototype_module.")
-                }
-                source_name = "model.prototype_module"
+                prototype_state_dict = _normalize_checkpoint_state_dict(checkpoint["model"])
+                source_name = "model.prototype_related"
             elif all(isinstance(key, str) for key in checkpoint.keys()):
-                prototype_state_dict = checkpoint
+                prototype_state_dict = _normalize_checkpoint_state_dict(checkpoint)
                 source_name = "raw_state_dict"
 
         if not prototype_state_dict:
             raise KeyError(f"No prototype weights found in checkpoint: {path}")
 
-        load_stats = _load_matching_state_dict(self.prototype_module, prototype_state_dict)
-        _log_checkpoint_load_status("prototype", path, source_name or "unknown", load_stats)
-        if strict and (
-            load_stats["target_keys_kept"]
-            or load_stats["skipped_source_keys"]
-            or load_stats["shape_mismatched_keys"]
-        ):
-            raise RuntimeError(
-                f"Error(s) in loading prototype checkpoint for {path}: "
-                f"kept={load_stats['target_keys_kept']}, "
-                f"skipped={load_stats['skipped_source_keys']}, "
-                f"shape_mismatched={load_stats['shape_mismatched_keys']}"
-            )
+        prototype_prefixes = self._prototype_prefixes()
+        prototype_state_dict = {
+            key: value
+            for key, value in prototype_state_dict.items()
+            if any(key.startswith(prefix) for prefix in prototype_prefixes)
+        }
+        prototype_target_keys = [
+            key for key in self.state_dict().keys()
+            if any(key.startswith(prefix) for prefix in prototype_prefixes)
+        ]
+        loaded_keys = _load_scoped_state_dict(self, prototype_state_dict, prototype_target_keys)
+        _log_checkpoint_load_status("prototype", path, source_name or "unknown", loaded_keys)
         return checkpoint
 
     def load_backbone_checkpoint(self, path, strict=True, map_location="cpu"):
@@ -360,41 +409,36 @@ class ITSELF(nn.Module):
 
         if isinstance(checkpoint, dict):
             if "backbone_state_dict" in checkpoint:
-                backbone_state_dict = checkpoint["backbone_state_dict"]
+                backbone_state_dict = _normalize_checkpoint_state_dict(checkpoint["backbone_state_dict"])
                 source_name = "backbone_state_dict"
             elif "base_model" in checkpoint and isinstance(checkpoint["base_model"], dict):
-                backbone_state_dict = {
-                    f"base_model.{key}": value
-                    for key, value in checkpoint["base_model"].items()
-                }
+                backbone_state_dict = _normalize_checkpoint_state_dict(
+                    checkpoint["base_model"],
+                    add_prefix="base_model.",
+                )
                 source_name = "base_model (legacy backbone-only)"
             elif "model" in checkpoint and isinstance(checkpoint["model"], dict):
-                backbone_state_dict = {
-                    key: value
-                    for key, value in checkpoint["model"].items()
-                    if not key.startswith("prototype_module.")
-                }
+                backbone_state_dict = _normalize_checkpoint_state_dict(checkpoint["model"])
                 source_name = "model (all non-prototype modules)"
             elif all(isinstance(key, str) for key in checkpoint.keys()):
-                backbone_state_dict = checkpoint
+                backbone_state_dict = _normalize_checkpoint_state_dict(checkpoint)
                 source_name = "raw_state_dict"
 
         if not backbone_state_dict:
             raise KeyError(f"No backbone weights found in checkpoint: {path}")
 
-        load_stats = _load_matching_state_dict(self, backbone_state_dict, ignored_target_prefixes=["prototype_module."])
-        _log_checkpoint_load_status("backbone", path, source_name or "unknown", load_stats)
-        if strict and (
-            load_stats["target_keys_kept"]
-            or load_stats["skipped_source_keys"]
-            or load_stats["shape_mismatched_keys"]
-        ):
-            raise RuntimeError(
-                f"Error(s) in loading backbone checkpoint for {path}: "
-                f"kept={load_stats['target_keys_kept']}, "
-                f"skipped={load_stats['skipped_source_keys']}, "
-                f"shape_mismatched={load_stats['shape_mismatched_keys']}"
-            )
+        prototype_prefixes = self._prototype_prefixes()
+        backbone_state_dict = {
+            key: value
+            for key, value in backbone_state_dict.items()
+            if not any(key.startswith(prefix) for prefix in prototype_prefixes)
+        }
+        backbone_target_keys = [
+            key for key in self.state_dict().keys()
+            if not any(key.startswith(prefix) for prefix in prototype_prefixes)
+        ]
+        loaded_keys = _load_scoped_state_dict(self, backbone_state_dict, backbone_target_keys)
+        _log_checkpoint_load_status("backbone", path, source_name or "unknown", loaded_keys)
         return checkpoint
 
     def apply_prototype(self, t_feats, i_feats, training=True, current_step=None, return_stats=False):
