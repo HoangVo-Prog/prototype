@@ -1,5 +1,7 @@
+import contextlib
 import importlib.util
 import importlib
+import io
 import pathlib
 import sys
 import unittest
@@ -487,6 +489,16 @@ class PoolManagerTests(unittest.TestCase):
 
 
 class SchedulerOptionTests(unittest.TestCase):
+    def test_host_clip_finetune_cli_parses_checkpoint_path(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = ["test", "--finetune_clip", "host_clip.pth"]
+            parsed = options.get_args()
+        finally:
+            sys.argv = old_argv
+        self.assertEqual(parsed.finetune_clip, "host_clip.pth")
+
     def test_positive_boolean_cli_parser(self):
         options = importlib.import_module("utils.options")
         self.assertTrue(options.str2bool("true"))
@@ -501,9 +513,30 @@ class SchedulerOptionTests(unittest.TestCase):
         finally:
             sys.argv = old_argv
         self.assertTrue(parsed.use_host_loss)
+        self.assertEqual(parsed.enrichment_start, 1)
         self.assertFalse(parsed.use_target_retrieval_loss)
         self.assertFalse(parsed.use_target_attention_loss)
         self.assertFalse(parsed.use_target_robust_loss)
+
+    def test_enrichment_start_cli_parses_start_epoch(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = ["test", "--enrichment_start", "5"]
+            parsed = options.get_args()
+        finally:
+            sys.argv = old_argv
+        self.assertEqual(parsed.enrichment_start, 5)
+
+    def test_enrichment_start_cli_requires_positive_epoch(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = ["test", "--enrichment_start", "0"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+        finally:
+            sys.argv = old_argv
 
     def test_loss_cli_flags_are_store_true_and_host_can_be_disabled(self):
         options = importlib.import_module("utils.options")
@@ -540,6 +573,31 @@ class SchedulerOptionTests(unittest.TestCase):
             power=0.9,
         ), optimizer)
         self.assertEqual(sched.total_epochs, 200)
+
+
+class HostCheckpointTests(unittest.TestCase):
+    def test_extract_host_state_dict_from_itself_checkpoint(self):
+        checkpoint = importlib.import_module("utils.checkpoint")
+        state_dict = checkpoint.unwrap_checkpoint_state_dict({
+            "model": {
+                "module.base_model.visual.conv1.weight": torch.ones(1),
+                "module.classifier_global.weight": torch.zeros(1),
+            }
+        })
+        host_state_dict = checkpoint.extract_host_model_state_dict(state_dict)
+        self.assertEqual(list(host_state_dict.keys()), ["visual.conv1.weight"])
+        self.assertTrue(torch.equal(host_state_dict["visual.conv1.weight"], torch.ones(1)))
+
+    def test_raw_clip_state_dict_is_kept(self):
+        checkpoint = importlib.import_module("utils.checkpoint")
+        state_dict = checkpoint.unwrap_checkpoint_state_dict({
+            "state_dict": {
+                "visual.conv1.weight": torch.ones(1),
+                "transformer.resblocks.0.attn.in_proj_weight": torch.zeros(1),
+            }
+        })
+        host_state_dict = checkpoint.extract_host_model_state_dict(state_dict)
+        self.assertEqual(set(host_state_dict.keys()), set(state_dict.keys()))
 
 
 if __name__ == "__main__":

@@ -136,6 +136,36 @@ def strip_prefix_if_present(state_dict, prefix):
     return stripped_state_dict
 
 
+def unwrap_checkpoint_state_dict(checkpoint):
+    for key in ("model", "state_dict"):
+        if isinstance(checkpoint, dict) and isinstance(checkpoint.get(key), dict):
+            return checkpoint[key]
+    if isinstance(checkpoint, dict):
+        return checkpoint
+    raise TypeError("Checkpoint must be a state dict or contain a 'model'/'state_dict' entry")
+
+
+def strip_prefix_from_keys(state_dict, prefix):
+    stripped_state_dict = OrderedDict()
+    for key, value in state_dict.items():
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+        stripped_state_dict[key] = value
+    return stripped_state_dict
+
+
+def extract_host_model_state_dict(state_dict, host_prefix="base_model."):
+    state_dict = strip_prefix_from_keys(state_dict, "module.")
+    host_state_dict = OrderedDict(
+        (key[len(host_prefix):], value)
+        for key, value in state_dict.items()
+        if key.startswith(host_prefix)
+    )
+    if host_state_dict:
+        return host_state_dict
+    return state_dict
+
+
 def load_state_dict(model, loaded_state_dict, except_keys=None):
     model_state_dict = model.state_dict()
     # if the state_dict comes from a model that was wrapped in a

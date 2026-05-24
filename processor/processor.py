@@ -36,6 +36,13 @@ def _grad_norm(parameters):
     return total ** 0.5
 
 
+def _target_enrichment_active(args, epoch):
+    enrichment_start = getattr(args, "enrichment_start", 1)
+    if enrichment_start < 1:
+        raise ValueError("--enrichment_start must be a positive integer")
+    return getattr(args, "target_enrichment", False) and epoch >= enrichment_start
+
+
 def _loss_grad_norm(loss, parameters):
     if not _is_trainable_loss(loss):
         return 0.0
@@ -67,6 +74,12 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
     logger = logging.getLogger("ITSELF.train")
     logger.info('start training')
+    if target_pool is not None and getattr(args, "enrichment_start", 1) > 1:
+        logger.info(
+            "Target enrichment delayed until epoch {}; earlier epochs use host training only".format(
+                args.enrichment_start
+            )
+        )
 
     meters = {
         "loss": AverageMeter(),
@@ -87,7 +100,10 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     tb_writer = SummaryWriter(log_dir=args.output_dir)
 
     best_top1 = 0.0
-    evaluator.eval(model.eval())
+    evaluator.eval(
+        model.eval(),
+        use_target_enrichment=_target_enrichment_active(args, start_epoch),
+    )
     # train
     now_top1 = 0
     current_epoch = 0
@@ -100,13 +116,16 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
         model.train()
         model.epoch = epoch
+        use_target_enrichment = target_pool is not None and _target_enrichment_active(args, epoch)
+        if target_pool is not None and epoch == getattr(args, "enrichment_start", 1):
+            logger.info("Target enrichment starts at epoch {}".format(epoch))
 
         
         for n_iter, batch in enumerate(train_loader):
             current_steps += 1
             batch = {k: v.to(device) for k, v in batch.items()}
             target_cache = None
-            if target_pool is not None:
+            if use_target_enrichment:
                 target_cache = target_pool.get_train_cache(model, batch, epoch, current_steps)
             if args.modify_k:
                 ret = model(batch, epoch, current_step=current_steps, target_cache=target_cache)
@@ -170,9 +189,15 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             if get_rank() == 0:
                 logger.info("Validation Results - Epoch: {}".format(epoch))
                 if args.distributed:
-                    top1 = evaluator.eval(model.module.eval())
+                    top1 = evaluator.eval(
+                        model.module.eval(),
+                        use_target_enrichment=_target_enrichment_active(args, epoch),
+                    )
                 else:
-                    top1 = evaluator.eval(model.eval())
+                    top1 = evaluator.eval(
+                        model.eval(),
+                        use_target_enrichment=_target_enrichment_active(args, epoch),
+                    )
                 now_top1 = max(now_top1,top1)
                 torch.cuda.empty_cache()
                 if best_top1 < top1:

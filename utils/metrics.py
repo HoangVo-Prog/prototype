@@ -159,7 +159,10 @@ class Evaluator():
         qfeats = torch.cat(qfeats, 0)
         return qfeats.cpu(), qids.cpu()
 
-    def eval(self, model, i2t_metric=False):
+    def eval(self, model, i2t_metric=False, use_target_enrichment=None):
+        if use_target_enrichment is None:
+            use_target_enrichment = getattr(self.args, "target_enrichment", False)
+
         qfeats, gfeats, qids, gids = self._compute_embedding(model)
         qfeats = F.normalize(qfeats, p=2, dim=1) # text features
         gfeats = F.normalize(gfeats, p=2, dim=1) # image features
@@ -192,7 +195,7 @@ class Evaluator():
                 'global+grab(0.32)': 0.32 * sims_global + 0.68 * sims_grab # alpha = 0.32
             }
 
-        if getattr(self.args, "target_enrichment", False):
+        if use_target_enrichment:
             target_cache, target_gids = self._compute_target_gallery_cache(model)
             target_qfeats, target_qids = self._compute_enriched_text_embedding(model, target_cache)
             target_qfeats = F.normalize(target_qfeats, p=2, dim=1)

@@ -6,7 +6,7 @@ import random
 import time
 from datasets import build_dataloader
 from processor.processor import do_train
-from utils.checkpoint import Checkpointer
+from utils.checkpoint import Checkpointer, extract_host_model_state_dict, unwrap_checkpoint_state_dict
 from utils.iotools import save_train_configs
 from utils.logger import setup_logger
 from solver import build_optimizer, build_lr_scheduler
@@ -17,6 +17,31 @@ from utils.options import get_args
 from utils.comm import get_rank, synchronize
 import warnings
 warnings.filterwarnings("ignore")
+
+
+def load_finetune_clip_checkpoint(model, checkpoint_file, logger):
+    try:
+        checkpoint = torch.load(checkpoint_file, map_location='cpu')
+    except RuntimeError as torch_load_error:
+        try:
+            checkpoint = torch.jit.load(checkpoint_file, map_location='cpu').state_dict()
+        except RuntimeError:
+            raise torch_load_error
+
+    state_dict = unwrap_checkpoint_state_dict(checkpoint)
+    host_state_dict = extract_host_model_state_dict(state_dict)
+    host_keys = set(model.base_model.state_dict().keys())
+    matched_keys = [key for key in host_state_dict.keys() if key in host_keys]
+    if not matched_keys:
+        raise ValueError(f"No host CLIP weights in {checkpoint_file} matched model.base_model")
+
+    logger.info(
+        "loading host CLIP checkpoint {} with {}/{} matched parameters".format(
+            checkpoint_file, len(matched_keys), len(host_keys)
+        )
+    )
+    model.base_model.load_param(host_state_dict)
+
 
 def set_seed(seed=1):
     torch.manual_seed(seed)
@@ -63,6 +88,8 @@ if __name__ == '__main__':
             param_dict[refine_k] = param_dict[k].detach().clone()
             del param_dict[k]
         model.load_state_dict(param_dict, False)
+    if args.finetune_clip:
+        load_finetune_clip_checkpoint(model, args.finetune_clip, logger)
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
