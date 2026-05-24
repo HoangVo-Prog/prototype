@@ -85,27 +85,50 @@ class TargetPrototypeEnricher(nn.Module):
         self.use_target_retrieval_loss = getattr(args, "use_target_retrieval_loss", False)
         self.use_target_attention_loss = getattr(args, "use_target_attention_loss", False)
         self.use_target_robust_loss = getattr(args, "use_target_robust_loss", False)
+        self.enrichment_space = getattr(args, "enrichment_space", "global")
+        if self.enrichment_space not in ("global", "grab"):
+            raise ValueError("--enrichment_space must be either 'global' or 'grab'")
+        if self.enrichment_space == "grab" and getattr(args, "only_global", False):
+            raise ValueError("--enrichment_space grab requires GRAB features; remove --only_global")
+        self.enable_global = self.enrichment_space == "global"
+        self.enable_grab = self.enrichment_space == "grab"
 
         att_dim = embed_dim
-        self.global_query_proj = nn.Linear(embed_dim, att_dim)
-        self.global_proto_proj = nn.Linear(embed_dim, att_dim)
-        self.global_fusion = _FusionMLP(embed_dim)
+        if self.enable_global:
+            self.global_query_proj = nn.Linear(embed_dim, att_dim)
+            self.global_proto_proj = nn.Linear(embed_dim, att_dim)
+            self.global_fusion = _FusionMLP(embed_dim)
 
-        self.proto_to_grab = nn.Linear(embed_dim, grab_embed_dim)
-        self.grab_query_proj = nn.Linear(grab_embed_dim, att_dim)
-        self.grab_proto_proj = nn.Linear(grab_embed_dim, att_dim)
-        self.grab_fusion = _FusionMLP(grab_embed_dim)
+        if self.enable_grab:
+            self.proto_to_grab = nn.Linear(embed_dim, grab_embed_dim)
+            self.grab_query_proj = nn.Linear(grab_embed_dim, att_dim)
+            self.grab_proto_proj = nn.Linear(grab_embed_dim, att_dim)
+            self.grab_fusion = _FusionMLP(grab_embed_dim)
+
+    def _require_global(self):
+        if not self.enable_global:
+            raise ValueError("Global enrichment is disabled because --enrichment_space is set to grab")
+
+    def _require_grab(self):
+        if not self.enable_grab:
+            raise ValueError(
+                "GRAB enrichment is disabled because --enrichment_space is not grab "
+                "or --only_global is enabled"
+            )
 
     def _project_prototypes(self, prototypes, space):
         if space == "grab":
+            self._require_grab()
             prototypes = self.proto_to_grab(prototypes.float())
         return F.normalize(prototypes.float(), p=2, dim=-1)
 
     def _attention(self, query_features, selected_prototypes, space):
         if space == "grab":
+            self._require_grab()
             query_proj = self.grab_query_proj(query_features.float())
             proto_proj = self.grab_proto_proj(selected_prototypes.float())
         else:
+            self._require_global()
             query_proj = self.global_query_proj(query_features.float())
             proto_proj = self.global_proto_proj(selected_prototypes.float())
 
@@ -117,8 +140,10 @@ class TargetPrototypeEnricher(nn.Module):
 
     def _fuse(self, query_features, context, space):
         if space == "grab":
+            self._require_grab()
             delta = self.grab_fusion(query_features.float(), context.float())
         else:
+            self._require_global()
             delta = self.global_fusion(query_features.float(), context.float())
         return F.normalize(query_features.float() + self.gamma * delta, p=2, dim=-1)
 
@@ -191,43 +216,54 @@ class TargetPrototypeEnricher(nn.Module):
         pool_pids,
     ):
         zero = enriched_query.sum() * 0.0
-        positive_mask = query_pids.view(-1, 1).eq(pool_pids.view(1, -1))
-        valid_positive = positive_mask.any(dim=1)
-        if valid_positive.any():
-            retrieval_scores = enriched_query @ retrieval_features.t() / max(self.tau, 1e-6)
-            pos_lse = _masked_logsumexp(retrieval_scores, positive_mask, dim=1)
-            all_lse = torch.logsumexp(retrieval_scores, dim=1)
-            target_loss = -(pos_lse[valid_positive] - all_lse[valid_positive]).mean()
-        else:
-            target_loss = zero
+        target_loss = zero
+        att_loss = zero
+        robust_loss = zero
+        guard_loss = zero
+        gain_loss = zero
 
-        top_pids = pool_pids[top_indices]
-        top_positive = top_pids.eq(query_pids.view(-1, 1))
-        top_negative = ~top_positive
-        valid_attention = top_positive.any(dim=1) & top_negative.any(dim=1)
-        if valid_attention.any():
-            proto_sims = (
-                raw_query.view(raw_query.shape[0], 1, 1, -1) * selected_prototypes
-            ).sum(dim=-1)
-            evidence = (attention_weights * proto_sims).sum(dim=-1)
-            pos_evidence = _masked_logsumexp(evidence, top_positive, dim=1)
-            neg_evidence = _masked_logsumexp(evidence, top_negative, dim=1)
-            att_loss = F.softplus(
-                neg_evidence[valid_attention]
-                - pos_evidence[valid_attention]
-                + self.att_margin
-            ).mean()
-        else:
-            att_loss = zero
+        positive_mask = None
+        if self.use_target_retrieval_loss or self.use_target_robust_loss:
+            positive_mask = query_pids.view(-1, 1).eq(pool_pids.view(1, -1))
 
-        robust_loss, guard_loss, gain_loss = self._compute_robust_loss(
-            raw_query=raw_query,
-            enriched_query=enriched_query,
-            retrieval_features=retrieval_features,
-            positive_mask=positive_mask,
-            reliable=top_positive.any(dim=1),
-            zero=zero,
-        )
+        if self.use_target_retrieval_loss:
+            valid_positive = positive_mask.any(dim=1)
+            if valid_positive.any():
+                retrieval_scores = enriched_query @ retrieval_features.t() / max(self.tau, 1e-6)
+                pos_lse = _masked_logsumexp(retrieval_scores, positive_mask, dim=1)
+                all_lse = torch.logsumexp(retrieval_scores, dim=1)
+                target_loss = -(pos_lse[valid_positive] - all_lse[valid_positive]).mean()
+
+        top_positive = None
+        if self.use_target_attention_loss or self.use_target_robust_loss:
+            top_pids = pool_pids[top_indices]
+            top_positive = top_pids.eq(query_pids.view(-1, 1))
+
+        if self.use_target_attention_loss:
+            top_negative = ~top_positive
+            valid_attention = top_positive.any(dim=1) & top_negative.any(dim=1)
+            if valid_attention.any():
+                proto_sims = (
+                    raw_query.view(raw_query.shape[0], 1, 1, -1) * selected_prototypes
+                ).sum(dim=-1)
+                evidence = (attention_weights * proto_sims).sum(dim=-1)
+                pos_evidence = _masked_logsumexp(evidence, top_positive, dim=1)
+                neg_evidence = _masked_logsumexp(evidence, top_negative, dim=1)
+                att_loss = F.softplus(
+                    neg_evidence[valid_attention]
+                    - pos_evidence[valid_attention]
+                    + self.att_margin
+                ).mean()
+
+        if self.use_target_robust_loss:
+            robust_loss, guard_loss, gain_loss = self._compute_robust_loss(
+                raw_query=raw_query,
+                enriched_query=enriched_query,
+                retrieval_features=retrieval_features,
+                positive_mask=positive_mask,
+                reliable=top_positive.any(dim=1),
+                zero=zero,
+            )
         total = zero
         if self.use_target_retrieval_loss:
             total = total + self.lambda_ret * target_loss

@@ -39,6 +39,7 @@ def args(**overrides):
         use_target_retrieval_loss=True,
         use_target_attention_loss=True,
         use_target_robust_loss=True,
+        enrichment_space="global",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -133,7 +134,7 @@ class EnrichmentShapeTests(unittest.TestCase):
         out["total_loss"].backward()
 
     def test_grab_forward_projects_prototypes_to_grab_space(self):
-        enricher = modules.TargetPrototypeEnricher(512, 4096, args()).float()
+        enricher = modules.TargetPrototypeEnricher(512, 4096, args(enrichment_space="grab")).float()
         cache = {
             "host_image_features": torch.randn(8, 512),
             "retrieval_features": torch.randn(8, 4096),
@@ -151,7 +152,7 @@ class EnrichmentShapeTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(out["total_loss"]))
 
     def test_grab_retrieval_features_must_match_grab_dimension(self):
-        enricher = modules.TargetPrototypeEnricher(512, 4096, args()).float()
+        enricher = modules.TargetPrototypeEnricher(512, 4096, args(enrichment_space="grab")).float()
         cache = {
             "host_image_features": torch.randn(8, 512),
             "retrieval_features": torch.randn(8, 512),
@@ -167,7 +168,65 @@ class EnrichmentShapeTests(unittest.TestCase):
                 space="grab",
             )
 
-    def test_method_losses_can_be_disabled_independently(self):
+    def test_global_enrichment_prunes_grab_enrichment_modules(self):
+        enricher = modules.TargetPrototypeEnricher(
+            512,
+            4096,
+            args(enrichment_space="global", only_global=False),
+        ).float()
+        self.assertTrue(enricher.enable_global)
+        self.assertFalse(enricher.enable_grab)
+        self.assertFalse(hasattr(enricher, "proto_to_grab"))
+        self.assertFalse(hasattr(enricher, "grab_query_proj"))
+        self.assertFalse(hasattr(enricher, "grab_proto_proj"))
+        self.assertFalse(hasattr(enricher, "grab_fusion"))
+        self.assertLess(sum(p.numel() for p in enricher.parameters()), 2_000_000)
+
+        cache = {
+            "host_image_features": torch.randn(8, 512),
+            "retrieval_features": torch.randn(8, 512),
+            "prototypes": torch.randn(8, 7, 512),
+            "pids": torch.tensor([0, 1, 2, 3, 0, 1, 2, 4]),
+        }
+        out = enricher(
+            query_features=torch.randn(3, 512, requires_grad=True),
+            host_text_features=torch.randn(3, 512, requires_grad=True),
+            query_pids=torch.tensor([0, 1, 2]),
+            pool_cache=cache,
+            space="global",
+        )
+        self.assertEqual(out["enriched_features"].shape, (3, 512))
+
+        with self.assertRaisesRegex(ValueError, "GRAB enrichment is disabled"):
+            enricher(
+                query_features=torch.randn(3, 4096),
+                host_text_features=torch.randn(3, 512),
+                query_pids=torch.tensor([0, 1, 2]),
+                pool_cache=cache,
+                space="grab",
+            )
+
+    def test_grab_enrichment_prunes_global_enrichment_modules(self):
+        enricher = modules.TargetPrototypeEnricher(
+            512,
+            4096,
+            args(enrichment_space="grab", only_global=False),
+        ).float()
+        self.assertFalse(enricher.enable_global)
+        self.assertTrue(enricher.enable_grab)
+        self.assertFalse(hasattr(enricher, "global_query_proj"))
+        self.assertFalse(hasattr(enricher, "global_proto_proj"))
+        self.assertFalse(hasattr(enricher, "global_fusion"))
+
+    def test_grab_enrichment_requires_grab_features(self):
+        with self.assertRaisesRegex(ValueError, "requires GRAB features"):
+            modules.TargetPrototypeEnricher(
+                512,
+                4096,
+                args(enrichment_space="grab", only_global=True),
+            )
+
+    def test_disabled_target_losses_return_zero_components(self):
         enricher = modules.TargetPrototypeEnricher(
             512,
             4096,
@@ -190,10 +249,42 @@ class EnrichmentShapeTests(unittest.TestCase):
             pool_cache=cache,
             space="global",
         )
-        self.assertTrue(torch.isfinite(out["target_loss"]))
-        self.assertTrue(torch.isfinite(out["att_loss"]))
-        self.assertTrue(torch.isfinite(out["robust_loss"]))
+        self.assertTrue(torch.allclose(out["target_loss"], torch.zeros_like(out["target_loss"])))
+        self.assertTrue(torch.allclose(out["att_loss"], torch.zeros_like(out["att_loss"])))
+        self.assertTrue(torch.allclose(out["robust_loss"], torch.zeros_like(out["robust_loss"])))
+        self.assertTrue(torch.allclose(out["guard_loss"], torch.zeros_like(out["guard_loss"])))
+        self.assertTrue(torch.allclose(out["gain_loss"], torch.zeros_like(out["gain_loss"])))
         self.assertTrue(torch.allclose(out["total_loss"], torch.zeros_like(out["total_loss"])))
+
+    def test_only_target_retrieval_loss_skips_auxiliary_components(self):
+        enricher = modules.TargetPrototypeEnricher(
+            512,
+            4096,
+            args(
+                use_target_retrieval_loss=True,
+                use_target_attention_loss=False,
+                use_target_robust_loss=False,
+            ),
+        ).float()
+        cache = {
+            "host_image_features": torch.randn(8, 512),
+            "retrieval_features": torch.randn(8, 512),
+            "prototypes": torch.randn(8, 7, 512),
+            "pids": torch.tensor([0, 1, 2, 3, 0, 1, 2, 4]),
+        }
+        out = enricher(
+            query_features=torch.randn(3, 512, requires_grad=True),
+            host_text_features=torch.randn(3, 512, requires_grad=True),
+            query_pids=torch.tensor([0, 1, 2]),
+            pool_cache=cache,
+            space="global",
+        )
+        self.assertTrue(torch.isfinite(out["target_loss"]))
+        self.assertTrue(torch.allclose(out["att_loss"], torch.zeros_like(out["att_loss"])))
+        self.assertTrue(torch.allclose(out["robust_loss"], torch.zeros_like(out["robust_loss"])))
+        self.assertTrue(torch.allclose(out["guard_loss"], torch.zeros_like(out["guard_loss"])))
+        self.assertTrue(torch.allclose(out["gain_loss"], torch.zeros_like(out["gain_loss"])))
+        self.assertTrue(torch.allclose(out["total_loss"], out["target_loss"], atol=1e-5))
 
     def test_target_losses_default_to_disabled_in_enricher(self):
         defaults = args()

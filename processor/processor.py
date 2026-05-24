@@ -23,7 +23,7 @@ def _is_trainable_loss(value):
 
 
 def _should_track_scalar(key):
-    return "loss" in key or key.endswith("grad_norm") or key.startswith("pool_")
+    return "loss" in key or key.endswith("grad_norm") or key == "pool_interval_reused"
 
 
 def _grad_norm(parameters):
@@ -76,23 +76,12 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         "tal_loss": AverageMeter(),
         "host_loss": AverageMeter(),
         "target_enrichment_loss": AverageMeter(),
-        "pool_num_required_positives": AverageMeter(),
-        "pool_num_inserted_positives": AverageMeter(),
-        "pool_selected_k": AverageMeter(),
-        "pool_interval_id": AverageMeter(),
         "pool_interval_reused": AverageMeter(),
-        "pool_positive_ratio": AverageMeter(),
-        "pool_cluster_distribution_distance": AverageMeter(),
-        "pool_cluster_shortage_count": AverageMeter(),
-        "pool_final_pool_size": AverageMeter(),
-        "pool_missing_positive_count": AverageMeter(),
-        "pool_k_valid": AverageMeter(),
-        "pool_k_dilute": AverageMeter(),
-        "pool_k_dist": AverageMeter(),
         "grad_norm": AverageMeter(),
         "host_loss_grad_norm": AverageMeter(),
         "cid_loss_grad_norm": AverageMeter(),
         "tal_loss_grad_norm": AverageMeter(),
+        "target_enrichment_loss_grad_norm": AverageMeter(),
     }
 
     tb_writer = SummaryWriter(log_dir=args.output_dir)
@@ -124,7 +113,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             else:
                 ret = model(batch, epoch, target_cache=target_cache)
             if target_cache is not None and "diagnostics" in target_cache:
-                ret.update(target_cache["diagnostics"])
+                ret["pool_interval_reused"] = target_cache["diagnostics"]["pool_interval_reused"]
             total_loss = ret.get("loss")
             if total_loss is None:
                 total_loss = sum([v for k, v in ret.items() if "loss" in k and _is_trainable_loss(v)])
@@ -143,7 +132,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 meters[key].update(scalar, batch_size)
             optimizer.zero_grad()
             trainable_params = [p for p in model.parameters() if p.requires_grad]
-            for loss_key in ["host_loss", "cid_loss", "tal_loss"]:
+            for loss_key in ["host_loss", "cid_loss", "tal_loss", "target_enrichment_loss"]:
                 if loss_key in ret:
                     meters[f"{loss_key}_grad_norm"].update(
                         _loss_grad_norm(ret[loss_key], trainable_params),

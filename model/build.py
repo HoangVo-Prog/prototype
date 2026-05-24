@@ -297,14 +297,20 @@ class ITSELF(nn.Module):
                     space="global",
                 )
                 t_feats = target_ret["enriched_features"]
-            ret.update({
+            target_metrics = {
                 "target_enrichment_loss": target_ret["total_loss"],
-                "target_retrieval_loss": target_ret["target_loss"].detach(),
-                "target_attention_loss": target_ret["att_loss"].detach(),
-                "target_robust_loss": target_ret["robust_loss"].detach(),
-                "target_guard_loss": target_ret["guard_loss"].detach(),
-                "target_gain_loss": target_ret["gain_loss"].detach(),
-            })
+            }
+            if self.target_enricher.use_target_retrieval_loss:
+                target_metrics["target_retrieval_loss"] = target_ret["target_loss"].detach()
+            if self.target_enricher.use_target_attention_loss:
+                target_metrics["target_attention_loss"] = target_ret["att_loss"].detach()
+            if self.target_enricher.use_target_robust_loss:
+                target_metrics.update({
+                    "target_robust_loss": target_ret["robust_loss"].detach(),
+                    "target_guard_loss": target_ret["guard_loss"].detach(),
+                    "target_gain_loss": target_ret["gain_loss"].detach(),
+                })
+            ret.update(target_metrics)
 
         if 'cid' in self.current_task:
             S = objectives.cosine_similarity_matrix(i_feats, t_feats)
