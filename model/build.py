@@ -4,6 +4,7 @@ from .clip_model import Transformer, LayerNorm, build_CLIP_from_openai_pretraine
 import torch
 import torch.nn as nn
 from .grab import TexualEmbeddingLayer, VisualEmbeddingLayer
+from .enrichment import TargetPrototypeEnricher, build_part_prototypes
 from torch.cuda.amp import autocast
 
 
@@ -73,6 +74,8 @@ class ITSELF(nn.Module):
         self.embed_dim = base_cfg['embed_dim']
         self.grab_embed_dim = 4096
         self.args = args
+        if getattr(args, "target_enrichment", False) and args.enrichment_space == "grab" and args.only_global:
+            raise ValueError("--enrichment_space grab requires GRAB features; remove --only_global")
         if 'cid' in args.loss_names:
             self.num_classes = num_classes + 1
             self.classifier_global = nn.Linear(self.embed_dim , self.num_classes)
@@ -92,7 +95,14 @@ class ITSELF(nn.Module):
                 nn.init.constant_(self.classifier_id_grab.bias.data, val=0.0)
                 self.visul_emb_layer = VisualEmbeddingLayer(ratio=args.select_ratio)
                 self.texual_emb_layer = TexualEmbeddingLayer(ratio=args.select_ratio)
-                
+
+        if not args.only_global and not hasattr(self, "visul_emb_layer"):
+            self.visul_emb_layer = VisualEmbeddingLayer(ratio=args.select_ratio)
+            self.texual_emb_layer = TexualEmbeddingLayer(ratio=args.select_ratio)
+
+        if getattr(args, "target_enrichment", False):
+            self.target_enricher = TargetPrototypeEnricher(self.embed_dim, self.grab_embed_dim, args)
+
         self.logit_scale = torch.ones([]) * (1 / args.temperature) 
   
     def _set_task(self):
@@ -117,6 +127,32 @@ class ITSELF(nn.Module):
         x,atten_t = self.base_model.encode_text(text.long())
         t_grab_f = self.texual_emb_layer(x, text, atten_t)
         return t_grab_f.float()
+
+    def encode_target_image_cache(self, image, cache_prototypes=True):
+        image_feats, atten_i = self.base_model.encode_image(image)
+        host_features = image_feats[:, 0, :].float()
+        cache = {"host_image_features": host_features}
+        if not cache_prototypes:
+            return cache
+
+        grid_size = None
+        if hasattr(self.base_model.visual, "num_y") and hasattr(self.base_model.visual, "num_x"):
+            grid_size = (self.base_model.visual.num_y, self.base_model.visual.num_x)
+        cache["prototypes"] = build_part_prototypes(image_feats, getattr(self.args, "num_parts", 6), grid_size=grid_size)
+        if getattr(self.args, "enrichment_space", "global") == "grab":
+            cache["retrieval_features"] = self.visul_emb_layer(image_feats, atten_i).float()
+        else:
+            cache["retrieval_features"] = host_features
+        return cache
+
+    def enrich_text_features(self, query_features, host_text_features, target_cache):
+        self.target_enricher = self.target_enricher.float()
+        return self.target_enricher.enrich_only(
+            query_features=query_features,
+            host_text_features=host_text_features,
+            pool_cache=target_cache,
+            space=getattr(self.args, "enrichment_space", "global"),
+        )
     
     def rollout(self, attentions: torch.Tensor, 
                 head_fusion = 'mean', 
@@ -168,7 +204,7 @@ class ITSELF(nn.Module):
 
         return result  # [B, N, N]
 
-    def forward(self, batch, epoch=None, current_step=None):
+    def forward(self, batch, epoch=None, current_step=None, target_cache=None):
         ret = dict()
         device = "cuda"
 
@@ -241,6 +277,35 @@ class ITSELF(nn.Module):
                 i_grab_f = self.visul_emb_layer(image_feats, atten_i)
                 t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
 
+        if getattr(self.args, "target_enrichment", False) and target_cache is not None:
+            self.target_enricher = self.target_enricher.float()
+            if self.args.enrichment_space == "grab":
+                target_ret = self.target_enricher(
+                    query_features=t_grab_f,
+                    host_text_features=t_feats,
+                    query_pids=batch["pids"],
+                    pool_cache=target_cache,
+                    space="grab",
+                )
+                t_grab_f = target_ret["enriched_features"]
+            else:
+                target_ret = self.target_enricher(
+                    query_features=t_feats,
+                    host_text_features=t_feats,
+                    query_pids=batch["pids"],
+                    pool_cache=target_cache,
+                    space="global",
+                )
+                t_feats = target_ret["enriched_features"]
+            ret.update({
+                "target_enrichment_loss": target_ret["total_loss"],
+                "target_retrieval_loss": target_ret["target_loss"].detach(),
+                "target_attention_loss": target_ret["att_loss"].detach(),
+                "target_robust_loss": target_ret["robust_loss"].detach(),
+                "target_guard_loss": target_ret["guard_loss"].detach(),
+                "target_gain_loss": target_ret["gain_loss"].detach(),
+            })
+
         if 'cid' in self.current_task:
             S = objectives.cosine_similarity_matrix(i_feats, t_feats)
             hard_negatives = objectives.sample_hard_negatives(S, batch['pids'])
@@ -290,6 +355,20 @@ class ITSELF(nn.Module):
                 ret.update({'tal_loss': TAL_global_loss + TAL_grab_loss}) 
             else:
                 ret.update({'tal_loss': TAL_global_loss})
+
+        zero = i_feats.float().sum() * 0.0
+        cid_loss = ret.get('cid_loss', zero)
+        tal_loss = ret.get('tal_loss', zero)
+        host_loss = cid_loss + tal_loss
+        if getattr(self.args, "use_host_loss", True):
+            host_loss = getattr(self.args, "lambda_host", 1.0) * host_loss
+        else:
+            host_loss = zero
+        target_enrichment_loss = ret.get('target_enrichment_loss', zero)
+        ret.update({
+            'host_loss': host_loss,
+            'loss': host_loss + target_enrichment_loss,
+        })
 
         return ret
 

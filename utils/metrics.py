@@ -119,6 +119,46 @@ class Evaluator():
         gfeats = torch.cat(gfeats, 0)
         return qfeats.cpu(), gfeats.cpu(), qids.cpu(), gids.cpu()
 
+    def _compute_target_gallery_cache(self, model):
+        model = model.eval()
+        device = next(model.parameters()).device
+        gids, cache_chunks = [], []
+
+        for pid, img in self.img_loader:
+            img = img.to(device)
+            with torch.no_grad():
+                cache = model.encode_target_image_cache(img)
+            gids.append(pid.view(-1))
+            cache_chunks.append({k: v.detach().cpu() for k, v in cache.items()})
+
+        gids = torch.cat(gids, 0)
+        target_cache = {}
+        for key in cache_chunks[0].keys():
+            target_cache[key] = torch.cat([chunk[key] for chunk in cache_chunks], dim=0).to(device)
+        target_cache["pids"] = gids.to(device)
+        return target_cache, gids.cpu()
+
+    def _compute_enriched_text_embedding(self, model, target_cache):
+        model = model.eval()
+        device = next(model.parameters()).device
+
+        qids, qfeats = [], []
+        for pid, caption in self.txt_loader:
+            caption = caption.to(device)
+            with torch.no_grad():
+                host_text_feat = model.encode_text(caption)
+                if self.args.enrichment_space == "grab":
+                    query_feat = model.encode_text_grab(caption)
+                else:
+                    query_feat = host_text_feat
+                text_feat = model.enrich_text_features(query_feat, host_text_feat, target_cache).cpu()
+            qids.append(pid.view(-1))
+            qfeats.append(text_feat)
+
+        qids = torch.cat(qids, 0)
+        qfeats = torch.cat(qfeats, 0)
+        return qfeats.cpu(), qids.cpu()
+
     def eval(self, model, i2t_metric=False):
         qfeats, gfeats, qids, gids = self._compute_embedding(model)
         qfeats = F.normalize(qfeats, p=2, dim=1) # text features
@@ -151,6 +191,16 @@ class Evaluator():
                 'global+grab(0.68)': 0.68 * sims_global + 0.32 * sims_grab, # alpha = 0.68
                 'global+grab(0.32)': 0.32 * sims_global + 0.68 * sims_grab # alpha = 0.32
             }
+
+        if getattr(self.args, "target_enrichment", False):
+            target_cache, target_gids = self._compute_target_gallery_cache(model)
+            target_qfeats, target_qids = self._compute_enriched_text_embedding(model, target_cache)
+            target_qfeats = F.normalize(target_qfeats, p=2, dim=1)
+            target_gfeats = F.normalize(target_cache["retrieval_features"].detach().cpu(), p=2, dim=1)
+            target_key = "target_{}".format(self.args.enrichment_space)
+            sims_dict[target_key] = target_qfeats @ target_gfeats.t()
+            qids = target_qids
+            gids = target_gids
 
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP","rSum"])
 

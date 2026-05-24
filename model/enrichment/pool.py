@@ -1,0 +1,693 @@
+import math
+import random
+from collections import defaultdict
+
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _pool_transform(img_size):
+    import torchvision.transforms as T
+
+    mean = [0.48145466, 0.4578275, 0.40821073]
+    std = [0.26862954, 0.26130258, 0.27577711]
+    return T.Compose([
+        T.Resize(img_size),
+        T.ToTensor(),
+        T.Normalize(mean=mean, std=std),
+    ])
+
+
+def _js_distance(p, q, eps=1e-12):
+    p = p.float().clamp_min(eps)
+    q = q.float().clamp_min(eps)
+    p = p / p.sum()
+    q = q / q.sum()
+    m = 0.5 * (p + q)
+    kl_pm = (p * (p / m).log()).sum()
+    kl_qm = (q * (q / m).log()).sum()
+    return float((0.5 * (kl_pm + kl_qm)).sqrt().item())
+
+
+def _parse_pool_k_candidates(value):
+    if isinstance(value, (list, tuple)):
+        candidates = value
+    else:
+        candidates = str(value).split(",")
+
+    parsed = []
+    for candidate in candidates:
+        if str(candidate).strip() == "":
+            continue
+        parsed.append(int(candidate))
+    return sorted({candidate for candidate in parsed if candidate > 0})
+
+
+class _PoolImageDataset(Dataset):
+    def __init__(self, records, transform):
+        self.records = records
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, index):
+        from utils.iotools import read_image
+
+        record = self.records[index]
+        image = read_image(record["img_path"])
+        if self.transform is not None:
+            image = self.transform(image)
+        return record["pid"], record["image_id"], image
+
+
+class TargetPoolManager:
+    def __init__(self, train_dataset, args, logger=None):
+        if args.pool_k < 1:
+            raise ValueError("--pool_k must be a positive integer")
+        if not (0 < args.positive_ratio_max <= 1):
+            raise ValueError("--positive_ratio_max must be in (0, 1]")
+        pool_k_mode = getattr(args, "pool_k_mode", "static")
+        if pool_k_mode not in ("static", "adaptive"):
+            raise ValueError("--pool_k_mode must be either 'static' or 'adaptive'")
+        self.args = args
+        self.logger = logger
+        self.pool_k_mode = pool_k_mode
+        self.pool_k_candidates = _parse_pool_k_candidates(
+            getattr(args, "pool_k_candidates", "512,1024,2048,4096,8192")
+        )
+        if not self.pool_k_candidates:
+            raise ValueError("--pool_k_candidates must contain at least one positive integer")
+        self.records = self._build_unique_records(train_dataset.dataset)
+        self.record_by_image_id = {record["image_id"]: record for record in self.records}
+        self.record_index_by_image_id = {
+            record["image_id"]: index for index, record in enumerate(self.records)
+        }
+        self.transform = _pool_transform(args.img_size)
+        self.cluster_to_indices = None
+        self.cluster_distribution = None
+        self.cluster_labels = None
+        self.last_refresh_unit = None
+        self.active_interval_id = None
+        self.interval_cache = None
+        self.rng = random.Random(42)
+
+    def _build_unique_records(self, dataset):
+        records = {}
+        for pid, image_id, img_path, _ in dataset:
+            if image_id not in records:
+                records[int(image_id)] = {
+                    "pid": int(pid),
+                    "image_id": int(image_id),
+                    "img_path": img_path,
+                }
+        return list(records.values())
+
+    def get_train_cache(self, model, batch, epoch, step):
+        if self._should_refresh(epoch, step):
+            self.refresh(model, epoch, step)
+            interval_id = self._interval_id(epoch, step)
+            self.interval_cache = self._build_interval_pool_cache(
+                model=model,
+                batch=batch,
+                interval_id=interval_id,
+            )
+            self.active_interval_id = interval_id
+        elif self.interval_cache is not None and "diagnostics" in self.interval_cache:
+            self.interval_cache["diagnostics"]["pool_interval_reused"] = 1.0
+        return self.interval_cache
+
+    def _interval_unit(self, epoch, step):
+        return epoch if self.args.recompute_level == "epoch" else step
+
+    def _interval_id(self, epoch, step):
+        interval = self.args.recompute_interval
+        if interval == -1:
+            return 0
+        if interval < 1:
+            raise ValueError("--recompute_interval must be -1 or a positive integer")
+        unit = self._interval_unit(epoch, step)
+        return (unit - 1) // interval
+
+    def _should_refresh(self, epoch, step):
+        if self.cluster_to_indices is None or self.interval_cache is None:
+            return True
+        if self.args.recompute_interval == -1:
+            return False
+        return self._interval_id(epoch, step) != self.active_interval_id
+
+    def refresh(self, model, epoch, step):
+        self._estimate_training_distribution(model)
+        self.last_refresh_unit = self._interval_unit(epoch, step)
+        if self.logger is not None:
+            self.logger.info(
+                "Target-pool training distribution refreshed: C={} level={} unit={}".format(
+                    len(self.cluster_to_indices), self.args.recompute_level, self.last_refresh_unit
+                )
+            )
+
+    def _estimate_training_distribution(self, model):
+        features = self._encode_records(model, self.records, cache_prototypes=False)["host_image_features"].cpu()
+        num_images = features.shape[0]
+        num_clusters = min(max(1, self.args.pool_clusters), num_images)
+
+        if num_clusters == 1:
+            labels = torch.zeros(num_images, dtype=torch.long)
+        else:
+            from sklearn.cluster import KMeans
+            kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
+            labels = torch.tensor(kmeans.fit_predict(features.numpy()), dtype=torch.long)
+
+        cluster_to_indices = defaultdict(list)
+        for index, label in enumerate(labels.tolist()):
+            cluster_to_indices[int(label)].append(index)
+
+        counts = torch.tensor([len(cluster_to_indices[c]) for c in range(num_clusters)], dtype=torch.float)
+        self.cluster_distribution = counts / counts.sum()
+        self.cluster_to_indices = dict(cluster_to_indices)
+        self.cluster_labels = labels
+
+    def _build_batch_pool_cache(self, model, batch):
+        return self._build_interval_pool_cache(model, batch, interval_id=0)
+
+    def _build_interval_pool_cache(self, model, batch, interval_id):
+        positives = self._required_positives(batch)
+        pool_k, distractor_indices, diagnostics = self._select_pool_k_and_distractors(
+            positives=positives,
+            interval_id=interval_id,
+        )
+        diagnostics["pool_interval_id"] = float(interval_id)
+        diagnostics["pool_interval_reused"] = 0.0
+        diagnostics["pool_k_mode"] = getattr(self.args, "pool_k_mode", "static")
+        diagnostics["pool_dist_metric"] = self.args.pool_dist_metric
+        diagnostics["selected_K"] = float(pool_k)
+        diagnostics["pool_selected_k"] = float(pool_k)
+        diagnostics["num_required_positives"] = diagnostics["pool_num_required_positives"]
+        diagnostics["num_inserted_positives"] = diagnostics["pool_num_inserted_positives"]
+        diagnostics["missing_positive_count"] = diagnostics["pool_missing_positive_count"]
+        diagnostics["positive_ratio"] = diagnostics["pool_positive_ratio"]
+        diagnostics["cluster_distribution_distance"] = diagnostics["pool_cluster_distribution_distance"]
+        diagnostics["final_pool_size"] = diagnostics["pool_final_pool_size"]
+        diagnostics["cluster_shortage_count"] = diagnostics["pool_cluster_shortage_count"]
+        diagnostics["K_valid"] = diagnostics["pool_k_valid"]
+        diagnostics["K_dilute"] = diagnostics["pool_k_dilute"]
+        diagnostics["K_dist"] = diagnostics["pool_k_dist"]
+
+        if diagnostics["pool_final_pool_size"] != float(pool_k):
+            raise ValueError(
+                "Target pool construction failed: selected_K={} but only {} unique images "
+                "could be inserted. Reduce --pool_k/--pool_k_candidates or add more "
+                "training images.".format(pool_k, int(diagnostics["pool_final_pool_size"]))
+            )
+
+        positive_record_items = [
+            item for item in positives if self._valid_record_index(item["record_index"])
+        ]
+        fallback_positive_items = [
+            item for item in positives if not self._valid_record_index(item["record_index"])
+        ]
+        distractor_records = [self.records[index] for index in distractor_indices]
+        cache = self._build_cache_from_interval_items(
+            model=model,
+            batch=batch,
+            positive_record_items=positive_record_items,
+            fallback_positive_items=fallback_positive_items,
+            distractor_records=distractor_records,
+        )
+        cache["diagnostics"] = diagnostics
+        self._warn_if_constraints_fail(diagnostics)
+        self._log_interval_cache(diagnostics)
+        return cache
+
+    def _valid_record_index(self, record_index):
+        return record_index is not None and 0 <= record_index < len(self.records)
+
+    def _available_pool_capacity(self, positives):
+        fallback_positives = [
+            item for item in positives if not self._valid_record_index(item["record_index"])
+        ]
+        return len(self.records) + len(fallback_positives)
+
+    def _select_pool_k_and_distractors(self, positives, interval_id):
+        pool_k_mode = getattr(self.args, "pool_k_mode", "static")
+        if pool_k_mode == "adaptive":
+            return self._select_adaptive_pool_k(positives, interval_id)
+
+        pool_k = self.args.pool_k
+        self._check_static_pool_k(pool_k, positives)
+        distractor_indices, diagnostics = self._sample_distractor_indices(positives, pool_k)
+        return pool_k, distractor_indices, diagnostics
+
+    def _check_static_pool_k(self, pool_k, positives):
+        if len(positives) > pool_k:
+            raise ValueError(
+                "K_valid failed: pool_k={} but active interval requires {} unique "
+                "positives. Increase --pool_k, reduce the interval size, or use "
+                "--pool_k_mode adaptive.".format(pool_k, len(positives))
+            )
+        capacity = self._available_pool_capacity(positives)
+        if pool_k > capacity:
+            raise ValueError(
+                "Target pool construction impossible: pool_k={} exceeds the available "
+                "unique training image capacity {} for this interval.".format(pool_k, capacity)
+            )
+
+    def _candidate_pool_ks(self, positives):
+        candidates = list(getattr(self, "pool_k_candidates", None) or _parse_pool_k_candidates(
+            getattr(self.args, "pool_k_candidates", "512,1024,2048,4096,8192")
+        ))
+        capacity = self._available_pool_capacity(positives)
+        if capacity > 0 and not any(candidate <= capacity for candidate in candidates):
+            candidates.append(capacity)
+        return sorted({candidate for candidate in candidates if candidate > 0})
+
+    def _simulate_candidate_pool(self, positives, pool_k, rng_state):
+        self.rng.setstate(rng_state)
+        distractor_indices, diagnostics = self._sample_distractor_indices(positives, pool_k)
+        next_state = self.rng.getstate()
+        return distractor_indices, diagnostics, next_state
+
+    def _select_adaptive_pool_k(self, positives, interval_id):
+        candidates = self._candidate_pool_ks(positives)
+        if not candidates:
+            raise ValueError("--pool_k_candidates must contain at least one positive integer")
+
+        capacity = self._available_pool_capacity(positives)
+        if len(positives) > capacity:
+            raise ValueError(
+                "K_valid failed: active interval requires {} positives but only {} "
+                "unique images are available.".format(len(positives), capacity)
+            )
+
+        k_valid = max(1, len(positives))
+        k_dilute = max(k_valid, int(math.ceil(len(positives) / self.args.positive_ratio_max)))
+        initial_state = self.rng.getstate()
+        k_dist = 0
+        k_dist_diagnostics = None
+        for pool_k in candidates:
+            if pool_k > capacity:
+                continue
+            distractors, diagnostics, next_state = self._simulate_candidate_pool(
+                positives, pool_k, initial_state
+            )
+            if diagnostics["pool_final_pool_size"] != float(pool_k):
+                continue
+            if not diagnostics["pool_k_valid"]:
+                continue
+            if diagnostics["pool_k_dist"]:
+                k_dist = pool_k
+                k_dist_diagnostics = diagnostics
+                break
+
+        selected_k = max(k_valid, k_dilute, k_dist)
+        capacity_limited = False
+        if selected_k > capacity:
+            if k_valid > capacity:
+                raise ValueError(
+                    "K_valid failed: no adaptive K can include {} required positives "
+                    "within capacity {}. Reduce the interval size or add training images.".format(
+                        len(positives), capacity
+                    )
+                )
+            selected_k = capacity
+            capacity_limited = True
+
+        distractors, diagnostics, next_state = self._simulate_candidate_pool(
+            positives, selected_k, initial_state
+        )
+        if diagnostics["pool_final_pool_size"] != float(selected_k):
+            raise ValueError(
+                "Adaptive target pool construction failed: selected_K={} but only {} "
+                "unique images could be inserted.".format(
+                    selected_k,
+                    int(diagnostics["pool_final_pool_size"]),
+                )
+            )
+
+        self.rng.setstate(next_state)
+        diagnostics["pool_adaptive_fallback"] = float(k_dist == 0 or capacity_limited)
+        diagnostics["pool_k_valid_target"] = float(k_valid)
+        diagnostics["pool_k_dilute_target"] = float(k_dilute)
+        diagnostics["pool_k_dist_target"] = float(k_dist)
+        diagnostics["pool_k_dist_found"] = float(k_dist > 0)
+        diagnostics["pool_k_capacity_limited"] = float(capacity_limited)
+
+        if self.logger is not None:
+            self.logger.info(
+                "Adaptive target pool interval {} selected K=max({}, {}, {})={}".format(
+                    interval_id,
+                    k_valid,
+                    k_dilute,
+                    k_dist,
+                    selected_k,
+                )
+            )
+            if k_dist == 0:
+                self.logger.warning(
+                    "Adaptive target pool interval {} could not find K_dist within "
+                    "candidates {}; selected K=max(K_valid,K_dilute).".format(
+                        interval_id,
+                        candidates,
+                    )
+                )
+            elif (
+                k_dist_diagnostics is not None
+                and selected_k != k_dist
+                and diagnostics["pool_cluster_distribution_distance"] > self.args.pool_dist_threshold
+            ):
+                self.logger.warning(
+                    "Adaptive target pool interval {} found K_dist={} but selected_K={} "
+                    "from max(...) has distance={:.4f}; consider adding selected_K to "
+                    "--pool_k_candidates for a direct distribution sweep.".format(
+                        interval_id,
+                        k_dist,
+                        selected_k,
+                        diagnostics["pool_cluster_distribution_distance"],
+                    )
+                )
+            if capacity_limited:
+                self.logger.warning(
+                    "Adaptive target pool interval {} was capacity-limited at K={}.".format(
+                        interval_id,
+                        selected_k,
+                    )
+                )
+        return selected_k, distractors, diagnostics
+
+    def _required_positives(self, batch):
+        image_ids = batch["image_ids"].detach().long().tolist()
+        pids = batch["pids"].detach().long().tolist()
+        positives = []
+        seen = set()
+        for batch_position, image_id in enumerate(image_ids):
+            if image_id in seen:
+                continue
+            seen.add(image_id)
+            record_index = self.record_index_by_image_id.get(image_id)
+            cluster_id = None
+            if self._valid_record_index(record_index) and self.cluster_labels is not None:
+                cluster_id = int(self.cluster_labels[record_index].item())
+            positives.append({
+                "batch_position": batch_position,
+                "image_id": int(image_id),
+                "pid": int(pids[batch_position]),
+                "record_index": record_index,
+                "cluster_id": cluster_id,
+            })
+        return positives
+
+    def _target_cluster_quotas(self, pool_k):
+        raw = self.cluster_distribution * pool_k
+        quotas = torch.floor(raw).long()
+        while quotas.sum().item() < pool_k:
+            deficit = raw - quotas.float()
+            quotas[int(deficit.argmax().item())] += 1
+        while quotas.sum().item() > pool_k:
+            surplus = quotas.float() - raw
+            idx = int(surplus.argmax().item())
+            if quotas[idx] == 0:
+                break
+            quotas[idx] -= 1
+        return quotas
+
+    def _sample_distractor_indices(self, positives, pool_k):
+        num_clusters = len(self.cluster_to_indices)
+        quotas = self._target_cluster_quotas(pool_k)
+        positive_record_indices = {
+            item["record_index"] for item in positives if self._valid_record_index(item["record_index"])
+        }
+        positive_cluster_counts = torch.zeros(num_clusters, dtype=torch.long)
+        missing_positive_count = 0
+        for item in positives:
+            if item["cluster_id"] is None:
+                missing_positive_count += 1
+            else:
+                positive_cluster_counts[item["cluster_id"]] += 1
+
+        remaining_quotas = torch.clamp(quotas - positive_cluster_counts, min=0)
+        selected = []
+        selected_set = set(positive_record_indices)
+        cluster_shortage_count = 0
+        for cluster_id in range(num_clusters):
+            candidates = [
+                idx for idx in self.cluster_to_indices[cluster_id]
+                if idx not in selected_set
+            ]
+            requested = int(remaining_quotas[cluster_id].item())
+            quota = min(requested, len(candidates))
+            cluster_shortage_count += max(0, requested - quota)
+            if quota > 0:
+                picks = self.rng.sample(candidates, quota)
+                selected.extend(picks)
+                selected_set.update(picks)
+
+        while len(positives) + len(selected) < pool_k:
+            counts = self._final_cluster_counts(positives, selected, num_clusters)
+            empirical = counts.float() / max(pool_k, 1)
+            deficits = self.cluster_distribution - empirical
+            ordered_clusters = torch.argsort(deficits, descending=True).tolist()
+            added = False
+            for cluster_id in ordered_clusters:
+                candidates = [
+                    idx for idx in self.cluster_to_indices[cluster_id]
+                    if idx not in selected_set
+                ]
+                if not candidates:
+                    continue
+                pick = self.rng.choice(candidates)
+                selected.append(pick)
+                selected_set.add(pick)
+                added = True
+                break
+            if not added:
+                break
+
+        final_counts = self._final_cluster_counts(positives, selected, num_clusters)
+        final_pool_size = len(positives) + len(selected)
+        positive_ratio = len(positives) / max(pool_k, 1)
+        distance = self._distribution_distance(final_counts, final_pool_size)
+        diagnostics = {
+            "pool_selected_k": float(pool_k),
+            "pool_num_required_positives": float(len(positives)),
+            "pool_num_inserted_positives": float(len(positives)),
+            "pool_positive_ratio": float(positive_ratio),
+            "pool_cluster_distribution_distance": float(distance),
+            "pool_final_pool_size": float(final_pool_size),
+            "pool_missing_positive_count": float(missing_positive_count),
+            "pool_cluster_shortage_count": float(cluster_shortage_count),
+            "pool_k_valid": float(len(positives) <= pool_k),
+            "pool_k_dilute": float(positive_ratio <= self.args.positive_ratio_max),
+            "pool_k_dist": float(distance <= self.args.pool_dist_threshold),
+        }
+        return selected, diagnostics
+
+    def _final_cluster_counts(self, positives, distractor_indices, num_clusters):
+        counts = torch.zeros(num_clusters, dtype=torch.long)
+        for item in positives:
+            if item["cluster_id"] is not None:
+                counts[item["cluster_id"]] += 1
+        for index in distractor_indices:
+            counts[int(self.cluster_labels[index].item())] += 1
+        return counts
+
+    def _distribution_distance(self, final_counts, final_pool_size):
+        if final_pool_size == 0:
+            return math.inf
+        empirical = final_counts.float() / final_pool_size
+        if self.args.pool_dist_metric == "js":
+            return _js_distance(empirical, self.cluster_distribution)
+        return float(torch.abs(empirical - self.cluster_distribution).sum().item())
+
+    def _warn_if_constraints_fail(self, diagnostics):
+        if self.logger is None:
+            return
+        if diagnostics["pool_k_valid"] < 1:
+            self.logger.warning(
+                "K_valid warning: selected_K={} is smaller than required positives={}".format(
+                    int(diagnostics["pool_selected_k"]),
+                    int(diagnostics["pool_num_required_positives"]),
+                )
+            )
+        if diagnostics["pool_positive_ratio"] > self.args.positive_ratio_max:
+            self.logger.warning(
+                "K_dilute warning: positive_ratio={:.4f} exceeds eta={:.4f}".format(
+                    diagnostics["pool_positive_ratio"], self.args.positive_ratio_max
+                )
+            )
+        if diagnostics["pool_cluster_distribution_distance"] > self.args.pool_dist_threshold:
+            self.logger.warning(
+                "K_dist warning: {} distance={:.4f} exceeds epsilon={:.4f}".format(
+                    self.args.pool_dist_metric,
+                    diagnostics["pool_cluster_distribution_distance"],
+                    self.args.pool_dist_threshold,
+                )
+            )
+        if diagnostics["pool_missing_positive_count"] > 0:
+            self.logger.warning(
+                "Target-pool warning: {} required positives were missing cluster assignments".format(
+                    int(diagnostics["pool_missing_positive_count"])
+                )
+            )
+        if diagnostics.get("pool_cluster_shortage_count", 0.0) > 0:
+            self.logger.warning(
+                "Target-pool quota warning: {} requested cluster slots were unavailable "
+                "and were filled from other clusters when possible".format(
+                    int(diagnostics["pool_cluster_shortage_count"])
+                )
+            )
+
+    def _log_interval_cache(self, diagnostics):
+        if self.logger is None:
+            return
+        self.logger.info(
+            "Target-pool interval cache built: interval={} mode={} selected_K={} "
+            "positives={} ratio={:.4f} dist={:.4f} final_size={}".format(
+                int(diagnostics["pool_interval_id"]),
+                diagnostics["pool_k_mode"],
+                int(diagnostics["pool_selected_k"]),
+                int(diagnostics["pool_num_inserted_positives"]),
+                diagnostics["pool_positive_ratio"],
+                diagnostics["pool_cluster_distribution_distance"],
+                int(diagnostics["pool_final_pool_size"]),
+            )
+        )
+
+    def _encode_batch_images(self, model, images, positions):
+        if not positions:
+            return None
+        position_tensor = torch.tensor(positions, dtype=torch.long, device=images.device)
+        core_model = _unwrap_model(model)
+        was_training = core_model.training
+        core_model.eval()
+        with torch.no_grad():
+            cache = core_model.encode_target_image_cache(images.index_select(0, position_tensor))
+        if was_training:
+            core_model.train()
+        return cache
+
+    def _build_cache_from_interval_items(
+        self,
+        model,
+        batch,
+        positive_record_items,
+        fallback_positive_items,
+        distractor_records,
+    ):
+        cache_chunks = []
+        image_ids = []
+        pids = []
+        cluster_ids = []
+
+        positive_records = [self.records[item["record_index"]] for item in positive_record_items]
+        if positive_records:
+            cache_chunks.append(self._encode_records(model, positive_records))
+            image_ids.extend([item["image_id"] for item in positive_record_items])
+            pids.extend([item["pid"] for item in positive_record_items])
+            cluster_ids.extend([
+                item["cluster_id"] if item["cluster_id"] is not None else -1
+                for item in positive_record_items
+            ])
+
+        if fallback_positive_items:
+            positions = [item["batch_position"] for item in fallback_positive_items]
+            cache_chunks.append(self._encode_batch_images(model, batch["images"], positions))
+            image_ids.extend([item["image_id"] for item in fallback_positive_items])
+            pids.extend([item["pid"] for item in fallback_positive_items])
+            cluster_ids.extend([
+                item["cluster_id"] if item["cluster_id"] is not None else -1
+                for item in fallback_positive_items
+            ])
+
+        if distractor_records:
+            cache_chunks.append(self._encode_records(model, distractor_records))
+            image_ids.extend([record["image_id"] for record in distractor_records])
+            pids.extend([record["pid"] for record in distractor_records])
+            cluster_ids.extend([
+                int(self.cluster_labels[self.record_index_by_image_id[record["image_id"]]].item())
+                for record in distractor_records
+            ])
+
+        cache_chunks = [chunk for chunk in cache_chunks if chunk is not None]
+        if not cache_chunks:
+            raise ValueError("Target pool construction produced an empty pool")
+
+        cache = {}
+        for key in cache_chunks[0].keys():
+            cache[key] = torch.cat([chunk[key] for chunk in cache_chunks], dim=0)
+        device = cache["host_image_features"].device
+        cache["image_ids"] = torch.tensor(image_ids, dtype=torch.long, device=device)
+        cache["pids"] = torch.tensor(pids, dtype=torch.long, device=device)
+        cache["cluster_ids"] = torch.tensor(cluster_ids, dtype=torch.long, device=device)
+        return self._shuffle_cache(cache)
+
+    def _merge_positive_and_distractor_cache(
+        self,
+        positive_cache,
+        positive_ids,
+        positive_pids,
+        distractor_cache,
+        distractor_records,
+    ):
+        if positive_cache is None and distractor_cache is None:
+            raise ValueError("Target pool construction produced an empty pool")
+        if positive_cache is None:
+            cache = {key: value for key, value in distractor_cache.items()}
+            device = cache["host_image_features"].device
+        elif distractor_cache is None:
+            cache = {key: value for key, value in positive_cache.items()}
+            device = cache["host_image_features"].device
+        else:
+            cache = {
+                key: torch.cat([positive_cache[key], distractor_cache[key]], dim=0)
+                for key in positive_cache.keys()
+            }
+            device = cache["host_image_features"].device
+
+        image_ids = list(positive_ids) + [record["image_id"] for record in distractor_records]
+        pids = list(positive_pids) + [record["pid"] for record in distractor_records]
+        cache["image_ids"] = torch.tensor(image_ids, dtype=torch.long, device=device)
+        cache["pids"] = torch.tensor(pids, dtype=torch.long, device=device)
+        return self._shuffle_cache(cache)
+
+    def _shuffle_cache(self, cache):
+        pool_size = cache["pids"].numel()
+        order = torch.tensor(
+            self.rng.sample(range(pool_size), pool_size),
+            dtype=torch.long,
+            device=cache["pids"].device,
+        )
+        return {
+            key: value.index_select(0, order) if torch.is_tensor(value) else value
+            for key, value in cache.items()
+        }
+
+    def _encode_records(self, model, records, cache_prototypes=True):
+        core_model = _unwrap_model(model)
+        device = next(core_model.parameters()).device
+        was_training = core_model.training
+        core_model.eval()
+        dataset = _PoolImageDataset(records, self.transform)
+        loader = DataLoader(
+            dataset,
+            batch_size=min(max(1, self.args.test_batch_size), max(1, len(records))),
+            shuffle=False,
+            num_workers=self.args.num_workers,
+        )
+
+        chunks = []
+        with torch.no_grad():
+            for _, _, images in loader:
+                images = images.to(device)
+                chunks.append(core_model.encode_target_image_cache(images, cache_prototypes=cache_prototypes))
+
+        if was_training:
+            core_model.train()
+
+        merged = {}
+        for key in chunks[0].keys():
+            merged[key] = torch.cat([chunk[key] for chunk in chunks], dim=0)
+        return merged

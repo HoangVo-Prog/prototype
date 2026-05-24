@@ -11,6 +11,7 @@ from utils.iotools import save_train_configs
 from utils.logger import setup_logger
 from solver import build_optimizer, build_lr_scheduler
 from model import build_model
+from model.enrichment import TargetPoolManager
 from utils.metrics import Evaluator
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
@@ -85,4 +86,8 @@ if __name__ == '__main__':
         start_epoch = checkpoint['epoch']
         logger.info(f"===================>start {start_epoch}")
 
-    do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer)
+    target_pool = None
+    if getattr(args, "target_enrichment", False):
+        target_pool = TargetPoolManager(train_loader.dataset, args, logger)
+
+    do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer, target_pool)
