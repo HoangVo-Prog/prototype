@@ -414,6 +414,25 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertFalse(parsed.use_target_attention_loss)
         self.assertFalse(parsed.use_target_robust_loss)
 
+    def test_loss_cli_flags_are_store_true_and_host_can_be_disabled(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "test",
+                "--no_use_host_loss",
+                "--use_target_retrieval_loss",
+                "--use_target_attention_loss",
+                "--use_target_robust_loss",
+            ]
+            parsed = options.get_args()
+        finally:
+            sys.argv = old_argv
+        self.assertFalse(parsed.use_host_loss)
+        self.assertTrue(parsed.use_target_retrieval_loss)
+        self.assertTrue(parsed.use_target_attention_loss)
+        self.assertTrue(parsed.use_target_robust_loss)
+
     def test_lr_total_epochs_overrides_training_epoch_count(self):
         build = importlib.import_module("solver.build")
         optimizer = torch.optim.SGD([torch.nn.Parameter(torch.ones(()))], lr=1.0)

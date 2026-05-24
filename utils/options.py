@@ -41,8 +41,12 @@ def get_args():
     
     ######################## loss settings ########################
     parser.add_argument("--loss_names", default='tal+cid', help="which loss to use ['cid, tal']")
-    parser.add_argument("--use_host_loss", type=str2bool, nargs="?", const=True, default=True,
-                        help="enable host cid/tal loss in the optimized objective")
+    host_loss_group = parser.add_mutually_exclusive_group()
+    host_loss_group.add_argument("--use_host_loss", dest="use_host_loss", action="store_true",
+                                 help="enable host cid/tal loss in the optimized objective")
+    host_loss_group.add_argument("--no_use_host_loss", dest="use_host_loss", action="store_false",
+                                 help="disable host cid/tal loss in the optimized objective")
+    parser.set_defaults(use_host_loss=True)
     parser.add_argument("--lambda_host", type=float, default=1.0,
                         help="weight applied to the combined host loss")
 
@@ -151,11 +155,11 @@ def get_args():
                         help="margin for query-aware prototype evidence loss")
     parser.add_argument("--gain_margin", type=float, default=0.01,
                         help="required enriched-vs-raw retrieval margin gain")
-    parser.add_argument("--use_target_retrieval_loss", type=str2bool, nargs="?", const=True, default=False,
+    parser.add_argument("--use_target_retrieval_loss", action="store_true", default=False,
                         help="enable the primary target-pool retrieval loss")
-    parser.add_argument("--use_target_attention_loss", type=str2bool, nargs="?", const=True, default=False,
+    parser.add_argument("--use_target_attention_loss", action="store_true", default=False,
                         help="enable the query-aware prototype evidence loss")
-    parser.add_argument("--use_target_robust_loss", type=str2bool, nargs="?", const=True, default=False,
+    parser.add_argument("--use_target_robust_loss", action="store_true", default=False,
                         help="enable the robust no-harm and margin-gain loss")
     
     args = parser.parse_args()
