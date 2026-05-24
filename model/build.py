@@ -37,6 +37,22 @@ def weights_init_classifier(m):
         if m.bias:
             nn.init.constant_(m.bias, 0.0)
 
+
+def freeze_host_parameters(model, trainable_prefix="target_enricher."):
+    frozen_params = 0
+    trainable_params = 0
+    for name, parameter in model.named_parameters():
+        keep_trainable = name.startswith(trainable_prefix)
+        parameter.requires_grad = keep_trainable
+        if keep_trainable:
+            trainable_params += parameter.numel()
+        else:
+            frozen_params += parameter.numel()
+    if trainable_params == 0:
+        raise ValueError("--freeze_host requires target enrichment parameters to train")
+    return frozen_params, trainable_params
+
+
 class TextEncoder(nn.Module):
     def __init__(self, clip_model):
         super().__init__()
@@ -103,8 +119,11 @@ class ITSELF(nn.Module):
         if getattr(args, "target_enrichment", False):
             self.target_enricher = TargetPrototypeEnricher(self.embed_dim, self.grab_embed_dim, args)
 
-        self.logit_scale = torch.ones([]) * (1 / args.temperature) 
-  
+        self.logit_scale = torch.ones([]) * (1 / args.temperature)
+        self.freeze_host_stats = None
+        if getattr(args, "freeze_host", False):
+            self.freeze_host_stats = freeze_host_parameters(self)
+
     def _set_task(self):
         loss_names = self.args.loss_names
         self.current_task = [l.strip() for l in loss_names.split('+')]

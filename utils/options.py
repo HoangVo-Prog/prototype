@@ -32,6 +32,8 @@ def get_args():
     parser.add_argument("--finetune", type=str, default="")
     parser.add_argument("--finetune_clip", type=str, default="",
                         help="load host CLIP weights from a CLIP or ITSELF checkpoint")
+    parser.add_argument("--freeze_host", action="store_true", default=False,
+                        help="freeze host CLIP/ITSELF parameters and train only target enrichment modules")
     parser.add_argument("--pretrain", type=str, default="")
 
 
@@ -167,4 +169,8 @@ def get_args():
                         help="enable the robust no-harm and margin-gain loss")
     
     args = parser.parse_args()
+    if args.enrichment_start < 1:
+        parser.error("--enrichment_start must be a positive integer")
+    if args.freeze_host and not args.target_enrichment:
+        parser.error("--freeze_host requires --target_enrichment")
     return args

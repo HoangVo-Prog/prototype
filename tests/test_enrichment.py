@@ -499,6 +499,20 @@ class SchedulerOptionTests(unittest.TestCase):
             sys.argv = old_argv
         self.assertEqual(parsed.finetune_clip, "host_clip.pth")
 
+    def test_freeze_host_cli_requires_target_enrichment(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = ["test", "--freeze_host"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+            sys.argv = ["test", "--freeze_host", "--target_enrichment"]
+            parsed = options.get_args()
+        finally:
+            sys.argv = old_argv
+        self.assertTrue(parsed.freeze_host)
+        self.assertTrue(parsed.target_enrichment)
+
     def test_positive_boolean_cli_parser(self):
         options = importlib.import_module("utils.options")
         self.assertTrue(options.str2bool("true"))
@@ -598,6 +612,35 @@ class HostCheckpointTests(unittest.TestCase):
         })
         host_state_dict = checkpoint.extract_host_model_state_dict(state_dict)
         self.assertEqual(set(host_state_dict.keys()), set(state_dict.keys()))
+
+
+class HostFreezeTests(unittest.TestCase):
+    def import_model_build(self):
+        if "ftfy" not in sys.modules:
+            sys.modules["ftfy"] = SimpleNamespace(fix_text=lambda text: text)
+        return importlib.import_module("model.build")
+
+    def test_freeze_host_keeps_only_target_enricher_trainable(self):
+        build = self.import_model_build()
+        model = torch.nn.Module()
+        model.base_model = torch.nn.Linear(2, 2)
+        model.classifier_global = torch.nn.Linear(2, 2)
+        model.target_enricher = torch.nn.Linear(2, 2)
+
+        frozen_params, trainable_params = build.freeze_host_parameters(model)
+
+        self.assertGreater(frozen_params, 0)
+        self.assertGreater(trainable_params, 0)
+        for name, parameter in model.named_parameters():
+            self.assertEqual(parameter.requires_grad, name.startswith("target_enricher."))
+
+    def test_freeze_host_requires_enrichment_parameters(self):
+        build = self.import_model_build()
+        model = torch.nn.Module()
+        model.base_model = torch.nn.Linear(2, 2)
+
+        with self.assertRaisesRegex(ValueError, "target enrichment"):
+            build.freeze_host_parameters(model)
 
 
 if __name__ == "__main__":
