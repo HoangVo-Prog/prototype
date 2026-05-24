@@ -414,7 +414,7 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertFalse(parsed.use_target_attention_loss)
         self.assertFalse(parsed.use_target_robust_loss)
 
-    def test_lr_total_epoch_overrides_training_epoch_count(self):
+    def test_lr_total_epochs_overrides_training_epoch_count(self):
         build = importlib.import_module("solver.build")
         optimizer = torch.optim.SGD([torch.nn.Parameter(torch.ones(()))], lr=1.0)
         sched = build.build_lr_scheduler(SimpleNamespace(
@@ -423,7 +423,7 @@ class SchedulerOptionTests(unittest.TestCase):
             warmup_factor=1.0,
             warmup_epochs=0,
             warmup_method="linear",
-            lr_total_epoch=200,
+            lr_total_epochs=200,
             num_epoch=60,
             lrscheduler="cosine",
             target_lr=0,
