@@ -23,7 +23,11 @@ def _is_trainable_loss(value):
     return torch.is_tensor(value) and value.numel() == 1 and value.requires_grad
 
 
-def _should_track_scalar(key):
+def _should_track_log_scalar(key):
+    return "loss" in key or key.endswith("grad_norm")
+
+
+def _should_track_wandb_scalar(key):
     return (
         "loss" in key
         or key.endswith("grad_norm")
@@ -67,6 +71,12 @@ def _loss_grad_norm(loss, parameters):
     return total ** 0.5
 
 
+def _update_meter(meters, key, value, batch_size):
+    if key not in meters:
+        meters[key] = AverageMeter()
+    meters[key].update(value, batch_size)
+
+
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
              scheduler, checkpointer, target_pool=None, wandb_run=None):
 
@@ -95,13 +105,13 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         "tal_loss": AverageMeter(),
         "host_loss": AverageMeter(),
         "target_enrichment_loss": AverageMeter(),
-        "pool_interval_reused": AverageMeter(),
         "grad_norm": AverageMeter(),
         "host_loss_grad_norm": AverageMeter(),
         "cid_loss_grad_norm": AverageMeter(),
         "tal_loss_grad_norm": AverageMeter(),
         "target_enrichment_loss_grad_norm": AverageMeter(),
     }
+    wandb_meters = {}
 
     tb_writer = SummaryWriter(log_dir=args.output_dir)
 
@@ -122,6 +132,8 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         current_epoch += 1
         start_time = time.time()
         for meter in meters.values():
+            meter.reset()
+        for meter in wandb_meters.values():
             meter.reset()
 
         model.train()
@@ -150,27 +162,29 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 total_loss = sum([v for k, v in ret.items() if "loss" in k and _is_trainable_loss(v)])
             batch_size = batch['images'].shape[0]
             meters['loss'].update(total_loss.item(), batch_size)
+            _update_meter(wandb_meters, "loss", total_loss.item(), batch_size)
             for key, value in ret.items():
                 if key == "loss":
-                    continue
-                if not _should_track_scalar(key):
                     continue
                 scalar = _scalar_value(value)
                 if scalar is None:
                     continue
-                if key not in meters:
-                    meters[key] = AverageMeter()
-                meters[key].update(scalar, batch_size)
+                if _should_track_log_scalar(key):
+                    _update_meter(meters, key, scalar, batch_size)
+                if _should_track_wandb_scalar(key):
+                    _update_meter(wandb_meters, key, scalar, batch_size)
             optimizer.zero_grad()
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             for loss_key in ["host_loss", "cid_loss", "tal_loss", "target_enrichment_loss"]:
                 if loss_key in ret:
-                    meters[f"{loss_key}_grad_norm"].update(
-                        _loss_grad_norm(ret[loss_key], trainable_params),
-                        batch_size,
-                    )
+                    grad_norm_key = f"{loss_key}_grad_norm"
+                    grad_norm_value = _loss_grad_norm(ret[loss_key], trainable_params)
+                    _update_meter(meters, grad_norm_key, grad_norm_value, batch_size)
+                    _update_meter(wandb_meters, grad_norm_key, grad_norm_value, batch_size)
             total_loss.backward()
-            meters['grad_norm'].update(_grad_norm(model.parameters()), batch_size)
+            grad_norm_value = _grad_norm(model.parameters())
+            meters['grad_norm'].update(grad_norm_value, batch_size)
+            _update_meter(wandb_meters, "grad_norm", grad_norm_value, batch_size)
             optimizer.step()
             synchronize()
             if (n_iter + 1) % log_period == 0:
@@ -184,7 +198,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 if get_rank() == 0:
                     train_metrics = {
                         "train/{}".format(k): v.avg
-                        for k, v in meters.items()
+                        for k, v in wandb_meters.items()
                         if v.count > 0
                     }
                     train_metrics["train/lr"] = scheduler.get_lr()[0]
@@ -199,7 +213,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         if get_rank() == 0:
             epoch_metrics = {
                 "train_epoch/{}".format(k): v.avg
-                for k, v in meters.items()
+                for k, v in wandb_meters.items()
                 if v.count > 0
             }
             epoch_metrics["train_epoch/lr"] = scheduler.get_lr()[0]

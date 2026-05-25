@@ -128,6 +128,8 @@ def get_args():
     parser.add_argument("--use_shared_k", action="store_true", default=False,
                         help="sample a shared K-sized target pool before top-M selection; "
                              "without this flag, top-M is selected from the full training set")
+    parser.add_argument("--pool_coverage_epochs", type=int, default=15,
+                        help="number of shared-K refreshes expected to cover every training image")
     parser.add_argument("--top_m", type=int, default=32,
                         help="number of host-ranked local images used for enrichment")
     parser.add_argument("--use_freeze_indices", "--freeze_indices",
@@ -189,4 +191,6 @@ def get_args():
         parser.error("--use_freeze_indices requires --target_enrichment")
     if args.use_shared_k and not args.target_enrichment:
         parser.error("--use_shared_k requires --target_enrichment")
+    if args.pool_coverage_epochs < 1:
+        parser.error("--pool_coverage_epochs must be a positive integer")
     return args

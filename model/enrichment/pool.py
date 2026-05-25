@@ -112,6 +112,7 @@ class TargetPoolManager:
             raise ValueError("--pool_k_candidates must contain at least one positive integer")
         self.records = self._build_unique_records(train_dataset.dataset)
         self.query_records = self._build_query_records(train_dataset.dataset)
+        self.records_by_pid = self._build_records_by_pid(self.records)
         self.record_by_image_id = {record["image_id"]: record for record in self.records}
         self.record_index_by_image_id = {
             record["image_id"]: index for index, record in enumerate(self.records)
@@ -130,6 +131,7 @@ class TargetPoolManager:
         self.frozen_rank_indices = None
         self.frozen_index_depth = None
         self.frozen_cache_requests = 0
+        self.pool_coverage_counts = [0 for _ in self.records]
         self.rng = random.Random(42)
 
         if not self.use_shared_k and not getattr(args, "use_freeze_indices", False) and logger is not None:
@@ -169,6 +171,15 @@ class TargetPoolManager:
                 "caption": caption,
             })
         return records
+
+    def _build_records_by_pid(self, records):
+        records_by_pid = defaultdict(list)
+        for index, record in enumerate(records):
+            records_by_pid[int(record["pid"])].append(index)
+        return {
+            pid: sorted(indices, key=lambda idx: records[idx]["image_id"])
+            for pid, indices in records_by_pid.items()
+        }
 
     def get_train_cache(self, model, batch, epoch, step):
         if getattr(self.args, "use_freeze_indices", False):
@@ -435,7 +446,7 @@ class TargetPoolManager:
         return self._build_interval_pool_cache(model, batch, interval_id=0)
 
     def _build_interval_pool_cache(self, model, batch, interval_id):
-        positives = self._required_positives(batch)
+        positives = self._required_identity_anchors()
         pool_k, distractor_indices, diagnostics = self._select_pool_k_and_distractors(
             positives=positives,
             interval_id=interval_id,
@@ -457,6 +468,7 @@ class TargetPoolManager:
         diagnostics["K_valid"] = diagnostics["pool_k_valid"]
         diagnostics["K_dilute"] = diagnostics["pool_k_dilute"]
         diagnostics["K_dist"] = diagnostics["pool_k_dist"]
+        diagnostics["K_cover"] = diagnostics["pool_k_cover"]
 
         if diagnostics["pool_final_pool_size"] != float(pool_k):
             raise ValueError(
@@ -479,6 +491,18 @@ class TargetPoolManager:
             fallback_positive_items=fallback_positive_items,
             distractor_records=distractor_records,
         )
+        covered_record_indices = [
+            item["record_index"]
+            for item in positive_record_items
+            if self._valid_record_index(item["record_index"])
+        ] + list(distractor_indices)
+        self._mark_pool_coverage(covered_record_indices)
+        diagnostics["pool_coverage_seen"] = float(self._coverage_seen_count())
+        diagnostics["pool_coverage_remaining"] = float(
+            max(0, len(self.records) - self._coverage_seen_count())
+        )
+        diagnostics["coverage_seen"] = diagnostics["pool_coverage_seen"]
+        diagnostics["coverage_remaining"] = diagnostics["pool_coverage_remaining"]
         cache["diagnostics"] = diagnostics
         self._warn_if_constraints_fail(diagnostics)
         self._log_interval_cache(diagnostics)
@@ -506,9 +530,9 @@ class TargetPoolManager:
     def _check_static_pool_k(self, pool_k, positives):
         if len(positives) > pool_k:
             raise ValueError(
-                "K_valid failed: pool_k={} but active interval requires {} unique "
-                "positives. Increase --pool_k, reduce the interval size, or use "
-                "--pool_k_mode adaptive.".format(pool_k, len(positives))
+                "K_valid failed: pool_k={} but shared identity coverage requires {} "
+                "unique identity anchors. Increase --pool_k or use --pool_k_mode "
+                "adaptive.".format(pool_k, len(positives))
             )
         capacity = self._available_pool_capacity(positives)
         if pool_k > capacity:
@@ -533,10 +557,6 @@ class TargetPoolManager:
         return distractor_indices, diagnostics, next_state
 
     def _select_adaptive_pool_k(self, positives, interval_id):
-        candidates = self._candidate_pool_ks(positives)
-        if not candidates:
-            raise ValueError("--pool_k_candidates must contain at least one positive integer")
-
         capacity = self._available_pool_capacity(positives)
         if len(positives) > capacity:
             raise ValueError(
@@ -546,6 +566,16 @@ class TargetPoolManager:
 
         k_valid = max(1, len(positives))
         k_dilute = max(k_valid, int(math.ceil(len(positives) / self.args.positive_ratio_max)))
+        k_cover = max(k_valid, self._coverage_k_target())
+        candidates = self._candidate_pool_ks(positives)
+        candidates.extend([k_valid, k_dilute, k_cover])
+        candidates = sorted({
+            candidate for candidate in candidates
+            if candidate > 0 and candidate <= max(capacity, 1)
+        })
+        if not candidates:
+            raise ValueError("--pool_k_candidates must contain at least one positive integer")
+
         initial_state = self.rng.getstate()
         k_dist = 0
         k_dist_diagnostics = None
@@ -564,12 +594,12 @@ class TargetPoolManager:
                 k_dist_diagnostics = diagnostics
                 break
 
-        selected_k = max(k_valid, k_dilute, k_dist)
+        selected_k = max(k_valid, k_dilute, k_dist, k_cover)
         capacity_limited = False
         if selected_k > capacity:
             if k_valid > capacity:
                 raise ValueError(
-                    "K_valid failed: no adaptive K can include {} required positives "
+                    "K_valid failed: no adaptive K can include {} identity anchors "
                     "within capacity {}. Reduce the interval size or add training images.".format(
                         len(positives), capacity
                     )
@@ -594,23 +624,25 @@ class TargetPoolManager:
         diagnostics["pool_k_valid_target"] = float(k_valid)
         diagnostics["pool_k_dilute_target"] = float(k_dilute)
         diagnostics["pool_k_dist_target"] = float(k_dist)
+        diagnostics["pool_k_cover_target"] = float(k_cover)
         diagnostics["pool_k_dist_found"] = float(k_dist > 0)
         diagnostics["pool_k_capacity_limited"] = float(capacity_limited)
 
         if self.logger is not None:
             self.logger.info(
-                "Adaptive target pool interval {} selected K=max({}, {}, {})={}".format(
+                "Adaptive target pool interval {} selected K=max({}, {}, {}, {})={}".format(
                     interval_id,
                     k_valid,
                     k_dilute,
                     k_dist,
+                    k_cover,
                     selected_k,
                 )
             )
             if k_dist == 0:
                 self.logger.warning(
                     "Adaptive target pool interval {} could not find K_dist within "
-                    "candidates {}; selected K=max(K_valid,K_dilute).".format(
+                    "candidates {}; selected K=max(K_valid,K_dilute,K_cover).".format(
                         interval_id,
                         candidates,
                     )
@@ -661,6 +693,83 @@ class TargetPoolManager:
             })
         return positives
 
+    def _coverage_horizon(self):
+        return max(1, int(getattr(self.args, "pool_coverage_epochs", 15)))
+
+    def _coverage_seen_count(self):
+        counts = getattr(self, "pool_coverage_counts", [])
+        return sum(1 for count in counts if count > 0)
+
+    def _coverage_k_target(self):
+        if not self.records:
+            return 0
+        records_by_pid = getattr(self, "records_by_pid", None)
+        if records_by_pid is None:
+            records_by_pid = self._build_records_by_pid(self.records)
+            self.records_by_pid = records_by_pid
+
+        horizon = self._coverage_horizon()
+        identity_slots = len(records_by_pid)
+        covered_by_identity_rotation = sum(
+            min(len(indices), horizon) for indices in records_by_pid.values()
+        )
+        remaining_after_identity_rotation = max(
+            0, len(self.records) - covered_by_identity_rotation
+        )
+        extra_slots = int(math.ceil(remaining_after_identity_rotation / horizon))
+        return min(len(self.records), identity_slots + extra_slots)
+
+    def _coverage_preferred_indices(self, candidates, count):
+        if count <= 0:
+            return []
+        coverage_counts = getattr(self, "pool_coverage_counts", None)
+        if coverage_counts is None:
+            coverage_counts = [0 for _ in self.records]
+            self.pool_coverage_counts = coverage_counts
+        if not hasattr(self, "rng"):
+            self.rng = random.Random(42)
+        decorated = [
+            (coverage_counts[index], self.rng.random(), index)
+            for index in candidates
+        ]
+        decorated.sort()
+        return [index for _, _, index in decorated[:count]]
+
+    def _coverage_preferred_index(self, candidates):
+        picks = self._coverage_preferred_indices(candidates, 1)
+        return picks[0] if picks else None
+
+    def _mark_pool_coverage(self, record_indices):
+        if not hasattr(self, "pool_coverage_counts"):
+            self.pool_coverage_counts = [0 for _ in self.records]
+        for index in record_indices:
+            if 0 <= index < len(self.pool_coverage_counts):
+                self.pool_coverage_counts[index] += 1
+
+    def _required_identity_anchors(self):
+        records_by_pid = getattr(self, "records_by_pid", None)
+        if records_by_pid is None:
+            records_by_pid = self._build_records_by_pid(self.records)
+            self.records_by_pid = records_by_pid
+
+        anchors = []
+        for pid in sorted(records_by_pid):
+            record_index = self._coverage_preferred_index(records_by_pid[pid])
+            if record_index is None:
+                continue
+            record = self.records[record_index]
+            cluster_id = None
+            if self.cluster_labels is not None:
+                cluster_id = int(self.cluster_labels[record_index].item())
+            anchors.append({
+                "batch_position": None,
+                "image_id": int(record["image_id"]),
+                "pid": int(record["pid"]),
+                "record_index": record_index,
+                "cluster_id": cluster_id,
+            })
+        return anchors
+
     def _target_cluster_quotas(self, pool_k):
         raw = self.cluster_distribution * pool_k
         quotas = torch.floor(raw).long()
@@ -693,16 +802,19 @@ class TargetPoolManager:
         selected = []
         selected_set = set(positive_record_indices)
         cluster_shortage_count = 0
+        distractor_capacity = max(0, pool_k - len(positives))
         for cluster_id in range(num_clusters):
+            if len(selected) >= distractor_capacity:
+                break
             candidates = [
                 idx for idx in self.cluster_to_indices[cluster_id]
                 if idx not in selected_set
             ]
             requested = int(remaining_quotas[cluster_id].item())
-            quota = min(requested, len(candidates))
+            quota = min(requested, len(candidates), distractor_capacity - len(selected))
             cluster_shortage_count += max(0, requested - quota)
             if quota > 0:
-                picks = self.rng.sample(candidates, quota)
+                picks = self._coverage_preferred_indices(candidates, quota)
                 selected.extend(picks)
                 selected_set.update(picks)
 
@@ -719,7 +831,7 @@ class TargetPoolManager:
                 ]
                 if not candidates:
                     continue
-                pick = self.rng.choice(candidates)
+                pick = self._coverage_preferred_index(candidates)
                 selected.append(pick)
                 selected_set.add(pick)
                 added = True
@@ -731,6 +843,8 @@ class TargetPoolManager:
         final_pool_size = len(positives) + len(selected)
         positive_ratio = len(positives) / max(pool_k, 1)
         distance = self._distribution_distance(final_counts, final_pool_size)
+        k_cover = self._coverage_k_target()
+        coverage_seen_before = self._coverage_seen_count()
         diagnostics = {
             "pool_selected_k": float(pool_k),
             "pool_num_required_positives": float(len(positives)),
@@ -743,6 +857,12 @@ class TargetPoolManager:
             "pool_k_valid": float(len(positives) <= pool_k),
             "pool_k_dilute": float(positive_ratio <= self.args.positive_ratio_max),
             "pool_k_dist": float(distance <= self.args.pool_dist_threshold),
+            "pool_k_cover": float(pool_k >= k_cover),
+            "pool_k_cover_target": float(k_cover),
+            "pool_coverage_horizon": float(self._coverage_horizon()),
+            "pool_coverage_seen_before": float(coverage_seen_before),
+            "pool_coverage_seen": float(coverage_seen_before),
+            "pool_coverage_remaining": float(max(0, len(self.records) - coverage_seen_before)),
         }
         return selected, diagnostics
 
@@ -787,6 +907,15 @@ class TargetPoolManager:
                     self.args.pool_dist_threshold,
                 )
             )
+        if diagnostics.get("pool_k_cover", 1.0) < 1:
+            self.logger.warning(
+                "K_cover warning: selected_K={} is smaller than the {}-pool coverage "
+                "target {}".format(
+                    int(diagnostics["pool_selected_k"]),
+                    int(diagnostics.get("pool_coverage_horizon", 0)),
+                    int(diagnostics.get("pool_k_cover_target", 0)),
+                )
+            )
         if diagnostics["pool_missing_positive_count"] > 0:
             self.logger.warning(
                 "Target-pool warning: {} required positives were missing cluster assignments".format(
@@ -806,7 +935,8 @@ class TargetPoolManager:
             return
         self.logger.info(
             "Target-pool interval cache built: interval={} mode={} selected_K={} "
-            "positives={} ratio={:.4f} dist={:.4f} final_size={}".format(
+            "identity_anchors={} ratio={:.4f} dist={:.4f} final_size={} "
+            "coverage={}/{}".format(
                 int(diagnostics["pool_interval_id"]),
                 diagnostics["pool_k_mode"],
                 int(diagnostics["pool_selected_k"]),
@@ -814,6 +944,8 @@ class TargetPoolManager:
                 diagnostics["pool_positive_ratio"],
                 diagnostics["pool_cluster_distribution_distance"],
                 int(diagnostics["pool_final_pool_size"]),
+                int(diagnostics.get("pool_coverage_seen", 0)),
+                len(self.records),
             )
         )
 
