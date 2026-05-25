@@ -121,6 +121,9 @@ def get_args():
                         help="comma-separated candidate K values used when --pool_k_mode adaptive")
     parser.add_argument("--top_m", type=int, default=32,
                         help="number of host-ranked local images used for enrichment")
+    parser.add_argument("--use_freeze_indices", "--freeze_indices",
+                        dest="use_freeze_indices", action="store_true", default=False,
+                        help="precompute frozen host top-K rankings once and reuse them for top-M selection")
     parser.add_argument("--robust_hard_k", "--hard_neg_k", dest="robust_hard_k",
                         type=int, default=32,
                         help="number of raw-score hard negatives R used by robust margin loss")
@@ -173,4 +176,6 @@ def get_args():
         parser.error("--enrichment_start must be a positive integer")
     if args.freeze_host and not args.target_enrichment:
         parser.error("--freeze_host requires --target_enrichment")
+    if args.use_freeze_indices and not args.target_enrichment:
+        parser.error("--use_freeze_indices requires --target_enrichment")
     return args

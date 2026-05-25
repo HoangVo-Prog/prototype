@@ -226,8 +226,9 @@ class ITSELF(nn.Module):
     def forward(self, batch, epoch=None, current_step=None, target_cache=None):
         ret = dict()
         device = "cuda"
+        use_host_loss = getattr(self.args, "use_host_loss", True)
 
-        if 'cid' in self.current_task:
+        if use_host_loss and 'cid' in self.current_task:
             self.mlp_global = self.mlp_global.float()
             self.classifier_global = self.classifier_global.float()
             if not self.args.only_global:
@@ -331,7 +332,7 @@ class ITSELF(nn.Module):
                 })
             ret.update(target_metrics)
 
-        if 'cid' in self.current_task:
+        if use_host_loss and 'cid' in self.current_task:
             S = objectives.cosine_similarity_matrix(i_feats, t_feats)
             hard_negatives = objectives.sample_hard_negatives(S, batch['pids'])
             M = batch['pids'].max().item()
@@ -373,7 +374,7 @@ class ITSELF(nn.Module):
             else:
                 ret.update({'cid_loss': closs1+closs3})
 
-        if 'tal' in self.current_task:
+        if use_host_loss and 'tal' in self.current_task:
             TAL_global_loss = objectives.compute_TAL(i_feats, t_feats,batch['pids'],margin=self.args.margin,tau=self.args.tau)
             if not self.args.only_global:
                 TAL_grab_loss = objectives.compute_TAL(i_grab_f, t_grab_f,batch['pids'],margin=self.args.margin,tau=self.args.tau)
@@ -384,11 +385,7 @@ class ITSELF(nn.Module):
         zero = i_feats.float().sum() * 0.0
         cid_loss = ret.get('cid_loss', zero)
         tal_loss = ret.get('tal_loss', zero)
-        host_loss = cid_loss + tal_loss
-        if getattr(self.args, "use_host_loss", True):
-            host_loss = getattr(self.args, "lambda_host", 1.0) * host_loss
-        else:
-            host_loss = zero
+        host_loss = getattr(self.args, "lambda_host", 1.0) * (cid_loss + tal_loss) if use_host_loss else zero
         target_enrichment_loss = ret.get('target_enrichment_loss', zero)
         ret.update({
             'host_loss': host_loss,

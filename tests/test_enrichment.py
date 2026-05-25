@@ -366,6 +366,29 @@ class EnrichmentShapeTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(out_a["top_indices"], out_b["top_indices"]))
 
+    def test_forward_uses_supplied_frozen_top_indices(self):
+        torch.manual_seed(13)
+        enricher = modules.TargetPrototypeEnricher(512, 4096, args()).float()
+        supplied = torch.tensor([
+            [5, 4, 3],
+            [2, 1, 0],
+        ])
+        cache = {
+            "host_image_features": torch.randn(6, 512),
+            "retrieval_features": torch.randn(6, 512),
+            "prototypes": torch.randn(6, 7, 512),
+            "pids": torch.tensor([0, 1, 2, 3, 4, 5]),
+            "top_indices": supplied,
+        }
+        out = enricher(
+            query_features=torch.randn(2, 512, requires_grad=True),
+            host_text_features=torch.randn(2, 512, requires_grad=True),
+            query_pids=torch.tensor([0, 1]),
+            pool_cache=cache,
+            space="global",
+        )
+        self.assertTrue(torch.equal(out["top_indices"].cpu(), supplied))
+
 
 class PoolManagerTests(unittest.TestCase):
     def test_unique_records_and_recompute_policy(self):
@@ -440,6 +463,43 @@ class PoolManagerTests(unittest.TestCase):
         self.assertEqual(cache2["diagnostics"]["pool_interval_reused"], 1.0)
         self.assertEqual(cache2["diagnostics"]["pool_interval_id"], 0.0)
 
+    def test_frozen_indices_bypass_recompute_interval(self):
+        manager = make_pool_manager(use_freeze_indices=True, top_m=2)
+        manager.refresh = lambda model, epoch, step: self.fail("frozen indices should not refresh")
+        manager.frozen_cache = {
+            "host_image_features": torch.zeros(4, 512),
+            "retrieval_features": torch.zeros(4, 512),
+            "prototypes": torch.zeros(4, 7, 512),
+            "pids": torch.tensor([0, 1, 2, 3]),
+        }
+        manager.frozen_rank_indices = torch.tensor([
+            [0, 1, 2, 3],
+            [1, 0, 2, 3],
+            [2, 3, 0, 1],
+            [3, 2, 1, 0],
+        ])
+        manager.frozen_index_depth = 4
+        manager.frozen_cache_requests = 0
+
+        cache1 = manager.get_train_cache(
+            FakeImageEncoder(),
+            {"index": torch.tensor([0, 2])},
+            epoch=1,
+            step=1,
+        )
+        cache2 = manager.get_train_cache(
+            FakeImageEncoder(),
+            {"index": torch.tensor([3, 1])},
+            epoch=99,
+            step=99,
+        )
+
+        self.assertTrue(torch.equal(cache1["top_indices"], torch.tensor([[0, 1], [2, 3]])))
+        self.assertTrue(torch.equal(cache2["top_indices"], torch.tensor([[3, 2], [1, 0]])))
+        self.assertEqual(cache1["diagnostics"]["pool_interval_reused"], 0.0)
+        self.assertEqual(cache2["diagnostics"]["pool_interval_reused"], 1.0)
+        self.assertEqual(cache2["diagnostics"]["pool_k_mode"], "frozen_indices")
+
     def test_static_mode_uses_exact_pool_k(self):
         manager = make_pool_manager(pool_k=3, positive_ratio_max=1.0)
         batch = {
@@ -512,6 +572,20 @@ class SchedulerOptionTests(unittest.TestCase):
             sys.argv = old_argv
         self.assertTrue(parsed.freeze_host)
         self.assertTrue(parsed.target_enrichment)
+
+    def test_freeze_indices_cli_requires_target_enrichment(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = ["test", "--use_freeze_indices"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+            sys.argv = ["test", "--target_enrichment", "--use_freeze_indices"]
+            parsed = options.get_args()
+        finally:
+            sys.argv = old_argv
+        self.assertTrue(parsed.target_enrichment)
+        self.assertTrue(parsed.use_freeze_indices)
 
     def test_positive_boolean_cli_parser(self):
         options = importlib.import_module("utils.options")
@@ -587,6 +661,76 @@ class SchedulerOptionTests(unittest.TestCase):
             power=0.9,
         ), optimizer)
         self.assertEqual(sched.total_epochs, 200)
+
+
+class HostLossForwardTests(unittest.TestCase):
+    def import_model_build(self):
+        if "ftfy" not in sys.modules:
+            sys.modules["ftfy"] = SimpleNamespace(fix_text=lambda text: text)
+        return importlib.import_module("model.build")
+
+    def test_no_use_host_loss_skips_host_objectives(self):
+        build = self.import_model_build()
+
+        class FakeBaseModel(torch.nn.Module):
+            def forward(self, images, caption_ids):
+                batch_size = images.shape[0]
+                embed_dim = 4
+                image_feats = torch.arange(
+                    batch_size * 2 * embed_dim,
+                    dtype=torch.float32,
+                ).reshape(batch_size, 2, embed_dim)
+                text_feats = torch.arange(
+                    batch_size * caption_ids.shape[1] * embed_dim,
+                    dtype=torch.float32,
+                ).reshape(batch_size, caption_ids.shape[1], embed_dim)
+                return image_feats, None, text_feats, None
+
+        def fail_host_objective(*_args, **_kwargs):
+            raise AssertionError("host loss objective should not be computed")
+
+        patched_names = [
+            "cosine_similarity_matrix",
+            "sample_hard_negatives",
+            "update_labels_for_negatives",
+            "create_sample_pairs",
+            "compute_cid",
+            "compute_id",
+            "compute_TAL",
+        ]
+        originals = {name: getattr(build.objectives, name) for name in patched_names}
+        try:
+            for name in patched_names:
+                setattr(build.objectives, name, fail_host_objective)
+
+            model = build.ITSELF.__new__(build.ITSELF)
+            torch.nn.Module.__init__(model)
+            model.args = SimpleNamespace(
+                use_host_loss=False,
+                return_all=False,
+                only_global=True,
+                target_enrichment=False,
+                lambda_host=1.0,
+                margin=0.1,
+                tau=0.015,
+            )
+            model.current_task = ["tal", "cid"]
+            model.logit_scale = torch.ones([])
+            model.base_model = FakeBaseModel()
+
+            ret = build.ITSELF.forward(model, {
+                "images": torch.zeros(2, 3, 8, 8),
+                "caption_ids": torch.tensor([[0, 2, 1], [1, 0, 2]]),
+                "pids": torch.tensor([0, 1]),
+            })
+        finally:
+            for name, original in originals.items():
+                setattr(build.objectives, name, original)
+
+        self.assertNotIn("cid_loss", ret)
+        self.assertNotIn("tal_loss", ret)
+        self.assertEqual(ret["host_loss"].item(), 0.0)
+        self.assertEqual(ret["loss"].item(), 0.0)
 
 
 class HostCheckpointTests(unittest.TestCase):

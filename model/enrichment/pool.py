@@ -3,6 +3,7 @@ import random
 from collections import defaultdict
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -65,6 +66,29 @@ class _PoolImageDataset(Dataset):
         return record["pid"], record["image_id"], image
 
 
+class _PoolTextDataset(Dataset):
+    def __init__(self, records, tokenizer, text_length, truncate):
+        self.records = records
+        self.tokenizer = tokenizer
+        self.text_length = text_length
+        self.truncate = truncate
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, index):
+        from datasets.bases import tokenize
+
+        record = self.records[index]
+        caption = tokenize(
+            record["caption"],
+            tokenizer=self.tokenizer,
+            text_length=self.text_length,
+            truncate=self.truncate,
+        )
+        return record["pid"], record["query_index"], caption
+
+
 class TargetPoolManager:
     def __init__(self, train_dataset, args, logger=None):
         if args.pool_k < 1:
@@ -76,6 +100,7 @@ class TargetPoolManager:
             raise ValueError("--pool_k_mode must be either 'static' or 'adaptive'")
         self.args = args
         self.logger = logger
+        self.train_dataset = train_dataset
         self.pool_k_mode = pool_k_mode
         self.pool_k_candidates = _parse_pool_k_candidates(
             getattr(args, "pool_k_candidates", "512,1024,2048,4096,8192")
@@ -83,6 +108,7 @@ class TargetPoolManager:
         if not self.pool_k_candidates:
             raise ValueError("--pool_k_candidates must contain at least one positive integer")
         self.records = self._build_unique_records(train_dataset.dataset)
+        self.query_records = self._build_query_records(train_dataset.dataset)
         self.record_by_image_id = {record["image_id"]: record for record in self.records}
         self.record_index_by_image_id = {
             record["image_id"]: index for index, record in enumerate(self.records)
@@ -94,7 +120,23 @@ class TargetPoolManager:
         self.last_refresh_unit = None
         self.active_interval_id = None
         self.interval_cache = None
+        self.frozen_cache = None
+        self.frozen_rank_indices = None
+        self.frozen_index_depth = None
+        self.frozen_cache_requests = 0
         self.rng = random.Random(42)
+
+        if getattr(args, "use_freeze_indices", False) and logger is not None:
+            if not getattr(args, "freeze_host", False):
+                logger.warning(
+                    "--use_freeze_indices is intended for a frozen host. If host weights "
+                    "change, the precomputed retrieval ranking will become stale."
+                )
+            if getattr(args, "txt_aug", False):
+                logger.warning(
+                    "--use_freeze_indices builds rankings from unaugmented captions; "
+                    "consider disabling text augmentation for exact frozen-host training."
+                )
 
     def _build_unique_records(self, dataset):
         records = {}
@@ -107,7 +149,22 @@ class TargetPoolManager:
                 }
         return list(records.values())
 
+    def _build_query_records(self, dataset):
+        records = []
+        for query_index, (pid, _, _, caption) in enumerate(dataset):
+            records.append({
+                "pid": int(pid),
+                "query_index": int(query_index),
+                "caption": caption,
+            })
+        return records
+
     def get_train_cache(self, model, batch, epoch, step):
+        if getattr(self.args, "use_freeze_indices", False):
+            if self.frozen_cache is None or self.frozen_rank_indices is None:
+                self._build_frozen_index_cache(model)
+            return self._frozen_batch_cache(batch)
+
         if self._should_refresh(epoch, step):
             self.refresh(model, epoch, step)
             interval_id = self._interval_id(epoch, step)
@@ -120,6 +177,112 @@ class TargetPoolManager:
         elif self.interval_cache is not None and "diagnostics" in self.interval_cache:
             self.interval_cache["diagnostics"]["pool_interval_reused"] = 1.0
         return self.interval_cache
+
+    def _build_frozen_index_cache(self, model):
+        if not self.records:
+            raise ValueError("Cannot build frozen indices from an empty training image pool")
+        if not self.query_records:
+            raise ValueError("Cannot build frozen indices from an empty training query set")
+
+        cache = self._encode_records(model, self.records, cache_prototypes=True)
+        device = cache["host_image_features"].device
+        cache["image_ids"] = torch.tensor(
+            [record["image_id"] for record in self.records],
+            dtype=torch.long,
+            device=device,
+        )
+        cache["pids"] = torch.tensor(
+            [record["pid"] for record in self.records],
+            dtype=torch.long,
+            device=device,
+        )
+
+        host_image_features = F.normalize(cache["host_image_features"].float(), p=2, dim=-1)
+        query_features = self._encode_text_records(model, self.query_records)
+        rank_depth = min(
+            max(int(getattr(self.args, "pool_k", 1)), int(getattr(self.args, "top_m", 1))),
+            host_image_features.shape[0],
+        )
+        if rank_depth < 1:
+            raise ValueError("Frozen index depth must be positive")
+
+        rank_chunks = []
+        batch_size = min(max(1, self.args.test_batch_size), max(1, query_features.shape[0]))
+        with torch.no_grad():
+            for start in range(0, query_features.shape[0], batch_size):
+                query_chunk = query_features[start:start + batch_size].to(device)
+                query_chunk = F.normalize(query_chunk.float(), p=2, dim=-1)
+                scores = query_chunk @ host_image_features.t()
+                rank_chunks.append(
+                    scores.topk(k=rank_depth, dim=1, largest=True, sorted=True).indices.cpu()
+                )
+
+        self.frozen_cache = cache
+        self.frozen_rank_indices = torch.cat(rank_chunks, dim=0)
+        self.frozen_index_depth = rank_depth
+        self.frozen_cache_requests = 0
+
+        if self.logger is not None:
+            self.logger.info(
+                "Frozen host retrieval index built: queries={} gallery={} rank_depth={}".format(
+                    self.frozen_rank_indices.shape[0],
+                    cache["pids"].numel(),
+                    rank_depth,
+                )
+            )
+
+    def _frozen_batch_cache(self, batch):
+        if "index" not in batch:
+            raise ValueError("--use_freeze_indices requires training batches to include dataset indices")
+
+        device = self.frozen_cache["host_image_features"].device
+        query_indices = batch["index"].detach().long().cpu()
+        if query_indices.numel() == 0:
+            raise ValueError("Cannot gather frozen indices for an empty batch")
+        if int(query_indices.max().item()) >= self.frozen_rank_indices.shape[0]:
+            raise ValueError("Batch query index exceeds the frozen retrieval index size")
+        if int(query_indices.min().item()) < 0:
+            raise ValueError("Batch query index must be non-negative")
+
+        top_m = min(int(getattr(self.args, "top_m", 1)), self.frozen_index_depth)
+        top_indices = self.frozen_rank_indices.index_select(0, query_indices)[:, :top_m].to(device)
+
+        diagnostics = {
+            "pool_interval_id": 0.0,
+            "pool_interval_reused": float(self.frozen_cache_requests > 0),
+            "pool_k_mode": "frozen_indices",
+            "pool_dist_metric": getattr(self.args, "pool_dist_metric", ""),
+            "selected_K": float(self.frozen_index_depth),
+            "pool_selected_k": float(self.frozen_index_depth),
+            "pool_final_pool_size": float(self.frozen_cache["pids"].numel()),
+            "pool_num_required_positives": 0.0,
+            "pool_num_inserted_positives": 0.0,
+            "pool_positive_ratio": 0.0,
+            "pool_cluster_distribution_distance": 0.0,
+            "pool_missing_positive_count": 0.0,
+            "pool_cluster_shortage_count": 0.0,
+            "pool_k_valid": 1.0,
+            "pool_k_dilute": 1.0,
+            "pool_k_dist": 1.0,
+            "num_required_positives": 0.0,
+            "num_inserted_positives": 0.0,
+            "missing_positive_count": 0.0,
+            "positive_ratio": 0.0,
+            "cluster_distribution_distance": 0.0,
+            "final_pool_size": float(self.frozen_cache["pids"].numel()),
+            "cluster_shortage_count": 0.0,
+            "K_valid": 1.0,
+            "K_dilute": 1.0,
+            "K_dist": 1.0,
+            "frozen_indices_used": 1.0,
+            "frozen_index_depth": float(self.frozen_index_depth),
+        }
+
+        self.frozen_cache_requests += 1
+        cache = {key: value for key, value in self.frozen_cache.items()}
+        cache["top_indices"] = top_indices
+        cache["diagnostics"] = diagnostics
+        return cache
 
     def _interval_unit(self, epoch, step):
         return epoch if self.args.recompute_level == "epoch" else step
@@ -691,3 +854,37 @@ class TargetPoolManager:
         for key in chunks[0].keys():
             merged[key] = torch.cat([chunk[key] for chunk in chunks], dim=0)
         return merged
+
+    def _encode_text_records(self, model, records):
+        core_model = _unwrap_model(model)
+        device = next(core_model.parameters()).device
+        was_training = core_model.training
+        core_model.eval()
+
+        tokenizer = getattr(self.train_dataset, "tokenizer", None)
+        if tokenizer is None:
+            from utils.simple_tokenizer import SimpleTokenizer
+            tokenizer = SimpleTokenizer()
+        dataset = _PoolTextDataset(
+            records,
+            tokenizer=tokenizer,
+            text_length=getattr(self.train_dataset, "text_length", self.args.text_length),
+            truncate=getattr(self.train_dataset, "truncate", True),
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=min(max(1, self.args.test_batch_size), max(1, len(records))),
+            shuffle=False,
+            num_workers=self.args.num_workers,
+        )
+
+        chunks = []
+        with torch.no_grad():
+            for _, _, captions in loader:
+                captions = captions.to(device)
+                chunks.append(core_model.encode_text(captions).detach().cpu())
+
+        if was_training:
+            core_model.train()
+
+        return torch.cat(chunks, dim=0)

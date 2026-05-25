@@ -147,6 +147,27 @@ class TargetPrototypeEnricher(nn.Module):
             delta = self.global_fusion(query_features.float(), context.float())
         return F.normalize(query_features.float() + self.gamma * delta, p=2, dim=-1)
 
+    def _top_indices(self, host_text_features, host_image_features, pool_cache):
+        supplied = pool_cache.get("top_indices")
+        if supplied is not None:
+            top_indices = supplied.long()
+            if top_indices.dim() != 2:
+                raise ValueError("pool_cache['top_indices'] must have shape [batch, top_m]")
+            if top_indices.shape[0] != host_text_features.shape[0]:
+                raise ValueError("pool_cache['top_indices'] batch size must match query batch size")
+            top_m = min(self.top_m, host_image_features.shape[0], top_indices.shape[1])
+            if top_m < 1:
+                raise ValueError("pool_cache['top_indices'] must contain at least one column")
+            top_indices = top_indices[:, :top_m].to(host_image_features.device)
+            if int(top_indices.min().item()) < 0 or int(top_indices.max().item()) >= host_image_features.shape[0]:
+                raise ValueError("pool_cache['top_indices'] contains indices outside the target pool")
+            return top_indices
+
+        with torch.no_grad():
+            host_scores = host_text_features @ host_image_features.t()
+            top_m = min(self.top_m, host_image_features.shape[0])
+            return host_scores.topk(k=top_m, dim=1, largest=True, sorted=True).indices
+
     def forward(self, query_features, host_text_features, query_pids, pool_cache, space):
         host_image_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
         retrieval_features = F.normalize(pool_cache["retrieval_features"].float(), p=2, dim=-1)
@@ -154,10 +175,7 @@ class TargetPrototypeEnricher(nn.Module):
         pool_pids = pool_cache["pids"].long()
 
         host_text_features = F.normalize(host_text_features.float(), p=2, dim=-1)
-        with torch.no_grad():
-            host_scores = host_text_features @ host_image_features.t()
-            top_m = min(self.top_m, host_image_features.shape[0])
-            top_indices = host_scores.topk(k=top_m, dim=1, largest=True, sorted=True).indices
+        top_indices = self._top_indices(host_text_features, host_image_features, pool_cache)
 
         gathered = prototypes[top_indices]
         batch_size, top_m, num_proto, _ = gathered.shape
@@ -190,11 +208,7 @@ class TargetPrototypeEnricher(nn.Module):
         host_image_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
         prototypes = pool_cache["prototypes"].float()
         host_text_features = F.normalize(host_text_features.float(), p=2, dim=-1)
-        with torch.no_grad():
-            top_m = min(self.top_m, host_image_features.shape[0])
-            top_indices = (host_text_features @ host_image_features.t()).topk(
-                k=top_m, dim=1, largest=True, sorted=True
-            ).indices
+        top_indices = self._top_indices(host_text_features, host_image_features, pool_cache)
 
         gathered = prototypes[top_indices]
         batch_size, top_m, num_proto, _ = gathered.shape
