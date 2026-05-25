@@ -79,9 +79,11 @@ def make_pool_manager(**overrides):
         pool_dist_threshold=0.01,
         recompute_level="step",
         recompute_interval=2,
+        use_shared_k=True,
     )
     defaults.update(overrides)
     manager.args = SimpleNamespace(**defaults)
+    manager.use_shared_k = defaults["use_shared_k"]
     manager.logger = None
     manager.records = [
         {"pid": 0, "image_id": 10, "img_path": "a.jpg"},
@@ -97,6 +99,9 @@ def make_pool_manager(**overrides):
     manager.interval_cache = None
     manager.active_interval_id = None
     manager.last_refresh_unit = None
+    manager.full_training_cache = None
+    manager.full_training_interval_id = None
+    manager.full_training_cache_requests = 0
     manager.refresh = lambda model, epoch, step: None
     manager._encode_records = lambda model, records, cache_prototypes=True: {
         "host_image_features": torch.zeros(len(records), 512),
@@ -500,6 +505,31 @@ class PoolManagerTests(unittest.TestCase):
         self.assertEqual(cache2["diagnostics"]["pool_interval_reused"], 1.0)
         self.assertEqual(cache2["diagnostics"]["pool_k_mode"], "frozen_indices")
 
+    def test_full_training_set_mode_bypasses_shared_k_sampling(self):
+        manager = make_pool_manager(use_shared_k=False, pool_k=2)
+        manager.refresh = lambda model, epoch, step: self.fail("full training set mode should not refresh clusters")
+        manager._sample_distractor_indices = lambda *_args, **_kwargs: self.fail(
+            "full training set mode should not sample a shared K pool"
+        )
+
+        batch = {
+            "image_ids": torch.tensor([10, 11]),
+            "pids": torch.tensor([0, 1]),
+            "images": torch.randn(2, 3, 8, 8),
+        }
+        cache1 = manager.get_train_cache(FakeImageEncoder(), batch, epoch=1, step=1)
+        cache2 = manager.get_train_cache(FakeImageEncoder(), batch, epoch=1, step=2)
+
+        self.assertEqual(set(cache1["image_ids"].tolist()), {10, 11, 12, 13})
+        self.assertEqual(cache1["pids"].numel(), 4)
+        self.assertNotIn("top_indices", cache1)
+        self.assertEqual(cache1["diagnostics"]["pool_k_mode"], "full_training_set")
+        self.assertEqual(cache1["diagnostics"]["pool_shared_k_used"], 0.0)
+        self.assertEqual(cache1["diagnostics"]["pool_selected_k"], 4.0)
+        self.assertEqual(cache1["diagnostics"]["pool_final_pool_size"], 4.0)
+        self.assertEqual(cache1["diagnostics"]["pool_interval_reused"], 0.0)
+        self.assertEqual(cache2["diagnostics"]["pool_interval_reused"], 1.0)
+
     def test_static_mode_uses_exact_pool_k(self):
         manager = make_pool_manager(pool_k=3, positive_ratio_max=1.0)
         batch = {
@@ -587,6 +617,20 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertTrue(parsed.target_enrichment)
         self.assertTrue(parsed.use_freeze_indices)
 
+    def test_shared_k_cli_requires_target_enrichment(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = ["test", "--use_shared_k"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+            sys.argv = ["test", "--target_enrichment", "--use_shared_k"]
+            parsed = options.get_args()
+        finally:
+            sys.argv = old_argv
+        self.assertTrue(parsed.target_enrichment)
+        self.assertTrue(parsed.use_shared_k)
+
     def test_positive_boolean_cli_parser(self):
         options = importlib.import_module("utils.options")
         self.assertTrue(options.str2bool("true"))
@@ -602,6 +646,7 @@ class SchedulerOptionTests(unittest.TestCase):
             sys.argv = old_argv
         self.assertTrue(parsed.use_host_loss)
         self.assertEqual(parsed.enrichment_start, 1)
+        self.assertFalse(parsed.use_shared_k)
         self.assertFalse(parsed.use_target_retrieval_loss)
         self.assertFalse(parsed.use_target_attention_loss)
         self.assertFalse(parsed.use_target_robust_loss)

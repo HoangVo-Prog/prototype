@@ -15,6 +15,7 @@ from model.enrichment import TargetPoolManager
 from utils.metrics import Evaluator
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
+from utils.wandb_utils import finish_wandb, init_wandb
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -74,6 +75,7 @@ if __name__ == '__main__':
     save_train_configs(args.output_dir, args)
     if not os.path.isdir(args.output_dir+'/img'):
         os.makedirs(args.output_dir+'/img')
+    wandb_run = None
 
         
     train_loader, val_img_loader, val_txt_loader, num_classes = build_dataloader(args)
@@ -117,4 +119,21 @@ if __name__ == '__main__':
     if getattr(args, "target_enrichment", False):
         target_pool = TargetPoolManager(train_loader.dataset, args, logger)
 
-    do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer, target_pool)
+    if get_rank() == 0 and args.training:
+        wandb_run = init_wandb(args, run_name=cur_time, output_dir=args.output_dir, logger=logger)
+
+    try:
+        do_train(
+            start_epoch,
+            args,
+            model,
+            train_loader,
+            evaluator,
+            optimizer,
+            scheduler,
+            checkpointer,
+            target_pool,
+            wandb_run=wandb_run,
+        )
+    finally:
+        finish_wandb(wandb_run)

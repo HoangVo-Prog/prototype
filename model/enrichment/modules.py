@@ -185,13 +185,26 @@ class TargetPrototypeEnricher(nn.Module):
         normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
         context, weights = self._attention(normalized_query, flat_prototypes, space)
         enriched = self._fuse(normalized_query, context, space)
+        attention_weights = weights.reshape(batch_size, top_m, num_proto)
 
         losses = self.compute_losses(
             raw_query=normalized_query,
             enriched_query=enriched,
             retrieval_features=retrieval_features,
             selected_prototypes=selected_prototypes,
-            attention_weights=weights.reshape(batch_size, top_m, num_proto),
+            attention_weights=attention_weights,
+            top_indices=top_indices,
+            query_pids=query_pids.long(),
+            pool_pids=pool_pids,
+        )
+        diagnostics = self.compute_diagnostics(
+            raw_query=normalized_query,
+            enriched_query=enriched,
+            context=context,
+            host_text_features=host_text_features,
+            host_image_features=host_image_features,
+            retrieval_features=retrieval_features,
+            attention_weights=attention_weights,
             top_indices=top_indices,
             query_pids=query_pids.long(),
             pool_pids=pool_pids,
@@ -202,6 +215,7 @@ class TargetPrototypeEnricher(nn.Module):
             "top_indices": top_indices,
             "attention_weights": weights,
             **losses,
+            **diagnostics,
         }
 
     def enrich_only(self, query_features, host_text_features, pool_cache, space):
@@ -293,6 +307,136 @@ class TargetPrototypeEnricher(nn.Module):
             "gain_loss": gain_loss,
             "total_loss": total,
         }
+
+    def compute_diagnostics(
+        self,
+        raw_query,
+        enriched_query,
+        context,
+        host_text_features,
+        host_image_features,
+        retrieval_features,
+        attention_weights,
+        top_indices,
+        query_pids,
+        pool_pids,
+    ):
+        with torch.no_grad():
+            zero = raw_query.new_tensor(0.0)
+            top_m = top_indices.shape[1]
+            num_proto = attention_weights.shape[2]
+            top_pids = pool_pids[top_indices]
+            top_positive = top_pids.eq(query_pids.view(-1, 1))
+            positive_mask = query_pids.view(-1, 1).eq(pool_pids.view(1, -1))
+            negative_mask = ~positive_mask
+
+            positive_in_pool = positive_mask.any(dim=1)
+            positive_in_topm = top_positive.any(dim=1)
+            top_positive_count = top_positive.sum(dim=1).float()
+            pool_positive_count = positive_mask.sum(dim=1).float()
+            host_topm_recall = top_positive_count / pool_positive_count.clamp_min(1.0)
+
+            ranks = torch.arange(1, top_m + 1, device=top_indices.device).view(1, -1)
+            absent_rank = raw_query.new_full((top_indices.shape[0], top_m), float(top_m + 1))
+            first_rank = torch.where(top_positive, ranks.float(), absent_rank).min(dim=1).values
+            if positive_in_topm.any():
+                first_rank_when_present = first_rank[positive_in_topm].mean()
+            else:
+                first_rank_when_present = zero
+
+            image_attention = attention_weights.sum(dim=2)
+            pos_attention = (image_attention * top_positive.float()).sum(dim=1)
+            neg_attention = (image_attention * (~top_positive).float()).sum(dim=1)
+            if positive_in_topm.any():
+                pos_attention_when_present = pos_attention[positive_in_topm].mean()
+            else:
+                pos_attention_when_present = zero
+
+            flat_attention = attention_weights.reshape(attention_weights.shape[0], -1).clamp_min(1e-12)
+            attention_entropy = -(flat_attention * flat_attention.log()).sum(dim=1)
+            attention_entropy_norm = attention_entropy / max(math.log(flat_attention.shape[1]), 1e-12)
+
+            host_scores = host_text_features @ host_image_features.t()
+            selected_scores = host_scores.gather(1, top_indices)
+            host_topm_gap = selected_scores[:, 0] - selected_scores[:, -1]
+
+            raw_enriched_cosine = (raw_query * enriched_query).sum(dim=1)
+            raw_context_cosine = (raw_query * F.normalize(context.float(), p=2, dim=-1)).sum(dim=1)
+            enrichment_shift = (enriched_query - raw_query).norm(dim=1)
+
+            diagnostics = {
+                "target_positive_in_pool_rate": positive_in_pool.float().mean(),
+                "target_positive_in_topm_rate": positive_in_topm.float().mean(),
+                "target_num_positive_in_pool": pool_positive_count.mean(),
+                "target_num_positive_in_topm": top_positive_count.mean(),
+                "target_host_topm_recall": host_topm_recall.mean(),
+                "target_first_positive_rank": first_rank_when_present,
+                "target_first_positive_rank_with_absent": first_rank.mean(),
+                "target_missing_topm_rate": (~positive_in_topm).float().mean(),
+                "target_attention_mass_positive": pos_attention.mean(),
+                "target_attention_mass_positive_when_present": pos_attention_when_present,
+                "target_attention_mass_negative": neg_attention.mean(),
+                "target_attention_pos_minus_neg": (pos_attention - neg_attention).mean(),
+                "target_attention_entropy": attention_entropy.mean(),
+                "target_attention_entropy_norm": attention_entropy_norm.mean(),
+                "target_attention_top1_mass": flat_attention.max(dim=1).values.mean(),
+                "target_attention_mass_image_proto": attention_weights[:, :, 0].sum(dim=1).mean(),
+                "target_attention_mass_part_proto": attention_weights[:, :, 1:].sum(dim=(1, 2)).mean()
+                if num_proto > 1 else zero,
+                "target_host_top1_score": selected_scores[:, 0].mean(),
+                "target_host_topm_score": selected_scores.mean(),
+                "target_host_top1_topm_gap": host_topm_gap.mean(),
+                "target_raw_enriched_cosine": raw_enriched_cosine.mean(),
+                "target_raw_context_cosine": raw_context_cosine.mean(),
+                "target_context_norm": context.norm(dim=1).mean(),
+                "target_enrichment_shift_norm": enrichment_shift.mean(),
+            }
+
+            valid = positive_mask.any(dim=1) & negative_mask.any(dim=1)
+            if valid.any():
+                raw_scores = raw_query @ retrieval_features.t()
+                enriched_scores = enriched_query @ retrieval_features.t()
+                hard_k = min(self.robust_hard_k, retrieval_features.shape[0])
+                hard_indices = raw_scores.masked_fill(positive_mask, torch.finfo(raw_scores.dtype).min).topk(
+                    k=hard_k, dim=1, largest=True, sorted=True
+                ).indices
+                hard_mask = negative_mask.gather(1, hard_indices)
+
+                raw_pos = _masked_logsumexp(raw_scores, positive_mask, dim=1)
+                enr_pos = _masked_logsumexp(enriched_scores, positive_mask, dim=1)
+                raw_hard = _masked_logsumexp(raw_scores.gather(1, hard_indices), hard_mask, dim=1)
+                enr_hard = _masked_logsumexp(enriched_scores.gather(1, hard_indices), hard_mask, dim=1)
+
+                raw_margin = raw_pos - raw_hard
+                enriched_margin = enr_pos - enr_hard
+                margin_gain = enriched_margin - raw_margin
+                reliable_valid = positive_in_topm & valid
+
+                diagnostics.update({
+                    "target_valid_robust_rate": valid.float().mean(),
+                    "target_raw_margin": raw_margin[valid].mean(),
+                    "target_enriched_margin": enriched_margin[valid].mean(),
+                    "target_margin_gain": margin_gain[valid].mean(),
+                    "target_guard_violation_rate": (raw_margin[valid] > enriched_margin[valid]).float().mean(),
+                    "target_reliable_robust_rate": reliable_valid.float().mean(),
+                    "target_margin_gain_reliable": margin_gain[reliable_valid].mean()
+                    if reliable_valid.any() else zero,
+                    "target_gain_satisfied_rate": (margin_gain[reliable_valid] >= self.gain_margin).float().mean()
+                    if reliable_valid.any() else zero,
+                })
+            else:
+                diagnostics.update({
+                    "target_valid_robust_rate": zero,
+                    "target_raw_margin": zero,
+                    "target_enriched_margin": zero,
+                    "target_margin_gain": zero,
+                    "target_guard_violation_rate": zero,
+                    "target_reliable_robust_rate": zero,
+                    "target_margin_gain_reliable": zero,
+                    "target_gain_satisfied_rate": zero,
+                })
+
+            return diagnostics
 
     def _compute_robust_loss(self, raw_query, enriched_query, retrieval_features, positive_mask, reliable, zero):
         negative_mask = ~positive_mask

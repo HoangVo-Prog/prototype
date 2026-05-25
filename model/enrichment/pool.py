@@ -91,21 +91,24 @@ class _PoolTextDataset(Dataset):
 
 class TargetPoolManager:
     def __init__(self, train_dataset, args, logger=None):
-        if args.pool_k < 1:
+        self.use_shared_k = getattr(args, "use_shared_k", False)
+        if self.use_shared_k and args.pool_k < 1:
             raise ValueError("--pool_k must be a positive integer")
         if not (0 < args.positive_ratio_max <= 1):
             raise ValueError("--positive_ratio_max must be in (0, 1]")
         pool_k_mode = getattr(args, "pool_k_mode", "static")
-        if pool_k_mode not in ("static", "adaptive"):
+        if self.use_shared_k and pool_k_mode not in ("static", "adaptive"):
             raise ValueError("--pool_k_mode must be either 'static' or 'adaptive'")
         self.args = args
         self.logger = logger
         self.train_dataset = train_dataset
         self.pool_k_mode = pool_k_mode
-        self.pool_k_candidates = _parse_pool_k_candidates(
-            getattr(args, "pool_k_candidates", "512,1024,2048,4096,8192")
+        self.pool_k_candidates = (
+            _parse_pool_k_candidates(getattr(args, "pool_k_candidates", "512,1024,2048,4096,8192"))
+            if self.use_shared_k
+            else []
         )
-        if not self.pool_k_candidates:
+        if self.use_shared_k and not self.pool_k_candidates:
             raise ValueError("--pool_k_candidates must contain at least one positive integer")
         self.records = self._build_unique_records(train_dataset.dataset)
         self.query_records = self._build_query_records(train_dataset.dataset)
@@ -120,12 +123,20 @@ class TargetPoolManager:
         self.last_refresh_unit = None
         self.active_interval_id = None
         self.interval_cache = None
+        self.full_training_cache = None
+        self.full_training_interval_id = None
+        self.full_training_cache_requests = 0
         self.frozen_cache = None
         self.frozen_rank_indices = None
         self.frozen_index_depth = None
         self.frozen_cache_requests = 0
         self.rng = random.Random(42)
 
+        if not self.use_shared_k and not getattr(args, "use_freeze_indices", False) and logger is not None:
+            logger.info(
+                "Target enrichment will select top-M directly from the full training set; "
+                "pass --use_shared_k to sample a shared K pool first."
+            )
         if getattr(args, "use_freeze_indices", False) and logger is not None:
             if not getattr(args, "freeze_host", False):
                 logger.warning(
@@ -164,6 +175,9 @@ class TargetPoolManager:
             if self.frozen_cache is None or self.frozen_rank_indices is None:
                 self._build_frozen_index_cache(model)
             return self._frozen_batch_cache(batch)
+
+        if not self.use_shared_k:
+            return self._full_training_set_cache(model, epoch, step)
 
         if self._should_refresh(epoch, step):
             self.refresh(model, epoch, step)
@@ -252,6 +266,7 @@ class TargetPoolManager:
             "pool_interval_reused": float(self.frozen_cache_requests > 0),
             "pool_k_mode": "frozen_indices",
             "pool_dist_metric": getattr(self.args, "pool_dist_metric", ""),
+            "pool_shared_k_used": 0.0,
             "selected_K": float(self.frozen_index_depth),
             "pool_selected_k": float(self.frozen_index_depth),
             "pool_final_pool_size": float(self.frozen_cache["pids"].numel()),
@@ -283,6 +298,88 @@ class TargetPoolManager:
         cache["top_indices"] = top_indices
         cache["diagnostics"] = diagnostics
         return cache
+
+    def _full_training_set_cache(self, model, epoch, step):
+        if self._should_refresh_full_training_set_cache(epoch, step):
+            self._build_full_training_set_cache(model, epoch, step)
+
+        diagnostics = dict(self.full_training_cache["diagnostics"])
+        diagnostics["pool_interval_reused"] = float(self.full_training_cache_requests > 0)
+        cache = {
+            key: value
+            for key, value in self.full_training_cache.items()
+            if key != "diagnostics"
+        }
+        cache["diagnostics"] = diagnostics
+        self.full_training_cache_requests += 1
+        return cache
+
+    def _should_refresh_full_training_set_cache(self, epoch, step):
+        if self.full_training_cache is None:
+            return True
+        if self.args.recompute_interval == -1:
+            return False
+        return self._interval_id(epoch, step) != self.full_training_interval_id
+
+    def _build_full_training_set_cache(self, model, epoch, step):
+        if not self.records:
+            raise ValueError("Cannot build a full-training-set target cache from an empty image pool")
+
+        interval_id = self._interval_id(epoch, step)
+        cache = self._encode_records(model, self.records, cache_prototypes=True)
+        device = cache["host_image_features"].device
+        pool_size = len(self.records)
+        cache["image_ids"] = torch.tensor(
+            [record["image_id"] for record in self.records],
+            dtype=torch.long,
+            device=device,
+        )
+        cache["pids"] = torch.tensor(
+            [record["pid"] for record in self.records],
+            dtype=torch.long,
+            device=device,
+        )
+        cache["diagnostics"] = {
+            "pool_interval_id": float(interval_id),
+            "pool_interval_reused": 0.0,
+            "pool_k_mode": "full_training_set",
+            "pool_dist_metric": getattr(self.args, "pool_dist_metric", ""),
+            "selected_K": float(pool_size),
+            "pool_selected_k": float(pool_size),
+            "pool_final_pool_size": float(pool_size),
+            "pool_num_required_positives": 0.0,
+            "pool_num_inserted_positives": 0.0,
+            "pool_positive_ratio": 0.0,
+            "pool_cluster_distribution_distance": 0.0,
+            "pool_missing_positive_count": 0.0,
+            "pool_cluster_shortage_count": 0.0,
+            "pool_k_valid": 1.0,
+            "pool_k_dilute": 1.0,
+            "pool_k_dist": 1.0,
+            "pool_shared_k_used": 0.0,
+            "num_required_positives": 0.0,
+            "num_inserted_positives": 0.0,
+            "missing_positive_count": 0.0,
+            "positive_ratio": 0.0,
+            "cluster_distribution_distance": 0.0,
+            "final_pool_size": float(pool_size),
+            "cluster_shortage_count": 0.0,
+            "K_valid": 1.0,
+            "K_dilute": 1.0,
+            "K_dist": 1.0,
+        }
+
+        self.full_training_cache = cache
+        self.full_training_interval_id = interval_id
+        self.full_training_cache_requests = 0
+        if self.logger is not None:
+            self.logger.info(
+                "Target-pool full training cache built: interval={} images={} top_m={}".format(
+                    interval_id,
+                    pool_size,
+                    getattr(self.args, "top_m", 1),
+                )
+            )
 
     def _interval_unit(self, epoch, step):
         return epoch if self.args.recompute_level == "epoch" else step
@@ -347,6 +444,7 @@ class TargetPoolManager:
         diagnostics["pool_interval_reused"] = 0.0
         diagnostics["pool_k_mode"] = getattr(self.args, "pool_k_mode", "static")
         diagnostics["pool_dist_metric"] = self.args.pool_dist_metric
+        diagnostics["pool_shared_k_used"] = 1.0
         diagnostics["selected_K"] = float(pool_k)
         diagnostics["pool_selected_k"] = float(pool_k)
         diagnostics["num_required_positives"] = diagnostics["pool_num_required_positives"]

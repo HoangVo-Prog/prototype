@@ -5,6 +5,7 @@ import torch
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.comm import get_rank, synchronize
+from utils.wandb_utils import log_wandb
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -23,7 +24,12 @@ def _is_trainable_loss(value):
 
 
 def _should_track_scalar(key):
-    return "loss" in key or key.endswith("grad_norm") or key == "pool_interval_reused"
+    return (
+        "loss" in key
+        or key.endswith("grad_norm")
+        or key.startswith("pool_")
+        or key.startswith("target_")
+    )
 
 
 def _grad_norm(parameters):
@@ -62,7 +68,7 @@ def _loss_grad_norm(loss, parameters):
 
 
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
-             scheduler, checkpointer, target_pool=None):
+             scheduler, checkpointer, target_pool=None, wandb_run=None):
 
     log_period = args.log_period
     eval_period = args.eval_period
@@ -100,10 +106,14 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     tb_writer = SummaryWriter(log_dir=args.output_dir)
 
     best_top1 = 0.0
-    evaluator.eval(
+    initial_top1 = evaluator.eval(
         model.eval(),
         use_target_enrichment=_target_enrichment_active(args, start_epoch),
     )
+    if get_rank() == 0:
+        initial_metrics = dict(getattr(evaluator, "last_metrics", {}))
+        initial_metrics["eval/top_R1"] = initial_top1
+        log_wandb(wandb_run, initial_metrics, step=0, epoch=start_epoch - 1)
     # train
     now_top1 = 0
     current_epoch = 0
@@ -132,7 +142,9 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             else:
                 ret = model(batch, epoch, target_cache=target_cache)
             if target_cache is not None and "diagnostics" in target_cache:
-                ret["pool_interval_reused"] = target_cache["diagnostics"]["pool_interval_reused"]
+                for diag_key, diag_value in target_cache["diagnostics"].items():
+                    if isinstance(diag_value, (int, float)):
+                        ret[diag_key] = diag_value
             total_loss = ret.get("loss")
             if total_loss is None:
                 total_loss = sum([v for k, v in ret.items() if "loss" in k and _is_trainable_loss(v)])
@@ -169,12 +181,30 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                         info_str += f", {k}: {v.avg:.4f}"
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)
+                if get_rank() == 0:
+                    train_metrics = {
+                        "train/{}".format(k): v.avg
+                        for k, v in meters.items()
+                        if v.count > 0
+                    }
+                    train_metrics["train/lr"] = scheduler.get_lr()[0]
+                    train_metrics["train/temperature"] = _scalar_value(ret.get("temperature"))
+                    log_wandb(wandb_run, train_metrics, step=current_steps, epoch=epoch)
 
         tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
         tb_writer.add_scalar('temperature', ret['temperature'], epoch)
         for k, v in meters.items():
             if v.count > 0:
                 tb_writer.add_scalar(k, v.avg, epoch)
+        if get_rank() == 0:
+            epoch_metrics = {
+                "train_epoch/{}".format(k): v.avg
+                for k, v in meters.items()
+                if v.count > 0
+            }
+            epoch_metrics["train_epoch/lr"] = scheduler.get_lr()[0]
+            epoch_metrics["train_epoch/temperature"] = _scalar_value(ret.get("temperature"))
+            log_wandb(wandb_run, epoch_metrics, step=current_steps, epoch=epoch)
 
         scheduler.step()
         if get_rank() == 0:
@@ -199,6 +229,10 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                         use_target_enrichment=_target_enrichment_active(args, epoch),
                     )
                 now_top1 = max(now_top1,top1)
+                eval_metrics = dict(getattr(evaluator, "last_metrics", {}))
+                eval_metrics["eval/top_R1"] = top1
+                eval_metrics["eval/best_R1"] = now_top1
+                log_wandb(wandb_run, eval_metrics, step=current_steps, epoch=epoch)
                 torch.cuda.empty_cache()
                 if best_top1 < top1:
                     best_top1 = top1

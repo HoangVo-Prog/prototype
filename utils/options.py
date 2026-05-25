@@ -95,6 +95,12 @@ def get_args():
     parser.add_argument("--test_batch_size", type=int, default=512)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--test", dest='training', default=True, action='store_false')
+    wandb_group = parser.add_mutually_exclusive_group()
+    wandb_group.add_argument("--use_wandb", dest="use_wandb", action="store_true",
+                             help="enable automatic Weights & Biases logging")
+    wandb_group.add_argument("--no_wandb", dest="use_wandb", action="store_false",
+                             help="disable Weights & Biases logging")
+    parser.set_defaults(use_wandb=True)
 
     ### GRAB
     parser.add_argument("--only_global", action='store_true')
@@ -119,6 +125,9 @@ def get_args():
                         help="number of images in the training pseudo-target pool")
     parser.add_argument("--pool_k_candidates", type=str, default="512,1024,2048,4096,8192",
                         help="comma-separated candidate K values used when --pool_k_mode adaptive")
+    parser.add_argument("--use_shared_k", action="store_true", default=False,
+                        help="sample a shared K-sized target pool before top-M selection; "
+                             "without this flag, top-M is selected from the full training set")
     parser.add_argument("--top_m", type=int, default=32,
                         help="number of host-ranked local images used for enrichment")
     parser.add_argument("--use_freeze_indices", "--freeze_indices",
@@ -178,4 +187,6 @@ def get_args():
         parser.error("--freeze_host requires --target_enrichment")
     if args.use_freeze_indices and not args.target_enrichment:
         parser.error("--use_freeze_indices requires --target_enrichment")
+    if args.use_shared_k and not args.target_enrichment:
+        parser.error("--use_shared_k requires --target_enrichment")
     return args

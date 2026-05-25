@@ -15,6 +15,7 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
+import re
 
 
 
@@ -59,12 +60,32 @@ def get_metrics(similarity, qids, gids, n_, retur_indices=False):
         return [n_, t2i_cmc[0], t2i_cmc[4], t2i_cmc[9], t2i_mAP, t2i_mINP, t2i_cmc[0]+ t2i_cmc[4]+ t2i_cmc[9]]
 
 
+def _metric_task_name(task):
+    task = str(task).replace("+", "_plus_")
+    task = task.replace("(", "_").replace(")", "")
+    task = task.replace(".", "p")
+    return re.sub(r"[^A-Za-z0-9_/-]+", "_", task).strip("_")
+
+
+def _row_to_eval_metrics(row):
+    task = _metric_task_name(row[0])
+    return {
+        f"eval/{task}/R1": float(row[1]),
+        f"eval/{task}/R5": float(row[2]),
+        f"eval/{task}/R10": float(row[3]),
+        f"eval/{task}/mAP": float(row[4]),
+        f"eval/{task}/mINP": float(row[5]),
+        f"eval/{task}/rSum": float(row[6]) if len(row) > 6 else 0.0,
+    }
+
+
 class Evaluator():
     def __init__(self, img_loader, txt_loader, args):
         self.img_loader = img_loader # gallery
         self.txt_loader = txt_loader # query
         self.logger = logging.getLogger("ITSELF.eval")
         self.args = args
+        self.last_metrics = {}
 
     def _compute_embedding(self, model):
         model = model.eval()
@@ -208,17 +229,44 @@ class Evaluator():
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP","rSum"])
 
         top1 = 0
+        eval_metrics = {}
+        rows_by_task = {}
 
         for key in sims_dict.keys():
             sims = sims_dict[key]
             rs = get_metrics(sims, qids, gids, f'{key}-t2i',False)
             table.add_row(rs)
+            rows_by_task[key] = rs
+            eval_metrics.update(_row_to_eval_metrics(rs))
             if i2t_metric:
                 i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=sims.t(), q_pids=gids, g_pids=qids, max_rank=10, get_mAP=True)
                 i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
-                table.add_row(['i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP])
+                i2t_row = [
+                    f'{key}-i2t',
+                    i2t_cmc[0],
+                    i2t_cmc[4],
+                    i2t_cmc[9],
+                    i2t_mAP,
+                    i2t_mINP,
+                    i2t_cmc[0] + i2t_cmc[4] + i2t_cmc[9],
+                ]
+                table.add_row(i2t_row)
+                eval_metrics.update(_row_to_eval_metrics(i2t_row))
 
             top1 = max(top1,rs[1])
+
+        target_key = "target_{}".format(self.args.enrichment_space)
+        if "global" in rows_by_task and target_key in rows_by_task:
+            global_row = rows_by_task["global"]
+            target_row = rows_by_task[target_key]
+            eval_metrics["eval/delta_R1_target_vs_global"] = float(target_row[1] - global_row[1])
+            eval_metrics["eval/delta_R5_target_vs_global"] = float(target_row[2] - global_row[2])
+            eval_metrics["eval/delta_R10_target_vs_global"] = float(target_row[3] - global_row[3])
+            eval_metrics["eval/delta_mAP_target_vs_global"] = float(target_row[4] - global_row[4])
+            eval_metrics["eval/delta_mINP_target_vs_global"] = float(target_row[5] - global_row[5])
+            eval_metrics["eval/delta_rSum_target_vs_global"] = float(target_row[6] - global_row[6])
+
+        self.last_metrics = eval_metrics
 
         table.custom_format["R1"] = lambda f, v: f"{v:.2f}"
         table.custom_format["R5"] = lambda f, v: f"{v:.2f}"

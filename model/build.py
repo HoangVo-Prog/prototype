@@ -330,6 +330,11 @@ class ITSELF(nn.Module):
                     "target_guard_loss": target_ret["guard_loss"].detach(),
                     "target_gain_loss": target_ret["gain_loss"].detach(),
                 })
+            for metric_key, metric_value in target_ret.items():
+                if not metric_key.startswith("target_"):
+                    continue
+                if torch.is_tensor(metric_value) and metric_value.numel() == 1:
+                    target_metrics[metric_key] = metric_value.detach()
             ret.update(target_metrics)
 
         if use_host_loss and 'cid' in self.current_task:
