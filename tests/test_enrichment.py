@@ -259,7 +259,10 @@ class EnrichmentShapeTests(unittest.TestCase):
             pool_cache=cache,
             space="global",
         )
-        self.assertTrue(torch.allclose(out["target_loss"], torch.zeros_like(out["target_loss"])))
+        self.assertTrue(torch.allclose(
+            out["target_retrieval_loss"],
+            torch.zeros_like(out["target_retrieval_loss"]),
+        ))
         self.assertTrue(torch.allclose(out["att_loss"], torch.zeros_like(out["att_loss"])))
         self.assertTrue(torch.allclose(out["robust_loss"], torch.zeros_like(out["robust_loss"])))
         self.assertTrue(torch.allclose(out["guard_loss"], torch.zeros_like(out["guard_loss"])))
@@ -289,12 +292,12 @@ class EnrichmentShapeTests(unittest.TestCase):
             pool_cache=cache,
             space="global",
         )
-        self.assertTrue(torch.isfinite(out["target_loss"]))
+        self.assertTrue(torch.isfinite(out["target_retrieval_loss"]))
         self.assertTrue(torch.allclose(out["att_loss"], torch.zeros_like(out["att_loss"])))
         self.assertTrue(torch.allclose(out["robust_loss"], torch.zeros_like(out["robust_loss"])))
         self.assertTrue(torch.allclose(out["guard_loss"], torch.zeros_like(out["guard_loss"])))
         self.assertTrue(torch.allclose(out["gain_loss"], torch.zeros_like(out["gain_loss"])))
-        self.assertTrue(torch.allclose(out["total_loss"], out["target_loss"], atol=1e-5))
+        self.assertTrue(torch.allclose(out["total_loss"], out["target_retrieval_loss"], atol=1e-5))
 
     def test_target_losses_default_to_disabled_in_enricher(self):
         defaults = args()
@@ -335,7 +338,10 @@ class EnrichmentShapeTests(unittest.TestCase):
         scaled.load_state_dict(base.state_dict())
         base_out = base(**common)
         scaled_out = scaled(**common)
-        self.assertTrue(torch.allclose(scaled_out["target_loss"], base_out["target_loss"]))
+        self.assertTrue(torch.allclose(
+            scaled_out["target_retrieval_loss"],
+            base_out["target_retrieval_loss"],
+        ))
         self.assertTrue(torch.allclose(scaled_out["total_loss"], base_out["total_loss"] * 2, atol=1e-5))
 
     def test_top_m_selection_is_label_free(self):

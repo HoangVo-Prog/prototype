@@ -244,7 +244,7 @@ class TargetPrototypeEnricher(nn.Module):
         pool_pids,
     ):
         zero = enriched_query.sum() * 0.0
-        target_loss = zero
+        target_retrieval_loss = zero
         att_loss = zero
         robust_loss = zero
         guard_loss = zero
@@ -260,7 +260,7 @@ class TargetPrototypeEnricher(nn.Module):
                 retrieval_scores = enriched_query @ retrieval_features.t() / max(self.tau, 1e-6)
                 pos_lse = _masked_logsumexp(retrieval_scores, positive_mask, dim=1)
                 all_lse = torch.logsumexp(retrieval_scores, dim=1)
-                target_loss = -(pos_lse[valid_positive] - all_lse[valid_positive]).mean()
+                target_retrieval_loss = -(pos_lse[valid_positive] - all_lse[valid_positive]).mean()
 
         top_positive = None
         if self.use_target_attention_loss or self.use_target_robust_loss:
@@ -294,13 +294,13 @@ class TargetPrototypeEnricher(nn.Module):
             )
         total = zero
         if self.use_target_retrieval_loss:
-            total = total + self.lambda_ret * target_loss
+            total = total + self.lambda_ret * target_retrieval_loss
         if self.use_target_attention_loss:
             total = total + self.lambda_att * att_loss
         if self.use_target_robust_loss:
             total = total + self.lambda_rob * robust_loss
         return {
-            "target_loss": target_loss,
+            "target_retrieval_loss": target_retrieval_loss,
             "att_loss": att_loss,
             "robust_loss": robust_loss,
             "guard_loss": guard_loss,

@@ -324,11 +324,8 @@ class ITSELF(nn.Module):
                 "target_enrichment_loss": target_ret["total_loss"],
             }
             if self.target_enricher.use_target_retrieval_loss:
-                target_metrics["target_retrieval_loss"] = target_ret["target_loss"].detach()
-                loss_grad_sources.update({
-                    "target_loss": target_ret["target_loss"],
-                    "target_retrieval_loss": target_ret["target_loss"],
-                })
+                target_metrics["target_retrieval_loss"] = target_ret["target_retrieval_loss"].detach()
+                loss_grad_sources["target_retrieval_loss"] = target_ret["target_retrieval_loss"]
             if self.target_enricher.use_target_attention_loss:
                 target_metrics["target_attention_loss"] = target_ret["att_loss"].detach()
                 loss_grad_sources["target_attention_loss"] = target_ret["att_loss"]
