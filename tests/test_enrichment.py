@@ -801,6 +801,37 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertFalse(parsed.use_target_retrieval_loss)
         self.assertFalse(parsed.use_target_attention_loss)
         self.assertFalse(parsed.use_target_robust_loss)
+        self.assertFalse(parsed.pnp_text_only)
+
+    def test_pnp_text_only_cli_requires_frozen_global_no_host_config(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "test",
+                "--pnp_text_only",
+                "--target_enrichment",
+                "--freeze_host",
+                "--only_global",
+                "--use_freeze_indices",
+            ]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+            sys.argv = [
+                "test",
+                "--pnp_text_only",
+                "--target_enrichment",
+                "--freeze_host",
+                "--no_use_host_loss",
+                "--only_global",
+                "--use_freeze_indices",
+            ]
+            parsed = options.get_args()
+        finally:
+            sys.argv = old_argv
+        self.assertTrue(parsed.pnp_text_only)
+        self.assertFalse(parsed.use_host_loss)
+        self.assertEqual(parsed.enrichment_space, "global")
 
     def test_reproducibility_cli_parses_seed_and_determinism(self):
         options = importlib.import_module("utils.options")

@@ -160,6 +160,8 @@ def get_args():
     parser.add_argument("--use_freeze_indices", "--freeze_indices",
                         dest="use_freeze_indices", action="store_true", default=False,
                         help="precompute frozen host top-K rankings once and reuse them for top-M selection")
+    parser.add_argument("--pnp_text_only", action="store_true", default=False,
+                        help="for frozen plug-and-play global training, encode only batch text and use frozen target cache for images")
     parser.add_argument("--robust_hard_k", "--hard_neg_k", dest="robust_hard_k",
                         type=int, default=32,
                         help="number of raw-score hard negatives R used by robust margin loss")
@@ -218,6 +220,19 @@ def get_args():
         parser.error("--use_freeze_indices requires --target_enrichment")
     if args.use_shared_k and not args.target_enrichment:
         parser.error("--use_shared_k requires --target_enrichment")
+    if args.pnp_text_only:
+        if not args.freeze_host:
+            parser.error("--pnp_text_only requires --freeze_host")
+        if args.use_host_loss:
+            parser.error("--pnp_text_only requires --no_use_host_loss")
+        if not args.only_global:
+            parser.error("--pnp_text_only requires --only_global")
+        if args.enrichment_space != "global":
+            parser.error("--pnp_text_only requires --enrichment_space global")
+        if not args.use_freeze_indices:
+            parser.error("--pnp_text_only requires --use_freeze_indices")
+        if args.return_all:
+            parser.error("--pnp_text_only is incompatible with --return_all")
     if args.pool_coverage_epochs < 1:
         parser.error("--pool_coverage_epochs must be a positive integer")
     if args.mixer_dim < 1:

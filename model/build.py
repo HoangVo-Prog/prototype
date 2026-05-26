@@ -236,10 +236,17 @@ class ITSELF(nn.Module):
                 self.classifier_grab = self.classifier_grab.float()
         
         ret.update({'temperature': 1 / self.logit_scale})
-        images = batch['images']
         caption_ids = batch['caption_ids']
-        
-        if self.args.return_all:
+        pnp_text_only = getattr(self.args, "pnp_text_only", False)
+
+        if pnp_text_only:
+            text_feats, _ = self.base_model.encode_text(caption_ids.long())
+            t_feats = text_feats[
+                torch.arange(text_feats.shape[0], device=text_feats.device),
+                caption_ids.argmax(dim=-1),
+            ].float()
+        elif self.args.return_all:
+            images = batch['images']
             image_feats, atten_i, text_feats, atten_t = self.base_model(images, caption_ids, return_all=True, average_attn_weights = self.args.average_attn_weights)
             i_feats = image_feats[:, 0, :].float()
             t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
@@ -289,6 +296,7 @@ class ITSELF(nn.Module):
                         i_grab_f = self.visul_emb_layer(image_feats, atten_i)
                         t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
         else:
+            images = batch['images']
             image_feats, atten_i, text_feats, atten_t = self.base_model(images, caption_ids)
             i_feats = image_feats[:, 0, :].float()
             # i_feats = image_feats.float() # for CLIP ResNet visual model
@@ -296,6 +304,8 @@ class ITSELF(nn.Module):
             if not self.args.only_global:
                 i_grab_f = self.visul_emb_layer(image_feats, atten_i)
                 t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
+
+        zero_source = t_feats if pnp_text_only else i_feats
 
         if getattr(self.args, "target_enrichment", False) and target_cache is not None:
             self.target_enricher = self.target_enricher.float()
@@ -395,7 +405,7 @@ class ITSELF(nn.Module):
             else:
                 ret.update({'tal_loss': TAL_global_loss})
 
-        zero = i_feats.float().sum() * 0.0
+        zero = zero_source.float().sum() * 0.0
         cid_loss = ret.get('cid_loss', zero)
         tal_loss = ret.get('tal_loss', zero)
         host_loss = getattr(self.args, "lambda_host", 1.0) * (cid_loss + tal_loss) if use_host_loss else zero

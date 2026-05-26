@@ -108,6 +108,12 @@ def _set_loader_epoch(loader, epoch):
         batch_sampler_inner.set_epoch(epoch)
 
 
+def _move_train_batch_to_device(batch, device, pnp_text_only=False):
+    if pnp_text_only:
+        return {key: value.to(device) for key, value in batch.items() if key != "images"}
+    return {key: value.to(device) for key, value in batch.items()}
+
+
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
              scheduler, checkpointer, target_pool=None, wandb_run=None):
 
@@ -177,7 +183,11 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         
         for n_iter, batch in enumerate(train_loader):
             current_steps += 1
-            batch = {k: v.to(device) for k, v in batch.items()}
+            batch = _move_train_batch_to_device(
+                batch,
+                device,
+                pnp_text_only=getattr(args, "pnp_text_only", False),
+            )
             target_cache = None
             if use_target_enrichment:
                 target_cache = target_pool.get_train_cache(model, batch, epoch, current_steps)
@@ -192,7 +202,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             total_loss = ret.get("loss")
             if total_loss is None:
                 total_loss = sum([v for k, v in ret.items() if "loss" in k and _is_trainable_loss(v)])
-            batch_size = batch['images'].shape[0]
+            batch_size = batch['caption_ids'].shape[0]
             meters['loss'].update(total_loss.item(), batch_size)
             _update_meter(wandb_meters, "loss", total_loss.item(), batch_size)
             for key, value in ret.items():
