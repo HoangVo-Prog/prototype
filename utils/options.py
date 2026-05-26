@@ -132,6 +132,21 @@ def get_args():
                         help="number of shared-K refreshes expected to cover every training image")
     parser.add_argument("--top_m", type=int, default=32,
                         help="number of host-ranked local images used for enrichment")
+    parser.add_argument("--context_module", type=str, default="mixer",
+                        choices=["mixer"],
+                        help="context construction module for target enrichment")
+    parser.add_argument("--mixer_dim", type=int, default=256,
+                        help="rank-part mixer bottleneck dimension")
+    parser.add_argument("--mixer_depth", type=int, default=2,
+                        help="number of stacked rank-part mixer blocks")
+    parser.add_argument("--mixer_hidden_part", type=int, default=32,
+                        help="hidden dimension for prototype-slot mixing")
+    parser.add_argument("--mixer_hidden_rank", type=int, default=64,
+                        help="hidden dimension for host-rank mixing")
+    parser.add_argument("--mixer_hidden_channel", type=int, default=512,
+                        help="hidden dimension for mixer-channel mixing")
+    parser.add_argument("--mixer_hidden_readout", type=int, default=128,
+                        help="hidden dimension for non-attention token readout")
     parser.add_argument("--use_freeze_indices", "--freeze_indices",
                         dest="use_freeze_indices", action="store_true", default=False,
                         help="precompute frozen host top-K rankings once and reuse them for top-M selection")
@@ -164,7 +179,7 @@ def get_args():
     
     ######################## target-aware loss settings ########################
     parser.add_argument("--lambda_att", type=float, default=0.1,
-                        help="weight for query-aware prototype evidence loss")
+                        help="deprecated: ignored by the mixer context module")
     parser.add_argument("--lambda_ret", type=float, default=1.0,
                         help="weight for the target-pool retrieval loss")
     parser.add_argument("--lambda_rob", type=float, default=0.1,
@@ -172,13 +187,13 @@ def get_args():
     parser.add_argument("--lambda_gain", type=float, default=1.0,
                         help="weight for the margin-gain term inside the robust loss")
     parser.add_argument("--att_margin", type=float, default=0.1,
-                        help="margin for query-aware prototype evidence loss")
+                        help="deprecated: ignored by the mixer context module")
     parser.add_argument("--gain_margin", type=float, default=0.01,
                         help="required enriched-vs-raw retrieval margin gain")
     parser.add_argument("--use_target_retrieval_loss", action="store_true", default=False,
                         help="enable the primary target-pool retrieval loss")
     parser.add_argument("--use_target_attention_loss", action="store_true", default=False,
-                        help="enable the query-aware prototype evidence loss")
+                        help="deprecated: ignored by the mixer context module")
     parser.add_argument("--use_target_robust_loss", action="store_true", default=False,
                         help="enable the robust no-harm and margin-gain loss")
     
@@ -193,4 +208,16 @@ def get_args():
         parser.error("--use_shared_k requires --target_enrichment")
     if args.pool_coverage_epochs < 1:
         parser.error("--pool_coverage_epochs must be a positive integer")
+    if args.mixer_dim < 1:
+        parser.error("--mixer_dim must be a positive integer")
+    if args.mixer_depth < 1:
+        parser.error("--mixer_depth must be a positive integer")
+    if args.mixer_hidden_part < 1:
+        parser.error("--mixer_hidden_part must be a positive integer")
+    if args.mixer_hidden_rank < 1:
+        parser.error("--mixer_hidden_rank must be a positive integer")
+    if args.mixer_hidden_channel < 1:
+        parser.error("--mixer_hidden_channel must be a positive integer")
+    if args.mixer_hidden_readout < 1:
+        parser.error("--mixer_hidden_readout must be a positive integer")
     return args

@@ -115,6 +115,46 @@ def make_pool_manager(**overrides):
 
 
 class EnrichmentShapeTests(unittest.TestCase):
+    def test_rank_part_mixer_adapter_shape_and_diagnostics(self):
+        adapter = modules.RankPartQueryConditionedMixerAdapter(
+            embed_dim=16,
+            num_ranks=3,
+            num_slots=5,
+            mixer_dim=8,
+            depth=2,
+            hidden_part=6,
+            hidden_rank=7,
+            hidden_channel=12,
+            hidden_readout=4,
+        ).float()
+        z_q = torch.randn(2, 16, requires_grad=True)
+        B_q_M = torch.randn(2, 3, 5, 16, requires_grad=True)
+
+        c_q = adapter(z_q, B_q_M)
+
+        self.assertEqual(c_q.shape, (2, 16))
+        for key in (
+            "mixer/context_norm",
+            "mixer/context_delta_cosine",
+            "mixer/output_delta_norm",
+            "mixer/rank_mixing_weight_norm",
+            "mixer/part_mixing_weight_norm",
+            "mixer/channel_mixing_weight_norm",
+            "mixer/readout_weight_norm",
+            "mixer/film_scale_mean",
+            "mixer/film_scale_std",
+            "mixer/film_shift_mean",
+            "mixer/film_shift_std",
+            "mixer/H_mean",
+            "mixer/H_std",
+            "mixer/H_flat_token_std",
+            "mixer/readout_output_norm",
+        ):
+            if key in ("mixer/context_delta_cosine", "mixer/output_delta_norm"):
+                continue
+            self.assertIn(key, adapter.last_diagnostics)
+        c_q.sum().backward()
+
     def test_part_prototypes_follow_document_shape(self):
         token_features = torch.randn(2, 193, 512)
         prototypes = modules.build_part_prototypes(token_features, num_parts=6, grid_size=(24, 8))
@@ -139,6 +179,11 @@ class EnrichmentShapeTests(unittest.TestCase):
         )
         self.assertEqual(out["enriched_features"].shape, (3, 512))
         self.assertEqual(out["top_indices"].shape, (3, 3))
+        self.assertFalse(enricher.use_target_attention_loss)
+        self.assertNotIn("attention_weights", out)
+        self.assertIn("mixer/context_norm", out)
+        self.assertIn("mixer/context_delta_cosine", out)
+        self.assertIn("mixer/output_delta_norm", out)
         self.assertEqual(enricher.robust_hard_k, 5)
         self.assertTrue(torch.isfinite(out["total_loss"]))
         out["total_loss"].backward()
@@ -190,7 +235,7 @@ class EnrichmentShapeTests(unittest.TestCase):
         self.assertFalse(hasattr(enricher, "grab_query_proj"))
         self.assertFalse(hasattr(enricher, "grab_proto_proj"))
         self.assertFalse(hasattr(enricher, "grab_fusion"))
-        self.assertLess(sum(p.numel() for p in enricher.parameters()), 2_000_000)
+        self.assertLess(sum(p.numel() for p in enricher.parameters()), 3_000_000)
 
         cache = {
             "host_image_features": torch.randn(8, 512),
@@ -711,6 +756,8 @@ class SchedulerOptionTests(unittest.TestCase):
             sys.argv = old_argv
         self.assertTrue(parsed.use_host_loss)
         self.assertEqual(parsed.enrichment_start, 1)
+        self.assertEqual(parsed.context_module, "mixer")
+        self.assertEqual(parsed.mixer_dim, 256)
         self.assertFalse(parsed.use_shared_k)
         self.assertEqual(parsed.pool_coverage_epochs, 15)
         self.assertFalse(parsed.use_target_retrieval_loss)

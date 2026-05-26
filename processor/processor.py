@@ -37,6 +37,7 @@ def _should_track_wandb_scalar(key):
         or key.endswith("grad_norm")
         or key.startswith("pool_")
         or key.startswith("target_")
+        or key.startswith("mixer/")
     )
 
 

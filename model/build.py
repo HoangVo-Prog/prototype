@@ -326,9 +326,6 @@ class ITSELF(nn.Module):
             if self.target_enricher.use_target_retrieval_loss:
                 target_metrics["target_retrieval_loss"] = target_ret["target_retrieval_loss"].detach()
                 loss_grad_sources["target_retrieval_loss"] = target_ret["target_retrieval_loss"]
-            if self.target_enricher.use_target_attention_loss:
-                target_metrics["target_attention_loss"] = target_ret["att_loss"].detach()
-                loss_grad_sources["target_attention_loss"] = target_ret["att_loss"]
             if self.target_enricher.use_target_robust_loss:
                 target_metrics.update({
                     "target_robust_loss": target_ret["robust_loss"].detach(),
@@ -341,7 +338,7 @@ class ITSELF(nn.Module):
                     "target_gain_loss": target_ret["gain_loss"],
                 })
             for metric_key, metric_value in target_ret.items():
-                if not metric_key.startswith("target_"):
+                if not (metric_key.startswith("target_") or metric_key.startswith("mixer/")):
                     continue
                 if torch.is_tensor(metric_value) and metric_value.numel() == 1:
                     target_metrics[metric_key] = metric_value.detach()
