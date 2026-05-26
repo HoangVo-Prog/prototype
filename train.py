@@ -1,8 +1,6 @@
 import os
 import os.path as op
 import torch
-import numpy as np
-import random
 import time
 from datasets import build_dataloader
 from processor.processor import do_train
@@ -15,6 +13,7 @@ from model.enrichment import TargetPoolManager
 from utils.metrics import Evaluator
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
+from utils.reproducibility import configure_reproducibility
 from utils.wandb_utils import finish_wandb, init_wandb
 import warnings
 warnings.filterwarnings("ignore")
@@ -44,18 +43,13 @@ def load_finetune_clip_checkpoint(model, checkpoint_file, logger):
     model.base_model.load_param(host_state_dict)
 
 
-def set_seed(seed=1):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
-
 if __name__ == '__main__':
     args = get_args()
-    set_seed(1+get_rank())
+    configure_reproducibility(
+        args.seed,
+        deterministic=args.deterministic,
+        warn_only=args.deterministic_warn_only,
+    )
     name = "ITSELF"
 
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1

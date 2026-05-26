@@ -24,6 +24,16 @@ def get_args():
     parser.add_argument("--local_rank", default=0, type=int)
     parser.add_argument("--output_dir", default="run_logs")
     parser.add_argument("--name", default="ITSELF", help="experiment name to save")
+    parser.add_argument("--seed", default=1, type=int,
+                        help="base seed for model init, samplers, dataloader workers, and target-pool sampling")
+    deterministic_group = parser.add_mutually_exclusive_group()
+    deterministic_group.add_argument("--deterministic", dest="deterministic", action="store_true",
+                                     help="enable deterministic PyTorch/CUDA settings")
+    deterministic_group.add_argument("--non_deterministic", dest="deterministic", action="store_false",
+                                     help="disable strict deterministic PyTorch/CUDA settings")
+    parser.set_defaults(deterministic=True)
+    parser.add_argument("--deterministic_warn_only", action="store_true", default=False,
+                        help="warn instead of raising when PyTorch encounters a nondeterministic operation")
     parser.add_argument("--log_period", default=20)
     parser.add_argument("--eval_period", default=1)
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
@@ -198,6 +208,8 @@ def get_args():
                         help="enable the robust no-harm and margin-gain loss")
     
     args = parser.parse_args()
+    if args.seed < 0 or args.seed >= 2**32:
+        parser.error("--seed must be in [0, 2**32)")
     if args.enrichment_start < 1:
         parser.error("--enrichment_start must be a positive integer")
     if args.freeze_host and not args.target_enrichment:

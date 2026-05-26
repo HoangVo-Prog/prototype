@@ -1,7 +1,6 @@
 from torch.utils.data.sampler import Sampler
 from collections import defaultdict
 import copy
-import random
 import numpy as np
 import math
 import torch.distributed as dist
@@ -118,11 +117,13 @@ class RandomIdentitySampler_DDP(Sampler):
     - batch_size (int): number of examples in a batch.
     """
 
-    def __init__(self, data_source, batch_size, num_instances):
+    def __init__(self, data_source, batch_size, num_instances, seed=0):
         self.data_source = data_source
         self.batch_size = batch_size
         self.world_size = dist.get_world_size()
         self.num_instances = num_instances
+        self.seed = int(seed)
+        self.epoch = 0
         self.mini_batch_size = self.batch_size // self.world_size
         self.num_pids_per_batch = self.mini_batch_size // self.num_instances
         self.index_dic = defaultdict(list)
@@ -144,15 +145,17 @@ class RandomIdentitySampler_DDP(Sampler):
         #self.world_size = dist.get_world_size()
         self.length //= self.world_size
 
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
     def __iter__(self):
-        seed = shared_random_seed()
-        np.random.seed(seed)
-        self._seed = int(seed)
+        self._seed = (self.seed + self.epoch) % 2**32
         final_idxs = self.sample_list()
         length = int(math.ceil(len(final_idxs) * 1.0 / self.world_size))
         #final_idxs = final_idxs[self.rank * length:(self.rank + 1) * length]
         final_idxs = self.__fetch_current_node_idxs(final_idxs, length)
         self.length = len(final_idxs)
+        self.epoch += 1
         return iter(final_idxs)
 
 
@@ -170,18 +173,19 @@ class RandomIdentitySampler_DDP(Sampler):
 
     def sample_list(self):
         #np.random.seed(self._seed)
+        np_rng = np.random.RandomState(self._seed)
         avai_pids = copy.deepcopy(self.pids)
         batch_idxs_dict = {}
 
         batch_indices = []
         while len(avai_pids) >= self.num_pids_per_batch:
-            selected_pids = np.random.choice(avai_pids, self.num_pids_per_batch, replace=False).tolist()
+            selected_pids = np_rng.choice(avai_pids, self.num_pids_per_batch, replace=False).tolist()
             for pid in selected_pids:
                 if pid not in batch_idxs_dict:
                     idxs = copy.deepcopy(self.index_dic[pid])
                     if len(idxs) < self.num_instances:
-                        idxs = np.random.choice(idxs, size=self.num_instances, replace=True).tolist()
-                    np.random.shuffle(idxs)
+                        idxs = np_rng.choice(idxs, size=self.num_instances, replace=True).tolist()
+                    np_rng.shuffle(idxs)
                     batch_idxs_dict[pid] = idxs
 
                 avai_idxs = batch_idxs_dict[pid]

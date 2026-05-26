@@ -5,6 +5,7 @@ from collections import defaultdict
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from utils.reproducibility import seed_worker, seeded_generator
 
 
 def _unwrap_model(model):
@@ -100,6 +101,7 @@ class TargetPoolManager:
         if self.use_shared_k and pool_k_mode not in ("static", "adaptive"):
             raise ValueError("--pool_k_mode must be either 'static' or 'adaptive'")
         self.args = args
+        self.seed = int(getattr(args, "seed", 1))
         self.logger = logger
         self.train_dataset = train_dataset
         self.pool_k_mode = pool_k_mode
@@ -132,7 +134,7 @@ class TargetPoolManager:
         self.frozen_index_depth = None
         self.frozen_cache_requests = 0
         self.pool_coverage_counts = [0 for _ in self.records]
-        self.rng = random.Random(42)
+        self.rng = random.Random(self.seed)
 
         if not self.use_shared_k and not getattr(args, "use_freeze_indices", False) and logger is not None:
             logger.info(
@@ -430,7 +432,7 @@ class TargetPoolManager:
             labels = torch.zeros(num_images, dtype=torch.long)
         else:
             from sklearn.cluster import KMeans
-            kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
+            kmeans = KMeans(n_clusters=num_clusters, random_state=self.seed % 2**32, n_init=10)
             labels = torch.tensor(kmeans.fit_predict(features.numpy()), dtype=torch.long)
 
         cluster_to_indices = defaultdict(list)
@@ -727,7 +729,7 @@ class TargetPoolManager:
             coverage_counts = [0 for _ in self.records]
             self.pool_coverage_counts = coverage_counts
         if not hasattr(self, "rng"):
-            self.rng = random.Random(42)
+            self.rng = random.Random(getattr(self, "seed", int(getattr(self.args, "seed", 1))))
         decorated = [
             (coverage_counts[index], self.rng.random(), index)
             for index in candidates
@@ -1069,6 +1071,8 @@ class TargetPoolManager:
             batch_size=min(max(1, self.args.test_batch_size), max(1, len(records))),
             shuffle=False,
             num_workers=self.args.num_workers,
+            worker_init_fn=seed_worker,
+            generator=seeded_generator(self.seed + 801),
         )
 
         chunks = []
@@ -1106,6 +1110,8 @@ class TargetPoolManager:
             batch_size=min(max(1, self.args.test_batch_size), max(1, len(records))),
             shuffle=False,
             num_workers=self.args.num_workers,
+            worker_init_fn=seed_worker,
+            generator=seeded_generator(self.seed + 901),
         )
 
         chunks = []

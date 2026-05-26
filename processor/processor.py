@@ -98,6 +98,16 @@ def _update_meter(meters, key, value, batch_size):
     meters[key].update(value, batch_size)
 
 
+def _set_loader_epoch(loader, epoch):
+    sampler = getattr(loader, "sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    batch_sampler_inner = getattr(batch_sampler, "sampler", None)
+    if hasattr(batch_sampler_inner, "set_epoch") and batch_sampler_inner is not sampler:
+        batch_sampler_inner.set_epoch(epoch)
+
+
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
              scheduler, checkpointer, target_pool=None, wandb_run=None):
 
@@ -159,6 +169,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
         model.train()
         model.epoch = epoch
+        _set_loader_epoch(train_loader, epoch)
         use_target_enrichment = target_pool is not None and _target_enrichment_active(args, epoch)
         if target_pool is not None and epoch == getattr(args, "enrichment_start", 1):
             logger.info("Target enrichment starts at epoch {}".format(epoch))

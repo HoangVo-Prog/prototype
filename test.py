@@ -9,6 +9,7 @@ from utils.logger import setup_logger
 from model import build_model
 import argparse
 from utils.iotools import load_train_configs
+from utils.reproducibility import configure_reproducibility
 
 def get_args():
     parser = argparse.ArgumentParser(description="TranTextReID Text")
@@ -25,6 +26,11 @@ def get_args():
 
 if __name__ == '__main__':
     args = get_args()
+    configure_reproducibility(
+        getattr(args, "seed", 1),
+        deterministic=getattr(args, "deterministic", True),
+        warn_only=getattr(args, "deterministic_warn_only", False),
+    )
     logger = setup_logger('ITSELF', save_dir=args.output_dir, if_train=args.training)
     logger.info(args)
     device = "cuda"

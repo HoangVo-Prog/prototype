@@ -3,10 +3,12 @@ import importlib.util
 import importlib
 import io
 import pathlib
+import random
 import sys
 import unittest
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 
@@ -81,9 +83,11 @@ def make_pool_manager(**overrides):
         recompute_interval=2,
         pool_coverage_epochs=15,
         use_shared_k=True,
+        seed=1,
     )
     defaults.update(overrides)
     manager.args = SimpleNamespace(**defaults)
+    manager.seed = defaults["seed"]
     manager.use_shared_k = defaults["use_shared_k"]
     manager.logger = None
     manager.records = [
@@ -688,6 +692,37 @@ class PoolManagerTests(unittest.TestCase):
             manager._build_batch_pool_cache(FakeImageEncoder(), batch)
 
 
+class ReproducibilityTests(unittest.TestCase):
+    def test_identity_sampler_is_seeded_per_epoch(self):
+        sampler_module = load_module("identity_sampler", "datasets/sampler.py")
+        data = [
+            (0, 0, "a.jpg", "a"),
+            (0, 0, "b.jpg", "b"),
+            (1, 1, "c.jpg", "c"),
+            (1, 1, "d.jpg", "d"),
+            (2, 2, "e.jpg", "e"),
+            (2, 2, "f.jpg", "f"),
+        ]
+
+        first = sampler_module.RandomIdentitySampler(data, batch_size=4, num_instances=2, seed=99)
+        first.set_epoch(3)
+        order_a = list(iter(first))
+
+        random.seed(12345)
+        np.random.seed(12345)
+        random.random()
+        np.random.rand()
+
+        second = sampler_module.RandomIdentitySampler(data, batch_size=4, num_instances=2, seed=99)
+        second.set_epoch(3)
+        order_b = list(iter(second))
+        self.assertEqual(order_a, order_b)
+
+        third = sampler_module.RandomIdentitySampler(data, batch_size=4, num_instances=2, seed=99)
+        third.set_epoch(4)
+        self.assertNotEqual(order_a, list(iter(third)))
+
+
 class SchedulerOptionTests(unittest.TestCase):
     def test_host_clip_finetune_cli_parses_checkpoint_path(self):
         options = importlib.import_module("utils.options")
@@ -760,9 +795,30 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertEqual(parsed.mixer_dim, 256)
         self.assertFalse(parsed.use_shared_k)
         self.assertEqual(parsed.pool_coverage_epochs, 15)
+        self.assertEqual(parsed.seed, 1)
+        self.assertTrue(parsed.deterministic)
+        self.assertFalse(parsed.deterministic_warn_only)
         self.assertFalse(parsed.use_target_retrieval_loss)
         self.assertFalse(parsed.use_target_attention_loss)
         self.assertFalse(parsed.use_target_robust_loss)
+
+    def test_reproducibility_cli_parses_seed_and_determinism(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "test",
+                "--seed",
+                "123",
+                "--non_deterministic",
+                "--deterministic_warn_only",
+            ]
+            parsed = options.get_args()
+        finally:
+            sys.argv = old_argv
+        self.assertEqual(parsed.seed, 123)
+        self.assertFalse(parsed.deterministic)
+        self.assertTrue(parsed.deterministic_warn_only)
 
     def test_enrichment_start_cli_parses_start_epoch(self):
         options = importlib.import_module("utils.options")
