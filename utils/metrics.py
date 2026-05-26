@@ -79,6 +79,21 @@ def _row_to_eval_metrics(row):
     }
 
 
+def _scale_scores_like(scores, reference, eps=1e-12):
+    score_min = scores.min(dim=1, keepdim=True).values
+    score_max = scores.max(dim=1, keepdim=True).values
+    ref_min = reference.min(dim=1, keepdim=True).values
+    ref_max = reference.max(dim=1, keepdim=True).values
+
+    score_range = (score_max - score_min).clamp_min(eps)
+    ref_range = ref_max - ref_min
+    return (scores - score_min) / score_range * ref_range + ref_min
+
+
+def _target_ablation_lambdas():
+    return [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+
 class Evaluator():
     def __init__(self, img_loader, txt_loader, args):
         self.img_loader = img_loader # gallery
@@ -222,7 +237,22 @@ class Evaluator():
             target_qfeats = F.normalize(target_qfeats, p=2, dim=1)
             target_gfeats = F.normalize(target_cache["retrieval_features"].detach().cpu(), p=2, dim=1)
             target_key = "target_{}".format(self.args.enrichment_space)
-            sims_dict[target_key] = target_qfeats @ target_gfeats.t()
+            sims_target = target_qfeats @ target_gfeats.t()
+            sims_dict[target_key] = sims_target
+            if self.args.only_global:
+                sims_base = sims_global
+                ablation_base_name = "global"
+            else:
+                sims_base = sims_global + sims_grab
+                ablation_base_name = "global+grab_sum"
+            scaled_base = _scale_scores_like(sims_base, sims_target)
+            for lambda_value in _target_ablation_lambdas():
+                sims_dict[
+                    "ablation_{}+target({:.1f})".format(
+                        ablation_base_name,
+                        lambda_value,
+                    )
+                ] = lambda_value * scaled_base + (1.0 - lambda_value) * sims_target
             qids = target_qids
             gids = target_gids
 
