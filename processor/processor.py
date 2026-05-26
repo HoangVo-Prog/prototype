@@ -23,6 +23,10 @@ def _is_trainable_loss(value):
     return torch.is_tensor(value) and value.numel() == 1 and value.requires_grad
 
 
+def _is_loss_key(key):
+    return key == "loss" or key.endswith("_loss")
+
+
 def _should_track_log_scalar(key):
     return "loss" in key or key.endswith("grad_norm")
 
@@ -69,6 +73,22 @@ def _loss_grad_norm(loss, parameters):
         grad_norm = grad.detach().float().norm(2).item()
         total += grad_norm ** 2
     return total ** 0.5
+
+
+def _iter_loss_grad_sources(ret):
+    sources = {}
+    explicit_sources = ret.get("_loss_grad_sources", {})
+    if isinstance(explicit_sources, dict):
+        for key, value in explicit_sources.items():
+            if _is_loss_key(key):
+                sources[key] = value
+
+    for key, value in ret.items():
+        if key == "_loss_grad_sources":
+            continue
+        if _is_loss_key(key) and key not in sources:
+            sources[key] = value
+    return sources.items()
 
 
 def _update_meter(meters, key, value, batch_size):
@@ -175,12 +195,13 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                     _update_meter(wandb_meters, key, scalar, batch_size)
             optimizer.zero_grad()
             trainable_params = [p for p in model.parameters() if p.requires_grad]
-            for loss_key in ["host_loss", "cid_loss", "tal_loss", "target_enrichment_loss"]:
-                if loss_key in ret:
-                    grad_norm_key = f"{loss_key}_grad_norm"
-                    grad_norm_value = _loss_grad_norm(ret[loss_key], trainable_params)
-                    _update_meter(meters, grad_norm_key, grad_norm_value, batch_size)
-                    _update_meter(wandb_meters, grad_norm_key, grad_norm_value, batch_size)
+            loss_grad_sources = dict(_iter_loss_grad_sources(ret))
+            loss_grad_sources["loss"] = total_loss
+            for loss_key, loss_value in loss_grad_sources.items():
+                grad_norm_key = f"{loss_key}_grad_norm"
+                grad_norm_value = _loss_grad_norm(loss_value, trainable_params)
+                _update_meter(meters, grad_norm_key, grad_norm_value, batch_size)
+                _update_meter(wandb_meters, grad_norm_key, grad_norm_value, batch_size)
             total_loss.backward()
             grad_norm_value = _grad_norm(model.parameters())
             meters['grad_norm'].update(grad_norm_value, batch_size)

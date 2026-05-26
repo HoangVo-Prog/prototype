@@ -320,21 +320,35 @@ class ITSELF(nn.Module):
             target_metrics = {
                 "target_enrichment_loss": target_ret["total_loss"],
             }
+            loss_grad_sources = {
+                "target_enrichment_loss": target_ret["total_loss"],
+            }
             if self.target_enricher.use_target_retrieval_loss:
                 target_metrics["target_retrieval_loss"] = target_ret["target_loss"].detach()
+                loss_grad_sources.update({
+                    "target_loss": target_ret["target_loss"],
+                    "target_retrieval_loss": target_ret["target_loss"],
+                })
             if self.target_enricher.use_target_attention_loss:
                 target_metrics["target_attention_loss"] = target_ret["att_loss"].detach()
+                loss_grad_sources["target_attention_loss"] = target_ret["att_loss"]
             if self.target_enricher.use_target_robust_loss:
                 target_metrics.update({
                     "target_robust_loss": target_ret["robust_loss"].detach(),
                     "target_guard_loss": target_ret["guard_loss"].detach(),
                     "target_gain_loss": target_ret["gain_loss"].detach(),
                 })
+                loss_grad_sources.update({
+                    "target_robust_loss": target_ret["robust_loss"],
+                    "target_guard_loss": target_ret["guard_loss"],
+                    "target_gain_loss": target_ret["gain_loss"],
+                })
             for metric_key, metric_value in target_ret.items():
                 if not metric_key.startswith("target_"):
                     continue
                 if torch.is_tensor(metric_value) and metric_value.numel() == 1:
                     target_metrics[metric_key] = metric_value.detach()
+            target_metrics["_loss_grad_sources"] = loss_grad_sources
             ret.update(target_metrics)
 
         if use_host_loss and 'cid' in self.current_task:
