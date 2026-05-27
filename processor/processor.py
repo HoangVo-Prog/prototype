@@ -160,6 +160,8 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     if get_rank() == 0:
         initial_metrics = dict(getattr(evaluator, "last_metrics", {}))
         initial_metrics["eval/top_R1"] = initial_top1
+        if "eval/ablation_best_R1" in initial_metrics:
+            initial_metrics["eval/best_ablation_R1"] = initial_top1
         log_wandb(wandb_run, initial_metrics, step=0, epoch=start_epoch - 1)
     # train
     now_top1 = 0
@@ -289,11 +291,16 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 eval_metrics = dict(getattr(evaluator, "last_metrics", {}))
                 eval_metrics["eval/top_R1"] = top1
                 eval_metrics["eval/best_R1"] = now_top1
+                if "eval/ablation_best_R1" in eval_metrics:
+                    eval_metrics["eval/best_ablation_R1"] = now_top1
                 log_wandb(wandb_run, eval_metrics, step=current_steps, epoch=epoch)
                 torch.cuda.empty_cache()
                 if best_top1 < top1:
                     best_top1 = top1
                     arguments["epoch"] = epoch
+                    if wandb_run is not None:
+                        wandb_run.summary["best_R1"] = float(best_top1)
+                        wandb_run.summary["best_R1_row"] = str(getattr(evaluator, "last_best_task", ""))
                     checkpointer.save("best", **arguments)
                 
  

@@ -94,6 +94,11 @@ def _target_ablation_lambdas():
     return [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 
+def _ablation_lambda_from_key(key):
+    match = re.search(r"\(([-+]?\d*\.?\d+)\)$", str(key))
+    return float(match.group(1)) if match else 0.0
+
+
 class Evaluator():
     def __init__(self, img_loader, txt_loader, args):
         self.img_loader = img_loader # gallery
@@ -101,6 +106,7 @@ class Evaluator():
         self.logger = logging.getLogger("ITSELF.eval")
         self.args = args
         self.last_metrics = {}
+        self.last_best_task = None
 
     def _compute_embedding(self, model):
         model = model.eval()
@@ -261,6 +267,10 @@ class Evaluator():
         top1 = 0
         eval_metrics = {}
         rows_by_task = {}
+        best_task = None
+        best_row = None
+        best_ablation_task = None
+        best_ablation_row = None
 
         for key in sims_dict.keys():
             sims = sims_dict[key]
@@ -283,7 +293,25 @@ class Evaluator():
                 table.add_row(i2t_row)
                 eval_metrics.update(_row_to_eval_metrics(i2t_row))
 
-            top1 = max(top1,rs[1])
+            if best_row is None or rs[1] > best_row[1]:
+                best_task = key
+                best_row = rs
+            if key.startswith("ablation_") and (best_ablation_row is None or rs[1] > best_ablation_row[1]):
+                best_ablation_task = key
+                best_ablation_row = rs
+
+        if best_ablation_row is not None:
+            top1 = float(best_ablation_row[1])
+            best_task = best_ablation_task
+            eval_metrics["eval/ablation_best_R1"] = float(best_ablation_row[1])
+            eval_metrics["eval/ablation_best_R5"] = float(best_ablation_row[2])
+            eval_metrics["eval/ablation_best_R10"] = float(best_ablation_row[3])
+            eval_metrics["eval/ablation_best_mAP"] = float(best_ablation_row[4])
+            eval_metrics["eval/ablation_best_mINP"] = float(best_ablation_row[5])
+            eval_metrics["eval/ablation_best_rSum"] = float(best_ablation_row[6])
+            eval_metrics["eval/ablation_best_lambda"] = _ablation_lambda_from_key(best_ablation_task)
+        elif best_row is not None:
+            top1 = float(best_row[1])
 
         target_key = "target_{}".format(self.args.enrichment_space)
         if "global" in rows_by_task and target_key in rows_by_task:
@@ -297,6 +325,7 @@ class Evaluator():
             eval_metrics["eval/delta_rSum_target_vs_global"] = float(target_row[6] - global_row[6])
 
         self.last_metrics = eval_metrics
+        self.last_best_task = best_task
 
         table.custom_format["R1"] = lambda f, v: f"{v:.2f}"
         table.custom_format["R5"] = lambda f, v: f"{v:.2f}"
@@ -306,5 +335,7 @@ class Evaluator():
         table.custom_format["RSum"] = lambda f, v: f"{v:.2f}"
         self.logger.info('\n' + str(table))
         self.logger.info('\n' + "best R1 = " + str(top1))
+        if best_task is not None:
+            self.logger.info("best R1 row = {}".format(best_task))
 
         return top1
