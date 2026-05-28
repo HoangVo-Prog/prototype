@@ -1,9 +1,3 @@
-# python test.py \
-#   --config_file ITSELF/CUHK-PEDES/run_xxx/configs.yaml \
-#   --checkpoint ITSELF/CUHK-PEDES/run_xxx/best.pth \
-#   --source_domain CUHK-PEDES \
-#   --target_domain RSTPReid
-
 import os
 import os.path as op
 

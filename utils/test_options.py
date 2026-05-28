@@ -51,9 +51,10 @@ def get_test_args():
     )
     parser.add_argument(
         "--target_domain",
+        nargs="+",
         default=None,
         choices=DATASET_CHOICES,
-        help="single target domain alias for --target_domains",
+        help="target domain alias for --target_domains; accepts one or more datasets",
     )
     parser.add_argument(
         "--target_domains",
@@ -151,5 +152,5 @@ def get_test_args():
     if args.target_domain is not None and args.target_domains is not None:
         parser.error("use either --target_domain or --target_domains, not both")
     if args.target_domain is not None:
-        args.target_domains = [args.target_domain]
+        args.target_domains = list(args.target_domain)
     return args
