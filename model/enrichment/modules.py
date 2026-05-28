@@ -6,7 +6,7 @@ try:
         _RankPartMixerBlock,
         _two_layer_mlp,
     )
-    from .prototypes import build_part_prototypes
+    from .prototypes import EXTRACTOR_MODES, build_part_prototypes, prototype_slot_count
 except ImportError:
     import importlib.util
     import pathlib
@@ -41,10 +41,14 @@ except ImportError:
     _FusionMLP = _mixer._FusionMLP
     _RankPartMixerBlock = _mixer._RankPartMixerBlock
     _two_layer_mlp = _mixer._two_layer_mlp
+    EXTRACTOR_MODES = _prototypes.EXTRACTOR_MODES
     build_part_prototypes = _prototypes.build_part_prototypes
+    prototype_slot_count = _prototypes.prototype_slot_count
 
 __all__ = [
+    "EXTRACTOR_MODES",
     "RankPartQueryConditionedMixerAdapter",
     "TargetPrototypeEnricher",
     "build_part_prototypes",
+    "prototype_slot_count",
 ]

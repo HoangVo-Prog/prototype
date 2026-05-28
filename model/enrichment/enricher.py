@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .mixer import RankPartQueryConditionedMixerAdapter, _FusionMLP
+from .prototypes import prototype_slot_count
 
 
 def _masked_logsumexp(values, mask, dim):
@@ -68,7 +69,9 @@ class TargetPrototypeEnricher(nn.Module):
         self.enable_global = self.enrichment_space == "global"
         self.enable_grab = self.enrichment_space == "grab"
 
-        num_slots = getattr(args, "num_parts", 6) + 1
+        self.extractor_mode = getattr(args, "extractor_mode", "global_horizontal")
+        self.num_parts = getattr(args, "num_parts", 6)
+        num_slots = prototype_slot_count(self.extractor_mode, self.num_parts)
         mixer_kwargs = dict(
             num_ranks=self.top_m,
             num_slots=num_slots,

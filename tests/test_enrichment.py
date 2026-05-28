@@ -46,6 +46,8 @@ def args(**overrides):
         use_target_attention_loss=True,
         use_target_robust_loss=True,
         enrichment_space="global",
+        extractor_mode="global_horizontal",
+        num_parts=6,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -168,6 +170,37 @@ class EnrichmentShapeTests(unittest.TestCase):
         norms = prototypes.norm(dim=-1)
         self.assertTrue(torch.allclose(norms, torch.ones_like(norms), atol=1e-5))
 
+    def test_extractor_modes_produce_expected_slot_counts(self):
+        token_features = torch.randn(2, 13, 16)
+        expected_slots = {
+            "global": 1,
+            "horizontal": 2,
+            "vertical": 2,
+            "grid": 4,
+            "global_horizontal": 3,
+            "global_vertical": 3,
+            "global_grid": 5,
+        }
+        for mode, slot_count in expected_slots.items():
+            with self.subTest(mode=mode):
+                prototypes = modules.build_part_prototypes(
+                    token_features,
+                    num_parts=2,
+                    grid_size=(3, 4),
+                    mode=mode,
+                )
+                self.assertEqual(prototypes.shape, (2, slot_count, 16))
+                self.assertEqual(modules.prototype_slot_count(mode, 2), slot_count)
+                norms = prototypes.norm(dim=-1)
+                self.assertTrue(torch.allclose(norms, torch.ones_like(norms), atol=1e-5))
+
+    def test_vertical_and_grid_extractors_require_grid_shape(self):
+        token_features = torch.randn(2, 13, 16)
+        with self.assertRaisesRegex(ValueError, "requires a valid patch grid_size"):
+            modules.build_part_prototypes(token_features, num_parts=2, mode="vertical")
+        with self.assertRaisesRegex(ValueError, "requires a valid patch grid_size"):
+            modules.build_part_prototypes(token_features, num_parts=2, mode="grid")
+
     def test_global_forward_and_losses_are_finite(self):
         enricher = modules.TargetPrototypeEnricher(512, 4096, args()).float()
         cache = {
@@ -194,6 +227,28 @@ class EnrichmentShapeTests(unittest.TestCase):
         self.assertEqual(enricher.robust_hard_k, 5)
         self.assertTrue(torch.isfinite(out["total_loss"]))
         out["total_loss"].backward()
+
+    def test_enricher_uses_extractor_mode_slot_count(self):
+        enricher = modules.TargetPrototypeEnricher(
+            512,
+            4096,
+            args(extractor_mode="global_grid", num_parts=2),
+        ).float()
+        cache = {
+            "host_image_features": torch.randn(8, 512),
+            "retrieval_features": torch.randn(8, 512),
+            "prototypes": torch.randn(8, 5, 512),
+            "pids": torch.tensor([0, 1, 2, 3, 0, 1, 2, 4]),
+        }
+        out = enricher(
+            query_features=torch.randn(3, 512, requires_grad=True),
+            host_text_features=torch.randn(3, 512, requires_grad=True),
+            query_pids=torch.tensor([0, 1, 2]),
+            pool_cache=cache,
+            space="global",
+        )
+        self.assertEqual(out["enriched_features"].shape, (3, 512))
+        self.assertTrue(torch.isfinite(out["total_loss"]))
 
     def test_residual_gate_mode_learns_query_adaptive_scale(self):
         enricher = modules.TargetPrototypeEnricher(
@@ -834,6 +889,7 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertTrue(parsed.use_host_loss)
         self.assertEqual(parsed.enrichment_start, 1)
         self.assertEqual(parsed.context_module, "mixer")
+        self.assertEqual(parsed.extractor_mode, "global_horizontal")
         self.assertEqual(parsed.mixer_dim, 256)
         self.assertFalse(parsed.use_shared_k)
         self.assertEqual(parsed.pool_coverage_epochs, 15)
@@ -866,6 +922,21 @@ class SchedulerOptionTests(unittest.TestCase):
             self.assertEqual(parsed.residual_gate_hidden_dim, 32)
 
             sys.argv = ["test", "--residual_gate", "residual", "--enrich_gamma", "1.2"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+        finally:
+            sys.argv = old_argv
+
+    def test_extractor_mode_cli_parses_mode_and_validates_num_parts(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = ["test", "--extractor_mode", "global_grid", "--num_parts", "3"]
+            parsed = options.get_args()
+            self.assertEqual(parsed.extractor_mode, "global_grid")
+            self.assertEqual(parsed.num_parts, 3)
+
+            sys.argv = ["test", "--num_parts", "0"]
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 options.get_args()
         finally:

@@ -142,6 +142,17 @@ def get_args():
                         help="number of shared-K refreshes expected to cover every training image")
     parser.add_argument("--top_m", type=int, default=32,
                         help="number of host-ranked local images used for enrichment")
+    parser.add_argument("--extractor_mode", type=str, default="global_horizontal",
+                        choices=[
+                            "global",
+                            "horizontal",
+                            "vertical",
+                            "grid",
+                            "global_horizontal",
+                            "global_vertical",
+                            "global_grid",
+                        ],
+                        help="prototype extractor: global, spatial-only, or global plus spatial variants")
     parser.add_argument("--context_module", type=str, default="mixer",
                         choices=["mixer"],
                         help="context construction module for target enrichment")
@@ -166,7 +177,7 @@ def get_args():
                         type=int, default=32,
                         help="number of raw-score hard negatives R used by robust margin loss")
     parser.add_argument("--num_parts", type=int, default=6,
-                        help="number of horizontal part prototypes per image")
+                        help="number of partitions for horizontal/vertical extractors; grid uses num_parts x num_parts")
     parser.add_argument("--pool_clusters", type=int, default=16,
                         help="visual clusters used for distribution-preserving pool sampling")
     parser.add_argument("--positive_ratio_max", "--eta", dest="positive_ratio_max",
@@ -240,6 +251,8 @@ def get_args():
             parser.error("--pnp_text_only is incompatible with --return_all")
     if args.pool_coverage_epochs < 1:
         parser.error("--pool_coverage_epochs must be a positive integer")
+    if args.num_parts < 1:
+        parser.error("--num_parts must be a positive integer")
     if args.residual_gate == "residual" and not (0 < args.enrich_gamma < 1):
         parser.error("--enrich_gamma must be in (0, 1) when --residual_gate residual")
     if args.residual_gate_hidden_dim < 1:

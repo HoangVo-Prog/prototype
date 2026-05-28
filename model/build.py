@@ -157,7 +157,12 @@ class ITSELF(nn.Module):
         grid_size = None
         if hasattr(self.base_model.visual, "num_y") and hasattr(self.base_model.visual, "num_x"):
             grid_size = (self.base_model.visual.num_y, self.base_model.visual.num_x)
-        cache["prototypes"] = build_part_prototypes(image_feats, getattr(self.args, "num_parts", 6), grid_size=grid_size)
+        cache["prototypes"] = build_part_prototypes(
+            image_feats,
+            getattr(self.args, "num_parts", 6),
+            grid_size=grid_size,
+            mode=getattr(self.args, "extractor_mode", "global_horizontal"),
+        )
         if getattr(self.args, "enrichment_space", "global") == "grab":
             cache["retrieval_features"] = self.visul_emb_layer(image_feats, atten_i).float()
         else:
