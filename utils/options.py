@@ -179,7 +179,12 @@ def get_args():
                         type=float, default=0.25,
                         help="warning threshold for target-pool cluster distribution distance")
     parser.add_argument("--enrich_gamma", type=float, default=0.1,
-                        help="residual strength for enriched text features")
+                        help="static residual strength, or initial gate value when --residual_gate residual")
+    parser.add_argument("--residual_gate", "--gate_mode", dest="residual_gate",
+                        type=str, default="static", choices=["static", "residual"],
+                        help="static uses --enrich_gamma; residual learns a per-query residual gate")
+    parser.add_argument("--residual_gate_hidden_dim", type=int, default=128,
+                        help="hidden dimension for the learned residual gate MLP")
     parser.add_argument("--recompute_level", type=str, default="epoch",
                         choices=["epoch", "step"],
                         help="unit used by recompute_interval for target-pool refresh")
@@ -235,6 +240,10 @@ def get_args():
             parser.error("--pnp_text_only is incompatible with --return_all")
     if args.pool_coverage_epochs < 1:
         parser.error("--pool_coverage_epochs must be a positive integer")
+    if args.residual_gate == "residual" and not (0 < args.enrich_gamma < 1):
+        parser.error("--enrich_gamma must be in (0, 1) when --residual_gate residual")
+    if args.residual_gate_hidden_dim < 1:
+        parser.error("--residual_gate_hidden_dim must be a positive integer")
     if args.mixer_dim < 1:
         parser.error("--mixer_dim must be a positive integer")
     if args.mixer_depth < 1:

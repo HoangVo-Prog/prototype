@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +10,26 @@ from .mixer import RankPartQueryConditionedMixerAdapter, _FusionMLP
 def _masked_logsumexp(values, mask, dim):
     neg_inf = torch.finfo(values.dtype).min
     return torch.logsumexp(values.masked_fill(~mask, neg_inf), dim=dim)
+
+
+class _ResidualGateMLP(nn.Module):
+    def __init__(self, dim, hidden_dim, initial_value):
+        super().__init__()
+        if hidden_dim < 1:
+            raise ValueError("--residual_gate_hidden_dim must be a positive integer")
+        initial_value = min(max(float(initial_value), 1e-4), 1.0 - 1e-4)
+        self.net = nn.Sequential(
+            nn.Linear(dim * 3, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.constant_(self.net[-1].bias, math.log(initial_value / (1.0 - initial_value)))
+
+    def forward(self, query, context):
+        gate_input = torch.cat([query, context, query * context], dim=-1)
+        return torch.sigmoid(self.net(gate_input))
 
 
 class TargetPrototypeEnricher(nn.Module):
@@ -22,6 +44,11 @@ class TargetPrototypeEnricher(nn.Module):
         if self.robust_hard_k < 1:
             raise ValueError("--robust_hard_k must be a positive integer")
         self.gamma = args.enrich_gamma
+        self.residual_gate_mode = getattr(args, "residual_gate", "static")
+        if self.residual_gate_mode not in ("static", "residual"):
+            raise ValueError("--residual_gate must be either 'static' or 'residual'")
+        if self.residual_gate_mode == "residual" and not (0 < float(self.gamma) < 1):
+            raise ValueError("--enrich_gamma must be in (0, 1) when --residual_gate is residual")
         self.tau = args.tau
         self.lambda_ret = getattr(args, "lambda_ret", 1.0)
         self.lambda_rob = args.lambda_rob
@@ -55,11 +82,23 @@ class TargetPrototypeEnricher(nn.Module):
         if self.enable_global:
             self.global_context = RankPartQueryConditionedMixerAdapter(embed_dim, **mixer_kwargs)
             self.global_fusion = _FusionMLP(embed_dim)
+            if self.residual_gate_mode == "residual":
+                self.global_residual_gate = _ResidualGateMLP(
+                    embed_dim,
+                    getattr(args, "residual_gate_hidden_dim", 128),
+                    self.gamma,
+                )
 
         if self.enable_grab:
             self.proto_to_grab = nn.Linear(embed_dim, grab_embed_dim)
             self.grab_context = RankPartQueryConditionedMixerAdapter(grab_embed_dim, **mixer_kwargs)
             self.grab_fusion = _FusionMLP(grab_embed_dim)
+            if self.residual_gate_mode == "residual":
+                self.grab_residual_gate = _ResidualGateMLP(
+                    grab_embed_dim,
+                    getattr(args, "residual_gate_hidden_dim", 128),
+                    self.gamma,
+                )
 
     def _require_global(self):
         if not self.enable_global:
@@ -101,14 +140,25 @@ class TargetPrototypeEnricher(nn.Module):
             delta = self.global_fusion(query_features.float(), context.float())
         return delta
 
+    def _residual_gate(self, query_features, context, space):
+        if self.residual_gate_mode == "static":
+            return query_features.new_full((query_features.shape[0], 1), float(self.gamma))
+        if space == "grab":
+            self._require_grab()
+            return self.grab_residual_gate(query_features.float(), context.float())
+        self._require_global()
+        return self.global_residual_gate(query_features.float(), context.float())
+
     def _fuse(self, query_features, context, space):
         delta = self._fusion_delta(query_features, context, space)
-        return F.normalize(query_features.float() + self.gamma * delta, p=2, dim=-1)
+        residual_gate = self._residual_gate(query_features, context, space)
+        return F.normalize(query_features.float() + residual_gate * delta, p=2, dim=-1)
 
     def _fuse_with_delta(self, query_features, context, space):
         delta = self._fusion_delta(query_features, context, space)
-        enriched = F.normalize(query_features.float() + self.gamma * delta, p=2, dim=-1)
-        return enriched, delta
+        residual_gate = self._residual_gate(query_features, context, space)
+        enriched = F.normalize(query_features.float() + residual_gate * delta, p=2, dim=-1)
+        return enriched, delta, residual_gate
 
     def _top_indices(self, host_text_features, host_image_features, pool_cache):
         supplied = pool_cache.get("top_indices")
@@ -145,7 +195,7 @@ class TargetPrototypeEnricher(nn.Module):
 
         normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
         context = self._context(normalized_query, selected_prototypes, space)
-        enriched, delta = self._fuse_with_delta(normalized_query, context, space)
+        enriched, delta, residual_gate = self._fuse_with_delta(normalized_query, context, space)
 
         losses = self.compute_losses(
             raw_query=normalized_query,
@@ -163,6 +213,7 @@ class TargetPrototypeEnricher(nn.Module):
             host_image_features=host_image_features,
             retrieval_features=retrieval_features,
             delta=delta,
+            residual_gate=residual_gate,
             top_indices=top_indices,
             query_pids=query_pids.long(),
             pool_pids=pool_pids,
@@ -253,6 +304,7 @@ class TargetPrototypeEnricher(nn.Module):
         host_image_features,
         retrieval_features,
         delta,
+        residual_gate,
         top_indices,
         query_pids,
         pool_pids,
@@ -288,6 +340,7 @@ class TargetPrototypeEnricher(nn.Module):
             raw_context_cosine = (raw_query * F.normalize(context.float(), p=2, dim=-1)).sum(dim=1)
             enrichment_shift = (enriched_query - raw_query).norm(dim=1)
             context_delta_cosine = F.cosine_similarity(context.float(), delta.float(), dim=-1)
+            residual_gate = residual_gate.detach().float()
 
             diagnostics = {
                 "target_positive_in_pool_rate": positive_in_pool.float().mean(),
@@ -305,6 +358,10 @@ class TargetPrototypeEnricher(nn.Module):
                 "target_raw_context_cosine": raw_context_cosine.mean(),
                 "target_context_norm": context.norm(dim=1).mean(),
                 "target_enrichment_shift_norm": enrichment_shift.mean(),
+                "target_residual_gate_mean": residual_gate.mean(),
+                "target_residual_gate_std": residual_gate.std(unbiased=False),
+                "target_residual_gate_min": residual_gate.min(),
+                "target_residual_gate_max": residual_gate.max(),
                 "mixer/context_delta_cosine": context_delta_cosine.mean(),
                 "mixer/output_delta_norm": delta.norm(dim=1).mean(),
             }

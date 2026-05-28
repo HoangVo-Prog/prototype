@@ -33,6 +33,8 @@ def args(**overrides):
         top_m=3,
         robust_hard_k=5,
         enrich_gamma=0.1,
+        residual_gate="static",
+        residual_gate_hidden_dim=128,
         tau=0.015,
         lambda_att=0.1,
         lambda_ret=1.0,
@@ -188,9 +190,49 @@ class EnrichmentShapeTests(unittest.TestCase):
         self.assertIn("mixer/context_norm", out)
         self.assertIn("mixer/context_delta_cosine", out)
         self.assertIn("mixer/output_delta_norm", out)
+        self.assertIn("target_residual_gate_mean", out)
         self.assertEqual(enricher.robust_hard_k, 5)
         self.assertTrue(torch.isfinite(out["total_loss"]))
         out["total_loss"].backward()
+
+    def test_residual_gate_mode_learns_query_adaptive_scale(self):
+        enricher = modules.TargetPrototypeEnricher(
+            512,
+            4096,
+            args(
+                residual_gate="residual",
+                residual_gate_hidden_dim=32,
+                enrich_gamma=0.2,
+                use_target_retrieval_loss=False,
+                use_target_robust_loss=False,
+            ),
+        ).float()
+        cache = {
+            "host_image_features": torch.randn(8, 512),
+            "retrieval_features": torch.randn(8, 512),
+            "prototypes": torch.randn(8, 7, 512),
+            "pids": torch.tensor([0, 1, 2, 3, 0, 1, 2, 4]),
+        }
+        out = enricher(
+            query_features=torch.randn(3, 512, requires_grad=True),
+            host_text_features=torch.randn(3, 512),
+            query_pids=torch.tensor([0, 1, 2]),
+            pool_cache=cache,
+            space="global",
+        )
+        self.assertTrue(hasattr(enricher, "global_residual_gate"))
+        self.assertTrue(torch.allclose(
+            out["target_residual_gate_mean"],
+            torch.tensor(0.2),
+            atol=1e-5,
+        ))
+        self.assertTrue(torch.allclose(
+            out["target_residual_gate_std"],
+            torch.zeros_like(out["target_residual_gate_std"]),
+            atol=1e-6,
+        ))
+        out["enriched_features"].sum().backward()
+        self.assertIsNotNone(enricher.global_residual_gate.net[-1].bias.grad)
 
     def test_grab_forward_projects_prototypes_to_grab_space(self):
         enricher = modules.TargetPrototypeEnricher(512, 4096, args(enrichment_space="grab")).float()
@@ -795,6 +837,8 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertEqual(parsed.mixer_dim, 256)
         self.assertFalse(parsed.use_shared_k)
         self.assertEqual(parsed.pool_coverage_epochs, 15)
+        self.assertEqual(parsed.residual_gate, "static")
+        self.assertEqual(parsed.residual_gate_hidden_dim, 128)
         self.assertEqual(parsed.seed, 1)
         self.assertTrue(parsed.deterministic)
         self.assertFalse(parsed.deterministic_warn_only)
@@ -802,6 +846,30 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertFalse(parsed.use_target_attention_loss)
         self.assertFalse(parsed.use_target_robust_loss)
         self.assertFalse(parsed.pnp_text_only)
+
+    def test_residual_gate_cli_parses_mode_and_validates_initial_gate(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "test",
+                "--residual_gate",
+                "residual",
+                "--enrich_gamma",
+                "0.2",
+                "--residual_gate_hidden_dim",
+                "32",
+            ]
+            parsed = options.get_args()
+            self.assertEqual(parsed.residual_gate, "residual")
+            self.assertEqual(parsed.enrich_gamma, 0.2)
+            self.assertEqual(parsed.residual_gate_hidden_dim, 32)
+
+            sys.argv = ["test", "--residual_gate", "residual", "--enrich_gamma", "1.2"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+        finally:
+            sys.argv = old_argv
 
     def test_pnp_text_only_cli_requires_frozen_global_no_host_config(self):
         options = importlib.import_module("utils.options")

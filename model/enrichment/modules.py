@@ -1,5 +1,5 @@
 try:
-    from .enricher import TargetPrototypeEnricher, _masked_logsumexp
+    from .enricher import TargetPrototypeEnricher, _ResidualGateMLP, _masked_logsumexp
     from .mixer import (
         RankPartQueryConditionedMixerAdapter,
         _FusionMLP,
@@ -35,6 +35,7 @@ except ImportError:
     _prototypes = _load_sibling("prototypes")
 
     TargetPrototypeEnricher = _enricher.TargetPrototypeEnricher
+    _ResidualGateMLP = _enricher._ResidualGateMLP
     _masked_logsumexp = _enricher._masked_logsumexp
     RankPartQueryConditionedMixerAdapter = _mixer.RankPartQueryConditionedMixerAdapter
     _FusionMLP = _mixer._FusionMLP
