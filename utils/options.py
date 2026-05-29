@@ -247,8 +247,6 @@ def get_args():
             parser.error("--pnp_text_only requires --freeze_host")
         if args.use_host_loss:
             parser.error("--pnp_text_only requires --no_use_host_loss")
-        if args.enrichment_space != "global":
-            parser.error("--pnp_text_only requires --enrichment_space global")
         if not args.use_freeze_indices:
             parser.error("--pnp_text_only requires --use_freeze_indices")
     if args.pool_coverage_epochs < 1:
