@@ -41,7 +41,7 @@ def get_args():
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
     parser.add_argument("--finetune", type=str, default="")
     parser.add_argument("--finetune_clip", type=str, default="",
-                        help="load host CLIP weights from a CLIP or ITSELF checkpoint")
+                        help="load compatible ITSELF weights (including CLIP/GRAB modules) from a CLIP or ITSELF checkpoint")
     parser.add_argument("--freeze_host", action="store_true", default=False,
                         help="freeze host CLIP/ITSELF parameters and train only target enrichment modules")
     parser.add_argument("--pretrain", type=str, default="")

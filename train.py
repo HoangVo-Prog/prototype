@@ -4,7 +4,7 @@ import torch
 import time
 from datasets import build_dataloader
 from processor.processor import do_train
-from utils.checkpoint import Checkpointer, extract_host_model_state_dict, unwrap_checkpoint_state_dict
+from utils.checkpoint import Checkpointer, unwrap_checkpoint_state_dict
 from utils.iotools import save_train_configs
 from utils.logger import setup_logger
 from solver import build_optimizer, build_lr_scheduler
@@ -19,6 +19,31 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
+def _strip_module_prefix(key):
+    return key[7:] if key.startswith("module.") else key
+
+
+def _iter_finetune_candidates(raw_key, base_model_subkeys):
+    key = _strip_module_prefix(raw_key)
+    direct_candidates = [key]
+    if key.startswith("model."):
+        direct_candidates.append(key[len("model."):])
+
+    candidates = []
+    seen = set()
+    for candidate in direct_candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        candidates.append(candidate)
+        if not candidate.startswith("base_model.") and candidate in base_model_subkeys:
+            mapped = "base_model." + candidate
+            if mapped not in seen:
+                seen.add(mapped)
+                candidates.append(mapped)
+    return candidates
+
+
 def load_finetune_clip_checkpoint(model, checkpoint_file, logger):
     try:
         checkpoint = torch.load(checkpoint_file, map_location='cpu')
@@ -29,18 +54,60 @@ def load_finetune_clip_checkpoint(model, checkpoint_file, logger):
             raise torch_load_error
 
     state_dict = unwrap_checkpoint_state_dict(checkpoint)
-    host_state_dict = extract_host_model_state_dict(state_dict)
-    host_keys = set(model.base_model.state_dict().keys())
-    matched_keys = [key for key in host_state_dict.keys() if key in host_keys]
-    if not matched_keys:
-        raise ValueError(f"No host CLIP weights in {checkpoint_file} matched model.base_model")
+    model_state = model.state_dict()
+    base_model_subkeys = {
+        key[len("base_model."):]
+        for key in model_state.keys()
+        if key.startswith("base_model.")
+    }
+    update_state = {}
+    skipped_proto = 0
+    skipped_missing = 0
+    skipped_shape = 0
+    skipped_non_tensor = 0
 
+    for raw_key, value in state_dict.items():
+        normalized_key = _strip_module_prefix(raw_key)
+        if normalized_key.startswith("prototype_branch.") or normalized_key.startswith("model.prototype_branch."):
+            skipped_proto += 1
+            continue
+        if not torch.is_tensor(value):
+            skipped_non_tensor += 1
+            continue
+
+        has_name_match = False
+        loaded = False
+        for candidate_key in _iter_finetune_candidates(raw_key, base_model_subkeys):
+            if candidate_key not in model_state:
+                continue
+            has_name_match = True
+            if model_state[candidate_key].shape != value.shape:
+                continue
+            update_state[candidate_key] = value.detach().clone()
+            loaded = True
+            break
+
+        if loaded:
+            continue
+        if has_name_match:
+            skipped_shape += 1
+        else:
+            skipped_missing += 1
+
+    if not update_state:
+        raise RuntimeError(f"No compatible weights found in --finetune_clip checkpoint: {checkpoint_file}")
+
+    model_state.update(update_state)
+    model.load_state_dict(model_state)
     logger.info(
-        "loading host CLIP checkpoint {} with {}/{} matched parameters".format(
-            checkpoint_file, len(matched_keys), len(host_keys)
-        )
+        "Loaded %d tensors from --finetune_clip checkpoint %s; skipped %d prototype, %d missing, %d shape-mismatch, %d non-tensor entries",
+        len(update_state),
+        checkpoint_file,
+        skipped_proto,
+        skipped_missing,
+        skipped_shape,
+        skipped_non_tensor,
     )
-    model.base_model.load_param(host_state_dict)
 
 
 if __name__ == '__main__':

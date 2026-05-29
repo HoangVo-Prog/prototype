@@ -90,8 +90,23 @@ def _scale_scores_like(scores, reference, eps=1e-12):
     return (scores - score_min) / score_range * ref_range + ref_min
 
 
-def _target_ablation_lambdas():
-    return [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+def _global_grab_lambdas():
+    return [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.68, 0.32]
+
+
+def _prototype_lambdas():
+    return [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+
+def _format_lambda(value):
+    if abs(value - round(value)) < 1e-12:
+        return str(int(round(value)))
+    return "{:.2f}".format(value).rstrip("0").rstrip(".")
+
+
+def _scaled_fuse(primary_scores, secondary_scores, primary_weight):
+    scaled_secondary = _scale_scores_like(secondary_scores, primary_scores)
+    return primary_weight * primary_scores + (1.0 - primary_weight) * scaled_secondary
 
 
 def _ablation_lambda_from_key(key):
@@ -217,48 +232,39 @@ class Evaluator():
             sims_grab = vq_feats@vg_feats.t()
 
         if self.args.only_global:
-            sims_dict = {
-                'global': sims_global
-            }
+            sims_dict = {"global": sims_global}
+            proto_bases = {"global": sims_global}
         else:
             sims_dict = {
-                'global': sims_global, # alpha = 1
-                'grab': sims_grab, # alpha = 0
-                'global+grab(0.1)': 0.1 * sims_global + 0.9 * sims_grab, # alpha = 0.1
-                'global+grab(0.2)': 0.2 * sims_global + 0.8 * sims_grab, # alpha = 0.2
-                'global+grab(0.3)': 0.3 * sims_global + 0.7 * sims_grab, # alpha = 0.3
-                'global+grab(0.4)': 0.4 * sims_global + 0.6 * sims_grab, # alpha = 0.4
-                'global+grab(0.5)': 0.5 * sims_global + 0.5 * sims_grab, # alpha = 0.5
-                'global+grab(0.6)': 0.6 * sims_global + 0.4 * sims_grab, # alpha = 0.6
-                'global+grab(0.7)': 0.7 * sims_global + 0.3 * sims_grab, # alpha = 0.7
-                'global+grab(0.8)': 0.8 * sims_global + 0.2 * sims_grab, # alpha = 0.8
-                'global+grab(0.9)': 0.9 * sims_global + 0.1 * sims_grab, # alpha = 0.9
-                'global+grab(0.68)': 0.68 * sims_global + 0.32 * sims_grab, # alpha = 0.68
-                'global+grab(0.32)': 0.32 * sims_global + 0.68 * sims_grab # alpha = 0.32
+                "global": sims_global,
+                "grab": sims_grab,
             }
+            proto_bases = {
+                "global": sims_global,
+                "grab": sims_grab,
+            }
+            for lambda_value in _global_grab_lambdas():
+                alpha = _format_lambda(lambda_value)
+                fused_name = "global+grab({})".format(alpha)
+                fused_scores = _scaled_fuse(sims_global, sims_grab, lambda_value)
+                sims_dict[fused_name] = fused_scores
+                proto_bases[fused_name] = fused_scores
 
         if use_target_enrichment:
             target_cache, target_gids = self._compute_target_gallery_cache(model)
             target_qfeats, target_qids = self._compute_enriched_text_embedding(model, target_cache)
             target_qfeats = F.normalize(target_qfeats, p=2, dim=1)
             target_gfeats = F.normalize(target_cache["retrieval_features"].detach().cpu(), p=2, dim=1)
-            target_key = "target_{}".format(self.args.enrichment_space)
             sims_target = target_qfeats @ target_gfeats.t()
-            sims_dict[target_key] = sims_target
-            if self.args.only_global:
-                sims_base = sims_global
-                ablation_base_name = "global"
-            else:
-                sims_base = sims_global + sims_grab
-                ablation_base_name = "global+grab_sum"
-            scaled_base = _scale_scores_like(sims_base, sims_target)
-            for lambda_value in _target_ablation_lambdas():
-                sims_dict[
-                    "ablation_{}+target({:.1f})".format(
-                        ablation_base_name,
-                        lambda_value,
+            for proto_lambda in _prototype_lambdas():
+                proto_value = _format_lambda(proto_lambda)
+                for base_name, base_scores in proto_bases.items():
+                    fused_name = "{}+proto({})".format(base_name, proto_value)
+                    scaled_base_scores = _scale_scores_like(base_scores, sims_target)
+                    sims_dict[fused_name] = (
+                        (1.0 - proto_lambda) * scaled_base_scores
+                        + proto_lambda * sims_target
                     )
-                ] = lambda_value * scaled_base + (1.0 - lambda_value) * sims_target
             qids = target_qids
             gids = target_gids
 
@@ -296,7 +302,7 @@ class Evaluator():
             if best_row is None or rs[1] > best_row[1]:
                 best_task = key
                 best_row = rs
-            if key.startswith("ablation_") and (best_ablation_row is None or rs[1] > best_ablation_row[1]):
+            if "+proto(" in key and (best_ablation_row is None or rs[1] > best_ablation_row[1]):
                 best_ablation_task = key
                 best_ablation_row = rs
 
@@ -313,7 +319,7 @@ class Evaluator():
         elif best_row is not None:
             top1 = float(best_row[1])
 
-        target_key = "target_{}".format(self.args.enrichment_space)
+        target_key = "global+proto(1)"
         if "global" in rows_by_task and target_key in rows_by_task:
             global_row = rows_by_task["global"]
             target_row = rows_by_task[target_key]
@@ -332,7 +338,7 @@ class Evaluator():
         table.custom_format["R10"] = lambda f, v: f"{v:.2f}"
         table.custom_format["mAP"] = lambda f, v: f"{v:.2f}"
         table.custom_format["mINP"] = lambda f, v: f"{v:.2f}"
-        table.custom_format["RSum"] = lambda f, v: f"{v:.2f}"
+        table.custom_format["rSum"] = lambda f, v: f"{v:.2f}"
         self.logger.info('\n' + str(table))
         self.logger.info('\n' + "best R1 = " + str(top1))
         if best_task is not None:
