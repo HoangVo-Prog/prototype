@@ -14,7 +14,7 @@ from utils.metrics import Evaluator
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
 from utils.reproducibility import configure_reproducibility
-from utils.wandb_utils import finish_wandb, init_wandb
+from utils.wandb_utils import finish_wandb, init_wandb, upload_best_checkpoint_artifact
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -129,5 +129,7 @@ if __name__ == '__main__':
             target_pool,
             wandb_run=wandb_run,
         )
+        if get_rank() == 0 and args.training:
+            upload_best_checkpoint_artifact(wandb_run, args.output_dir, logger=logger)
     finally:
         finish_wandb(wandb_run)

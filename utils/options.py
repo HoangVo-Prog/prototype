@@ -153,6 +153,44 @@ def get_args():
                             "global_grid",
                         ],
                         help="prototype extractor: global, spatial-only, or global plus spatial variants")
+    parser.add_argument("--num_parts", type=int, default=6,
+                        help="number of partitions for horizontal/vertical extractors; grid uses num_parts x num_parts") 
+    parser.add_argument("--use_freeze_indices", "--freeze_indices",
+                        dest="use_freeze_indices", action="store_true", default=False,
+                        help="precompute frozen host top-K rankings once and reuse them for top-M selection")
+    parser.add_argument("--pnp_text_only", action="store_true", default=False,
+                        help="for frozen plug-and-play global training, encode only batch text and use frozen target cache for images")
+    parser.add_argument("--robust_hard_k", "--hard_neg_k", dest="robust_hard_k",
+                        type=int, default=32,
+                        help="number of raw-score hard negatives R used by robust margin loss")
+    parser.add_argument("--pool_clusters", type=int, default=16,
+                        help="visual clusters used for distribution-preserving pool sampling")
+    parser.add_argument("--positive_ratio_max", "--eta", dest="positive_ratio_max",
+                        type=float, default=0.5,
+                        help="maximum allowed required-positive ratio in a target pool")
+    parser.add_argument("--pool_dist_metric", type=str, default="l1",
+                        choices=["l1", "js"],
+                        help="distance metric for final-pool vs train-set cluster distribution")
+    parser.add_argument("--pool_dist_threshold", "--epsilon", dest="pool_dist_threshold",
+                        type=float, default=0.25,
+                        help="warning threshold for target-pool cluster distribution distance")
+    parser.add_argument("--enrich_gamma", type=float, default=None,
+                        help="static residual strength; valid only with --residual_gate static")
+    parser.add_argument("--residual_gate", "--gate_mode", dest="residual_gate",
+                        type=str, default="residual", choices=["static", "residual"],
+                        help="static uses --enrich_gamma; residual learns a per-query residual gate")
+    parser.add_argument("--residual_gate_hidden_dim", type=int, default=128,
+                        help="hidden dimension for the learned residual gate MLP")
+    parser.add_argument("--recompute_level", type=str, default="epoch",
+                        choices=["epoch", "step"],
+                        help="unit used by recompute_interval for target-pool refresh")
+    parser.add_argument("--recompute_interval", type=int, default=1,
+                        help="-1 computes the target pool once; otherwise refresh every N epochs or steps")
+    parser.add_argument("--pool_interval", dest="recompute_interval", type=int,
+                        default=argparse.SUPPRESS,
+                        help="alias for --recompute_interval")
+    
+    ######################## mlp-mixer module settings ########################
     parser.add_argument("--context_module", type=str, default="mixer",
                         choices=["mixer"],
                         help="context construction module for target enrichment")
@@ -167,43 +205,11 @@ def get_args():
     parser.add_argument("--mixer_hidden_channel", type=int, default=512,
                         help="hidden dimension for mixer-channel mixing")
     parser.add_argument("--mixer_hidden_readout", type=int, default=128,
-                        help="hidden dimension for non-attention token readout")
-    parser.add_argument("--use_freeze_indices", "--freeze_indices",
-                        dest="use_freeze_indices", action="store_true", default=False,
-                        help="precompute frozen host top-K rankings once and reuse them for top-M selection")
-    parser.add_argument("--pnp_text_only", action="store_true", default=False,
-                        help="for frozen plug-and-play global training, encode only batch text and use frozen target cache for images")
-    parser.add_argument("--robust_hard_k", "--hard_neg_k", dest="robust_hard_k",
-                        type=int, default=32,
-                        help="number of raw-score hard negatives R used by robust margin loss")
-    parser.add_argument("--num_parts", type=int, default=6,
-                        help="number of partitions for horizontal/vertical extractors; grid uses num_parts x num_parts")
-    parser.add_argument("--pool_clusters", type=int, default=16,
-                        help="visual clusters used for distribution-preserving pool sampling")
-    parser.add_argument("--positive_ratio_max", "--eta", dest="positive_ratio_max",
-                        type=float, default=0.5,
-                        help="maximum allowed required-positive ratio in a target pool")
-    parser.add_argument("--pool_dist_metric", type=str, default="l1",
-                        choices=["l1", "js"],
-                        help="distance metric for final-pool vs train-set cluster distribution")
-    parser.add_argument("--pool_dist_threshold", "--epsilon", dest="pool_dist_threshold",
-                        type=float, default=0.25,
-                        help="warning threshold for target-pool cluster distribution distance")
-    parser.add_argument("--enrich_gamma", type=float, default=0.1,
-                        help="static residual strength, or initial gate value when --residual_gate residual")
-    parser.add_argument("--residual_gate", "--gate_mode", dest="residual_gate",
-                        type=str, default="static", choices=["static", "residual"],
-                        help="static uses --enrich_gamma; residual learns a per-query residual gate")
-    parser.add_argument("--residual_gate_hidden_dim", type=int, default=128,
-                        help="hidden dimension for the learned residual gate MLP")
-    parser.add_argument("--recompute_level", type=str, default="epoch",
-                        choices=["epoch", "step"],
-                        help="unit used by recompute_interval for target-pool refresh")
-    parser.add_argument("--recompute_interval", type=int, default=1,
-                        help="-1 computes the target pool once; otherwise refresh every N epochs or steps")
-    parser.add_argument("--pool_interval", dest="recompute_interval", type=int,
-                        default=argparse.SUPPRESS,
-                        help="alias for --recompute_interval")
+                        help="hidden dimension for MLP or hybrid token readout")
+    parser.add_argument("--context_pooling", "--mixer_context_pooling",
+                        dest="context_pooling", type=str, default="mlp",
+                        choices=["mlp", "late_attention", "hybrid_attention"],
+                        help="context pooling after rank-part mixing")    
     
     ######################## target-aware loss settings ########################
     parser.add_argument("--lambda_att", type=float, default=0.1,
@@ -253,8 +259,10 @@ def get_args():
         parser.error("--pool_coverage_epochs must be a positive integer")
     if args.num_parts < 1:
         parser.error("--num_parts must be a positive integer")
-    if args.residual_gate == "residual" and not (0 < args.enrich_gamma < 1):
-        parser.error("--enrich_gamma must be in (0, 1) when --residual_gate residual")
+    if args.residual_gate == "static" and args.enrich_gamma is None:
+        parser.error("--residual_gate static requires --enrich_gamma")
+    if args.residual_gate == "residual" and args.enrich_gamma is not None:
+        parser.error("--enrich_gamma is only valid with --residual_gate static")
     if args.residual_gate_hidden_dim < 1:
         parser.error("--residual_gate_hidden_dim must be a positive integer")
     if args.mixer_dim < 1:

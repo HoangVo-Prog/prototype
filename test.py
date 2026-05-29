@@ -176,6 +176,12 @@ def _target_domains(cli_args, source_domain):
     return [source_domain]
 
 
+def _source_check_enabled(cli_args):
+    if cli_args.source_check is None:
+        return True
+    return bool(cli_args.source_check)
+
+
 def _json_safe(value):
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -239,12 +245,14 @@ def main():
     source_domain = cli_args.source_domain or args.dataset_name
     targets = _target_domains(cli_args, source_domain)
     cross_domain = cli_args.cross_domain or any(domain != source_domain for domain in targets)
+    run_source_check = _source_check_enabled(cli_args)
 
     logger.info("Config file: {}".format(config_file))
     logger.info("Checkpoint: {}".format(checkpoint))
     logger.info("Source domain: {}".format(source_domain))
     logger.info("Target domains: {}".format(", ".join(targets)))
     logger.info("Cross-domain evaluation: {}".format(cross_domain))
+    logger.info("Source-domain sanity inference: {}".format(run_source_check))
     logger.info("Evaluation output: {}".format(eval_dir))
 
     device = _resolve_device(cli_args.device)
@@ -257,11 +265,42 @@ def main():
         "source_domain": source_domain,
         "target_domains": targets,
         "cross_domain": cross_domain,
+        "source_check_enabled": run_source_check,
+        "source_check": None,
         "device": str(device),
         "results": {},
     }
 
+    source_check_metrics = None
+    if run_source_check:
+        logger.info(
+            "Running source-domain sanity inference before target evaluation: {}".format(
+                source_domain
+            )
+        )
+        source_check_metrics = _evaluate_domain(
+            model,
+            args,
+            source_domain,
+            cli_args,
+            logger,
+        )
+        results["source_check"] = {
+            "domain": source_domain,
+            "metrics": source_check_metrics,
+        }
+    else:
+        logger.info("Skipping source-domain sanity inference")
+
     for target_domain in targets:
+        if run_source_check and target_domain == source_domain:
+            logger.info(
+                "Reusing source-domain sanity inference for target domain: {}".format(
+                    target_domain
+                )
+            )
+            results["results"][target_domain] = source_check_metrics
+            continue
         results["results"][target_domain] = _evaluate_domain(
             model,
             args,

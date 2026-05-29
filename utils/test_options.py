@@ -68,6 +68,12 @@ def get_test_args():
         action="store_true",
         help="mark the run as cross-domain evaluation in logs/results",
     )
+    _add_boolean_override(
+        parser,
+        "source_check",
+        "run source-domain sanity inference before target evaluation",
+        "skip source-domain sanity inference before target evaluation",
+    )
 
     parser.add_argument("--root_dir", default=None, help="dataset root override")
     parser.add_argument("--test_batch_size", type=int, default=None)

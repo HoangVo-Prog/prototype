@@ -8,13 +8,16 @@ from .mixer import RankPartQueryConditionedMixerAdapter, _FusionMLP
 from .prototypes import prototype_slot_count
 
 
+DEFAULT_RESIDUAL_GATE_INIT = 0.1
+
+
 def _masked_logsumexp(values, mask, dim):
     neg_inf = torch.finfo(values.dtype).min
     return torch.logsumexp(values.masked_fill(~mask, neg_inf), dim=dim)
 
 
 class _ResidualGateMLP(nn.Module):
-    def __init__(self, dim, hidden_dim, initial_value):
+    def __init__(self, dim, hidden_dim, initial_value=DEFAULT_RESIDUAL_GATE_INIT):
         super().__init__()
         if hidden_dim < 1:
             raise ValueError("--residual_gate_hidden_dim must be a positive integer")
@@ -44,12 +47,14 @@ class TargetPrototypeEnricher(nn.Module):
         self.robust_hard_k = getattr(args, "robust_hard_k", self.top_m)
         if self.robust_hard_k < 1:
             raise ValueError("--robust_hard_k must be a positive integer")
-        self.gamma = args.enrich_gamma
-        self.residual_gate_mode = getattr(args, "residual_gate", "static")
+        self.gamma = getattr(args, "enrich_gamma", None)
+        self.residual_gate_mode = getattr(args, "residual_gate", "residual")
         if self.residual_gate_mode not in ("static", "residual"):
             raise ValueError("--residual_gate must be either 'static' or 'residual'")
-        if self.residual_gate_mode == "residual" and not (0 < float(self.gamma) < 1):
-            raise ValueError("--enrich_gamma must be in (0, 1) when --residual_gate is residual")
+        if self.residual_gate_mode == "static" and self.gamma is None:
+            raise ValueError("--residual_gate static requires --enrich_gamma")
+        if self.residual_gate_mode == "residual" and self.gamma is not None:
+            raise ValueError("--enrich_gamma is only valid when --residual_gate is static")
         self.tau = args.tau
         self.lambda_ret = getattr(args, "lambda_ret", 1.0)
         self.lambda_rob = args.lambda_rob
@@ -81,6 +86,7 @@ class TargetPrototypeEnricher(nn.Module):
             hidden_rank=getattr(args, "mixer_hidden_rank", 64),
             hidden_channel=getattr(args, "mixer_hidden_channel", 512),
             hidden_readout=getattr(args, "mixer_hidden_readout", 128),
+            context_pooling=getattr(args, "context_pooling", "mlp"),
         )
         if self.enable_global:
             self.global_context = RankPartQueryConditionedMixerAdapter(embed_dim, **mixer_kwargs)
@@ -89,7 +95,6 @@ class TargetPrototypeEnricher(nn.Module):
                 self.global_residual_gate = _ResidualGateMLP(
                     embed_dim,
                     getattr(args, "residual_gate_hidden_dim", 128),
-                    self.gamma,
                 )
 
         if self.enable_grab:
@@ -100,7 +105,6 @@ class TargetPrototypeEnricher(nn.Module):
                 self.grab_residual_gate = _ResidualGateMLP(
                     grab_embed_dim,
                     getattr(args, "residual_gate_hidden_dim", 128),
-                    self.gamma,
                 )
 
     def _require_global(self):

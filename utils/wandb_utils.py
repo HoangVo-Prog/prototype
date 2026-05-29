@@ -1,5 +1,6 @@
 import math
 import os
+import re
 from pathlib import Path
 
 import torch
@@ -204,6 +205,49 @@ def log_wandb(run, metrics, step=None, epoch=None, prefix=None):
         payload["epoch"] = int(epoch)
     if payload:
         run.log(payload)
+
+
+def _wandb_artifact_name(value, default="best-checkpoint"):
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "")).strip("-._")
+    return name or default
+
+
+def upload_best_checkpoint_artifact(run, output_dir, logger=None, checkpoint_name="best.pth"):
+    if run is None:
+        return None
+
+    checkpoint_path = Path(output_dir) / checkpoint_name
+    if not checkpoint_path.is_file():
+        if logger is not None:
+            logger.warning("W&B checkpoint upload skipped: {} not found.".format(checkpoint_path))
+        return None
+
+    try:
+        import wandb
+
+        run_name = getattr(run, "name", None) or checkpoint_path.parent.name
+        artifact_name = _wandb_artifact_name("{}-best".format(run_name))
+        artifact = wandb.Artifact(
+            artifact_name,
+            type="model",
+            metadata={
+                "checkpoint": checkpoint_name,
+                "output_dir": str(output_dir),
+                "size_bytes": checkpoint_path.stat().st_size,
+            },
+        )
+        artifact.add_file(str(checkpoint_path), name=checkpoint_name)
+        run.log_artifact(artifact, aliases=["best", "latest"])
+        if hasattr(run, "summary"):
+            run.summary["best_checkpoint_artifact"] = artifact_name
+            run.summary["best_checkpoint_path"] = str(checkpoint_path)
+        if logger is not None:
+            logger.info("Uploaded W&B checkpoint artifact: {}".format(artifact_name))
+        return artifact
+    except Exception as error:
+        if logger is not None:
+            logger.warning("W&B checkpoint upload failed: {}".format(error))
+        return None
 
 
 def finish_wandb(run):
