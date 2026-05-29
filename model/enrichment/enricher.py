@@ -74,7 +74,7 @@ class TargetPrototypeEnricher(nn.Module):
         self.enable_global = self.enrichment_space == "global"
         self.enable_grab = self.enrichment_space == "grab"
 
-        self.extractor_mode = getattr(args, "extractor_mode", "global_horizontal")
+        self.extractor_mode = getattr(args, "extractor_mode", "global,horizontal")
         self.num_parts = getattr(args, "num_parts", 6)
         num_slots = prototype_slot_count(self.extractor_mode, self.num_parts)
         mixer_kwargs = dict(

@@ -212,7 +212,29 @@ def _wandb_artifact_name(value, default="best-checkpoint"):
     return name or default
 
 
-def upload_best_checkpoint_artifact(run, output_dir, logger=None, checkpoint_name="best.pth"):
+def _resolve_config_upload_path(output_dir, config_name):
+    if not config_name:
+        return None, None
+
+    config_path = Path(output_dir) / config_name
+    if config_path.is_file():
+        return config_path, config_name
+
+    # Backward compatibility: earlier runs may only contain configs.yaml.
+    if config_name == "config.yaml":
+        legacy_config = Path(output_dir) / "configs.yaml"
+        if legacy_config.is_file():
+            return legacy_config, config_name
+    return None, None
+
+
+def upload_best_checkpoint_artifact(
+    run,
+    output_dir,
+    logger=None,
+    checkpoint_name="best.pth",
+    config_name="config.yaml",
+):
     if run is None:
         return None
 
@@ -227,16 +249,27 @@ def upload_best_checkpoint_artifact(run, output_dir, logger=None, checkpoint_nam
 
         run_name = getattr(run, "name", None) or checkpoint_path.parent.name
         artifact_name = _wandb_artifact_name("{}-best".format(run_name))
+        config_path, artifact_config_name = _resolve_config_upload_path(output_dir, config_name)
+        metadata = {
+            "checkpoint": checkpoint_name,
+            "output_dir": str(output_dir),
+            "size_bytes": checkpoint_path.stat().st_size,
+        }
+        if config_path is not None:
+            metadata["config"] = artifact_config_name
+            metadata["config_size_bytes"] = config_path.stat().st_size
         artifact = wandb.Artifact(
             artifact_name,
             type="model",
-            metadata={
-                "checkpoint": checkpoint_name,
-                "output_dir": str(output_dir),
-                "size_bytes": checkpoint_path.stat().st_size,
-            },
+            metadata=metadata,
         )
         artifact.add_file(str(checkpoint_path), name=checkpoint_name)
+        if config_path is not None:
+            artifact.add_file(str(config_path), name=artifact_config_name)
+            if hasattr(run, "summary"):
+                run.summary["best_checkpoint_config_path"] = str(config_path)
+        elif logger is not None:
+            logger.warning("W&B config upload skipped: {} not found in {}.".format(config_name, output_dir))
         run.log_artifact(artifact, aliases=["best", "latest"])
         if hasattr(run, "summary"):
             run.summary["best_checkpoint_artifact"] = artifact_name

@@ -1,6 +1,14 @@
 import argparse
 
 
+_EXTRACTOR_BASE_MODES = ("global", "horizontal", "vertical", "grid")
+_LEGACY_EXTRACTOR_MODE_ALIASES = {
+    "global_horizontal": "global,horizontal",
+    "global_vertical": "global,vertical",
+    "global_grid": "global,grid",
+}
+
+
 def str2bool(value):
     if isinstance(value, bool):
         return value
@@ -10,6 +18,35 @@ def str2bool(value):
     if value in ("no", "false", "f", "0", "n"):
         return False
     raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
+def parse_extractor_mode(value):
+    if not isinstance(value, str):
+        raise argparse.ArgumentTypeError("--extractor_mode must be a comma-separated string")
+
+    raw_tokens = [token.strip().lower() for token in value.split(",") if token.strip()]
+    if not raw_tokens:
+        raise argparse.ArgumentTypeError("--extractor_mode must contain at least one mode")
+
+    expanded_tokens = []
+    for token in raw_tokens:
+        alias = _LEGACY_EXTRACTOR_MODE_ALIASES.get(token)
+        if alias is not None:
+            expanded_tokens.extend(alias.split(","))
+        else:
+            expanded_tokens.append(token)
+
+    normalized_tokens = []
+    seen = set()
+    for token in expanded_tokens:
+        if token not in _EXTRACTOR_BASE_MODES:
+            raise argparse.ArgumentTypeError(
+                f"--extractor_mode supports comma-separated values from {_EXTRACTOR_BASE_MODES}; got '{value}'"
+            )
+        if token not in seen:
+            seen.add(token)
+            normalized_tokens.append(token)
+    return ",".join(normalized_tokens)
 
 
 def get_args():
@@ -142,17 +179,8 @@ def get_args():
                         help="number of shared-K refreshes expected to cover every training image")
     parser.add_argument("--top_m", type=int, default=32,
                         help="number of host-ranked local images used for enrichment")
-    parser.add_argument("--extractor_mode", type=str, default="global_horizontal",
-                        choices=[
-                            "global",
-                            "horizontal",
-                            "vertical",
-                            "grid",
-                            "global_horizontal",
-                            "global_vertical",
-                            "global_grid",
-                        ],
-                        help="prototype extractor: global, spatial-only, or global plus spatial variants")
+    parser.add_argument("--extractor_mode", type=parse_extractor_mode, default="global,horizontal",
+                        help="comma-separated prototype extractors (supported: global,horizontal,vertical,grid)")
     parser.add_argument("--num_parts", type=int, default=6,
                         help="number of partitions for horizontal/vertical extractors; grid uses num_parts x num_parts") 
     parser.add_argument("--use_freeze_indices", "--freeze_indices",
@@ -249,6 +277,8 @@ def get_args():
             parser.error("--pnp_text_only requires --no_use_host_loss")
         if not args.use_freeze_indices:
             parser.error("--pnp_text_only requires --use_freeze_indices")
+        if args.enrichment_space != "global":
+            parser.error("--pnp_text_only requires --enrichment_space global")
     if args.pool_coverage_epochs < 1:
         parser.error("--pool_coverage_epochs must be a positive integer")
     if args.num_parts < 1:

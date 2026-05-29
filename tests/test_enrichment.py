@@ -47,7 +47,7 @@ def args(**overrides):
         use_target_attention_loss=True,
         use_target_robust_loss=True,
         enrichment_space="global",
-        extractor_mode="global_horizontal",
+        extractor_mode="global,horizontal",
         num_parts=6,
     )
     defaults.update(overrides)
@@ -231,9 +231,11 @@ class EnrichmentShapeTests(unittest.TestCase):
             "horizontal": 2,
             "vertical": 2,
             "grid": 4,
-            "global_horizontal": 3,
-            "global_vertical": 3,
-            "global_grid": 5,
+            "global,horizontal": 3,
+            "global,vertical": 3,
+            "global,grid": 5,
+            "horizontal,vertical": 4,
+            "global,grid,vertical,horizontal": 9,
         }
         for mode, slot_count in expected_slots.items():
             with self.subTest(mode=mode):
@@ -286,12 +288,12 @@ class EnrichmentShapeTests(unittest.TestCase):
         enricher = modules.TargetPrototypeEnricher(
             512,
             4096,
-            args(extractor_mode="global_grid", num_parts=2),
+            args(extractor_mode="global,grid,horizontal", num_parts=2),
         ).float()
         cache = {
             "host_image_features": torch.randn(8, 512),
             "retrieval_features": torch.randn(8, 512),
-            "prototypes": torch.randn(8, 5, 512),
+            "prototypes": torch.randn(8, 7, 512),
             "pids": torch.tensor([0, 1, 2, 3, 0, 1, 2, 4]),
         }
         out = enricher(
@@ -964,7 +966,7 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertTrue(parsed.use_host_loss)
         self.assertEqual(parsed.enrichment_start, 1)
         self.assertEqual(parsed.context_module, "mixer")
-        self.assertEqual(parsed.extractor_mode, "global_horizontal")
+        self.assertEqual(parsed.extractor_mode, "global,horizontal")
         self.assertEqual(parsed.context_pooling, "mlp")
         self.assertEqual(parsed.mixer_dim, 256)
         self.assertFalse(parsed.use_shared_k)
@@ -1030,10 +1032,18 @@ class SchedulerOptionTests(unittest.TestCase):
         options = importlib.import_module("utils.options")
         old_argv = sys.argv
         try:
-            sys.argv = ["test", "--extractor_mode", "global_grid", "--num_parts", "3"]
+            sys.argv = ["test", "--extractor_mode", "global,grid,vertical,horizontal", "--num_parts", "3"]
             parsed = options.get_args()
-            self.assertEqual(parsed.extractor_mode, "global_grid")
+            self.assertEqual(parsed.extractor_mode, "global,grid,vertical,horizontal")
             self.assertEqual(parsed.num_parts, 3)
+
+            sys.argv = ["test", "--extractor_mode", "global_grid"]
+            parsed = options.get_args()
+            self.assertEqual(parsed.extractor_mode, "global,grid")
+
+            sys.argv = ["test", "--extractor_mode", "global,diagonal"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
 
             sys.argv = ["test", "--num_parts", "0"]
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

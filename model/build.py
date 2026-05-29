@@ -161,7 +161,7 @@ class ITSELF(nn.Module):
             image_feats,
             getattr(self.args, "num_parts", 6),
             grid_size=grid_size,
-            mode=getattr(self.args, "extractor_mode", "global_horizontal"),
+            mode=getattr(self.args, "extractor_mode", "global,horizontal"),
         )
         if getattr(self.args, "enrichment_space", "global") == "grab":
             cache["retrieval_features"] = self.visul_emb_layer(image_feats, atten_i).float()

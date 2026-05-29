@@ -7,24 +7,65 @@ EXTRACTOR_MODES = (
     "horizontal",
     "vertical",
     "grid",
-    "global_horizontal",
-    "global_vertical",
-    "global_grid",
 )
+
+_LEGACY_EXTRACTOR_MODE_ALIASES = {
+    "global_horizontal": "global,horizontal",
+    "global_vertical": "global,vertical",
+    "global_grid": "global,grid",
+}
+
+
+def _normalize_extractor_modes(mode):
+    if isinstance(mode, str):
+        raw_tokens = [token.strip().lower() for token in mode.split(",") if token.strip()]
+    elif isinstance(mode, (list, tuple)):
+        raw_tokens = [str(token).strip().lower() for token in mode if str(token).strip()]
+    else:
+        raise ValueError("--extractor_mode must be a comma-separated string or sequence of mode names")
+
+    expanded_tokens = []
+    for token in raw_tokens:
+        alias = _LEGACY_EXTRACTOR_MODE_ALIASES.get(token)
+        if alias is not None:
+            expanded_tokens.extend(alias.split(","))
+        else:
+            expanded_tokens.append(token)
+
+    modes = []
+    seen = set()
+    for token in expanded_tokens:
+        if token not in EXTRACTOR_MODES:
+            raise ValueError(
+                f"--extractor_mode supports comma-separated values from {EXTRACTOR_MODES}, got {mode}"
+            )
+        if token not in seen:
+            seen.add(token)
+            modes.append(token)
+
+    if not modes:
+        raise ValueError("--extractor_mode must contain at least one mode")
+    return tuple(modes)
+
+
+def canonicalize_extractor_mode(mode):
+    return ",".join(_normalize_extractor_modes(mode))
 
 
 def prototype_slot_count(mode, num_parts):
-    if mode not in EXTRACTOR_MODES:
-        raise ValueError(f"Unknown extractor mode: {mode}")
+    modes = _normalize_extractor_modes(mode)
     if num_parts < 1:
         raise ValueError("--num_parts must be a positive integer")
-    if mode == "global":
-        return 1
-    if mode in ("grid", "global_grid"):
-        slots = num_parts * num_parts
-    else:
-        slots = num_parts
-    return slots + int(mode.startswith("global_"))
+
+    slots = 0
+    for extractor in modes:
+        if extractor == "global":
+            slots += 1
+        elif extractor == "grid":
+            slots += num_parts * num_parts
+        else:
+            slots += num_parts
+    return slots
 
 
 def _balanced_bounds(size, num_parts, device):
@@ -41,14 +82,19 @@ def _balanced_bounds(size, num_parts, device):
     return bounds
 
 
-def _resolve_patch_grid(patch_features, grid_size, mode):
+def _resolve_patch_grid(patch_features, grid_size, modes):
     batch_size, num_patches, dim = patch_features.shape
     if grid_size is not None:
         grid_h, grid_w = grid_size
         if grid_h * grid_w == num_patches:
             return patch_features.reshape(batch_size, grid_h, grid_w, dim)
-    if mode in ("vertical", "grid", "global_vertical", "global_grid"):
-        raise ValueError(f"--extractor_mode {mode} requires a valid patch grid_size")
+
+    requires_grid = any(extractor in ("vertical", "grid") for extractor in modes)
+    if requires_grid:
+        raise ValueError(
+            f"--extractor_mode {','.join(modes)} requires a valid patch grid_size "
+            "for vertical/grid extractors"
+        )
     return None
 
 
@@ -89,27 +135,28 @@ def _grid_prototypes(patch_grid, num_parts):
     return parts
 
 
-def build_part_prototypes(token_features, num_parts, grid_size=None, mode="global_horizontal"):
-    if mode not in EXTRACTOR_MODES:
-        raise ValueError(f"--extractor_mode must be one of {EXTRACTOR_MODES}, got {mode}")
+def build_part_prototypes(token_features, num_parts, grid_size=None, mode="global,horizontal"):
+    modes = _normalize_extractor_modes(mode)
     if num_parts < 1:
         raise ValueError("--num_parts must be a positive integer")
 
     token_features = token_features.float()
     global_feature = F.normalize(token_features[:, 0, :], p=2, dim=-1)
-    if mode == "global":
+    if modes == ("global",):
         return global_feature.unsqueeze(1)
 
     patch_features = token_features[:, 1:, :]
-    patch_grid = _resolve_patch_grid(patch_features, grid_size, mode)
+    patch_grid = _resolve_patch_grid(patch_features, grid_size, modes)
 
-    if mode in ("horizontal", "global_horizontal"):
-        parts = _horizontal_prototypes(patch_features, patch_grid, num_parts)
-    elif mode in ("vertical", "global_vertical"):
-        parts = _vertical_prototypes(patch_grid, num_parts)
-    else:
-        parts = _grid_prototypes(patch_grid, num_parts)
+    parts = []
+    for extractor in modes:
+        if extractor == "global":
+            parts.append(global_feature)
+        elif extractor == "horizontal":
+            parts.extend(_horizontal_prototypes(patch_features, patch_grid, num_parts))
+        elif extractor == "vertical":
+            parts.extend(_vertical_prototypes(patch_grid, num_parts))
+        else:
+            parts.extend(_grid_prototypes(patch_grid, num_parts))
 
-    if mode.startswith("global_"):
-        parts = [global_feature] + parts
     return torch.stack(parts, dim=1)

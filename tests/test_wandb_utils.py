@@ -1,6 +1,8 @@
 import sys
+import shutil
 import types
 import unittest
+import uuid
 from pathlib import Path
 
 from utils.wandb_utils import upload_best_checkpoint_artifact
@@ -55,21 +57,45 @@ class WandbCheckpointArtifactTests(unittest.TestCase):
         else:
             sys.modules["wandb"] = self.original_wandb
 
+    def _make_tmp_output_dir(self):
+        tmp_path = ROOT / "tests_tmp" / f"wandb_{uuid.uuid4().hex}"
+        tmp_path.mkdir(parents=True, exist_ok=False)
+        self.addCleanup(shutil.rmtree, tmp_path, True)
+        return tmp_path
+
     def test_upload_best_checkpoint_artifact_logs_best_file(self):
         run = FakeRun(name="20260529_010203_ITSELF_tal+cid")
+        tmp_path = self._make_tmp_output_dir()
+        checkpoint_name = "best.pth"
+        (tmp_path / checkpoint_name).write_text("checkpoint", encoding="utf-8")
 
         artifact = upload_best_checkpoint_artifact(
             run,
-            ROOT,
-            checkpoint_name="requirements.txt",
+            tmp_path,
+            checkpoint_name=checkpoint_name,
         )
 
         self.assertIsNotNone(artifact)
         self.assertEqual(artifact.name, "20260529_010203_ITSELF_tal-cid-best")
         self.assertEqual(artifact.type, "model")
-        self.assertEqual(artifact.files[0][1], "requirements.txt")
+        self.assertEqual(artifact.files[0][1], checkpoint_name)
         self.assertEqual(run.logged_artifacts[0][1], ["best", "latest"])
         self.assertEqual(run.summary["best_checkpoint_artifact"], artifact.name)
+
+    def test_upload_best_checkpoint_artifact_uploads_config_yaml(self):
+        run = FakeRun(name="demo-run")
+        tmp_path = self._make_tmp_output_dir()
+        (tmp_path / "best.pth").write_text("checkpoint", encoding="utf-8")
+        (tmp_path / "config.yaml").write_text("foo: bar\n", encoding="utf-8")
+
+        artifact = upload_best_checkpoint_artifact(run, tmp_path)
+
+        self.assertIsNotNone(artifact)
+        uploaded_names = [name for _, name in artifact.files]
+        self.assertIn("best.pth", uploaded_names)
+        self.assertIn("config.yaml", uploaded_names)
+        self.assertEqual(artifact.metadata["config"], "config.yaml")
+        self.assertIn("best_checkpoint_config_path", run.summary)
 
     def test_upload_best_checkpoint_artifact_skips_missing_file(self):
         run = FakeRun()
