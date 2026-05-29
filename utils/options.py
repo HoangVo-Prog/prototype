@@ -251,8 +251,6 @@ def get_args():
             parser.error("--pnp_text_only requires --enrichment_space global")
         if not args.use_freeze_indices:
             parser.error("--pnp_text_only requires --use_freeze_indices")
-        if args.return_all:
-            parser.error("--pnp_text_only is incompatible with --return_all")
     if args.pool_coverage_epochs < 1:
         parser.error("--pool_coverage_epochs must be a positive integer")
     if args.num_parts < 1:
