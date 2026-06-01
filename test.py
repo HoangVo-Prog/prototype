@@ -192,7 +192,7 @@ def _json_safe(value):
 
 def _evaluate_domain(model, args, target_domain, cli_args, logger):
     from datasets import build_dataloader
-    from utils.metrics import Evaluator
+    from utils.test_metrics import Evaluator
 
     logger.info("Evaluating target domain: {}".format(target_domain))
     args.dataset_name = target_domain

@@ -240,22 +240,16 @@ def get_args():
                         help="context pooling after rank-part mixing")    
     
     ######################## target-aware loss settings ########################
-    parser.add_argument("--lambda_att", type=float, default=0.1,
-                        help="deprecated: ignored by the mixer context module")
     parser.add_argument("--lambda_ret", type=float, default=1.0,
                         help="weight for the target-pool retrieval loss")
     parser.add_argument("--lambda_rob", type=float, default=0.1,
                         help="weight for robust no-harm/margin-gain loss")
     parser.add_argument("--lambda_gain", type=float, default=1.0,
                         help="weight for the margin-gain term inside the robust loss")
-    parser.add_argument("--att_margin", type=float, default=0.1,
-                        help="deprecated: ignored by the mixer context module")
     parser.add_argument("--gain_margin", type=float, default=0.01,
                         help="required enriched-vs-raw retrieval margin gain")
     parser.add_argument("--use_target_retrieval_loss", action="store_true", default=False,
                         help="enable the primary target-pool retrieval loss")
-    parser.add_argument("--use_target_attention_loss", action="store_true", default=False,
-                        help="deprecated: ignored by the mixer context module")
     parser.add_argument("--use_target_robust_loss", action="store_true", default=False,
                         help="enable the robust no-harm and margin-gain loss")
     

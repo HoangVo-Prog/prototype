@@ -64,7 +64,6 @@ class TargetPrototypeEnricher(nn.Module):
         self.context_module = getattr(args, "context_module", "mixer")
         if self.context_module != "mixer":
             raise ValueError("--context_module must be mixer; attention context construction has been removed")
-        self.use_target_attention_loss = False
         self.use_target_robust_loss = getattr(args, "use_target_robust_loss", False)
         self.enrichment_space = getattr(args, "enrichment_space", "global")
         if self.enrichment_space not in ("global", "grab"):
@@ -257,7 +256,6 @@ class TargetPrototypeEnricher(nn.Module):
     ):
         zero = enriched_query.sum() * 0.0
         target_retrieval_loss = zero
-        att_loss = zero
         robust_loss = zero
         guard_loss = zero
         gain_loss = zero
@@ -295,7 +293,6 @@ class TargetPrototypeEnricher(nn.Module):
             total = total + self.lambda_rob * robust_loss
         return {
             "target_retrieval_loss": target_retrieval_loss,
-            "att_loss": att_loss,
             "robust_loss": robust_loss,
             "guard_loss": guard_loss,
             "gain_loss": gain_loss,

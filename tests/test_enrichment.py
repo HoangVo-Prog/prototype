@@ -37,14 +37,11 @@ def args(**overrides):
         residual_gate_hidden_dim=128,
         context_pooling="mlp",
         tau=0.015,
-        lambda_att=0.1,
         lambda_ret=1.0,
         lambda_rob=0.1,
         lambda_gain=1.0,
-        att_margin=0.1,
         gain_margin=0.01,
         use_target_retrieval_loss=True,
-        use_target_attention_loss=True,
         use_target_robust_loss=True,
         enrichment_space="global",
         extractor_mode="global,horizontal",
@@ -274,7 +271,6 @@ class EnrichmentShapeTests(unittest.TestCase):
         )
         self.assertEqual(out["enriched_features"].shape, (3, 512))
         self.assertEqual(out["top_indices"].shape, (3, 3))
-        self.assertFalse(enricher.use_target_attention_loss)
         self.assertNotIn("attention_weights", out)
         self.assertIn("mixer/context_norm", out)
         self.assertIn("mixer/context_delta_cosine", out)
@@ -465,7 +461,6 @@ class EnrichmentShapeTests(unittest.TestCase):
             4096,
             args(
                 use_target_retrieval_loss=False,
-                use_target_attention_loss=False,
                 use_target_robust_loss=False,
             ),
         ).float()
@@ -486,7 +481,6 @@ class EnrichmentShapeTests(unittest.TestCase):
             out["target_retrieval_loss"],
             torch.zeros_like(out["target_retrieval_loss"]),
         ))
-        self.assertTrue(torch.allclose(out["att_loss"], torch.zeros_like(out["att_loss"])))
         self.assertTrue(torch.allclose(out["robust_loss"], torch.zeros_like(out["robust_loss"])))
         self.assertTrue(torch.allclose(out["guard_loss"], torch.zeros_like(out["guard_loss"])))
         self.assertTrue(torch.allclose(out["gain_loss"], torch.zeros_like(out["gain_loss"])))
@@ -498,7 +492,6 @@ class EnrichmentShapeTests(unittest.TestCase):
             4096,
             args(
                 use_target_retrieval_loss=True,
-                use_target_attention_loss=False,
                 use_target_robust_loss=False,
             ),
         ).float()
@@ -516,7 +509,6 @@ class EnrichmentShapeTests(unittest.TestCase):
             space="global",
         )
         self.assertTrue(torch.isfinite(out["target_retrieval_loss"]))
-        self.assertTrue(torch.allclose(out["att_loss"], torch.zeros_like(out["att_loss"])))
         self.assertTrue(torch.allclose(out["robust_loss"], torch.zeros_like(out["robust_loss"])))
         self.assertTrue(torch.allclose(out["guard_loss"], torch.zeros_like(out["guard_loss"])))
         self.assertTrue(torch.allclose(out["gain_loss"], torch.zeros_like(out["gain_loss"])))
@@ -525,11 +517,9 @@ class EnrichmentShapeTests(unittest.TestCase):
     def test_target_losses_default_to_disabled_in_enricher(self):
         defaults = args()
         delattr(defaults, "use_target_retrieval_loss")
-        delattr(defaults, "use_target_attention_loss")
         delattr(defaults, "use_target_robust_loss")
         enricher = modules.TargetPrototypeEnricher(512, 4096, defaults).float()
         self.assertFalse(enricher.use_target_retrieval_loss)
-        self.assertFalse(enricher.use_target_attention_loss)
         self.assertFalse(enricher.use_target_robust_loss)
 
     def test_lambda_ret_scales_target_retrieval_objective(self):
@@ -551,12 +541,12 @@ class EnrichmentShapeTests(unittest.TestCase):
         base = modules.TargetPrototypeEnricher(
             512,
             4096,
-            args(use_target_attention_loss=False, use_target_robust_loss=False, lambda_ret=1.0),
+            args(use_target_robust_loss=False, lambda_ret=1.0),
         ).float()
         scaled = modules.TargetPrototypeEnricher(
             512,
             4096,
-            args(use_target_attention_loss=False, use_target_robust_loss=False, lambda_ret=2.0),
+            args(use_target_robust_loss=False, lambda_ret=2.0),
         ).float()
         scaled.load_state_dict(base.state_dict())
         base_out = base(**common)
@@ -978,7 +968,6 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertTrue(parsed.deterministic)
         self.assertFalse(parsed.deterministic_warn_only)
         self.assertFalse(parsed.use_target_retrieval_loss)
-        self.assertFalse(parsed.use_target_attention_loss)
         self.assertFalse(parsed.use_target_robust_loss)
         self.assertFalse(parsed.pnp_text_only)
 
@@ -1127,7 +1116,6 @@ class SchedulerOptionTests(unittest.TestCase):
                 "test",
                 "--no_use_host_loss",
                 "--use_target_retrieval_loss",
-                "--use_target_attention_loss",
                 "--use_target_robust_loss",
             ]
             parsed = options.get_args()
@@ -1135,7 +1123,6 @@ class SchedulerOptionTests(unittest.TestCase):
             sys.argv = old_argv
         self.assertFalse(parsed.use_host_loss)
         self.assertTrue(parsed.use_target_retrieval_loss)
-        self.assertTrue(parsed.use_target_attention_loss)
         self.assertTrue(parsed.use_target_robust_loss)
 
     def test_lr_total_epochs_overrides_training_epoch_count(self):
