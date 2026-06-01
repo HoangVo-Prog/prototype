@@ -4,8 +4,9 @@ import types
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
-from utils.wandb_utils import upload_best_checkpoint_artifact
+from utils.wandb_utils import build_wandb_config, get_wandb_project, upload_best_checkpoint_artifact
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +43,20 @@ class FakeLogger:
 
     def info(self, message):
         self.infos.append(message)
+
+
+class WandbConfigTests(unittest.TestCase):
+    def test_build_wandb_config_uses_cli_project_name(self):
+        args = SimpleNamespace(wandb_project="custom-project", use_wandb=True)
+
+        config = build_wandb_config(args, run_name="run-1", output_dir="logs/run-1")
+
+        self.assertEqual(config["wandb_project"], "custom-project")
+        self.assertEqual(config["wandb_run_name"], "run-1")
+        self.assertEqual(config["output_dir"], "logs/run-1")
+
+    def test_wandb_project_falls_back_for_legacy_args(self):
+        self.assertEqual(get_wandb_project(SimpleNamespace()), "enrichment")
 
 
 class WandbCheckpointArtifactTests(unittest.TestCase):

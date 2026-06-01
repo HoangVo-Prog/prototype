@@ -148,6 +148,8 @@ def get_args():
     wandb_group.add_argument("--no_wandb", dest="use_wandb", action="store_false",
                              help="disable Weights & Biases logging")
     parser.set_defaults(use_wandb=True)
+    parser.add_argument("--wandb_project", default="enrichment",
+                        help="Weights & Biases project name")
 
     ### GRAB
     parser.add_argument("--only_global", action='store_true')
@@ -256,6 +258,9 @@ def get_args():
     args = parser.parse_args()
     if args.seed < 0 or args.seed >= 2**32:
         parser.error("--seed must be in [0, 2**32)")
+    args.wandb_project = args.wandb_project.strip()
+    if not args.wandb_project:
+        parser.error("--wandb_project must not be empty")
     if args.enrichment_start < 1:
         parser.error("--enrichment_start must be a positive integer")
     if args.freeze_host and not args.target_enrichment:

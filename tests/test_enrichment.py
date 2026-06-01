@@ -970,6 +970,21 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertFalse(parsed.use_target_retrieval_loss)
         self.assertFalse(parsed.use_target_robust_loss)
         self.assertFalse(parsed.pnp_text_only)
+        self.assertEqual(parsed.wandb_project, "enrichment")
+
+    def test_wandb_project_cli_parses_and_validates_name(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = ["test", "--wandb_project", "custom-project"]
+            parsed = options.get_args()
+            self.assertEqual(parsed.wandb_project, "custom-project")
+
+            sys.argv = ["test", "--wandb_project", "   "]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+        finally:
+            sys.argv = old_argv
 
     def test_residual_gate_cli_parses_static_gamma_and_rejects_residual_gamma(self):
         options = importlib.import_module("utils.options")

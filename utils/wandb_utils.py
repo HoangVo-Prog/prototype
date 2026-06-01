@@ -112,10 +112,19 @@ def _config_value(value):
     return str(value)
 
 
+def get_wandb_project(args):
+    project = getattr(args, "wandb_project", None)
+    if project is None:
+        return WANDB_PROJECT
+    project = str(project).strip()
+    return project or WANDB_PROJECT
+
+
 def build_wandb_config(args, run_name, output_dir):
+    project = get_wandb_project(args)
     config = {key: _config_value(value) for key, value in vars(args).items()}
     config.update({
-        "wandb_project": WANDB_PROJECT,
+        "wandb_project": project,
         "wandb_run_name": run_name,
         "output_dir": output_dir,
     })
@@ -139,13 +148,14 @@ def init_wandb(args, run_name, output_dir, logger=None):
             logger.warning("W&B disabled: wandb package is not installed.")
         return None
 
-    os.environ.setdefault("WANDB_PROJECT", WANDB_PROJECT)
+    project = get_wandb_project(args)
+    os.environ["WANDB_PROJECT"] = project
     os.environ.setdefault("WANDB_NAME", run_name)
 
     try:
         wandb.login(key=api_key, relogin=False)
         init_kwargs = {
-            "project": WANDB_PROJECT,
+            "project": project,
             "name": run_name,
             "config": build_wandb_config(args, run_name, output_dir),
             "dir": output_dir,
