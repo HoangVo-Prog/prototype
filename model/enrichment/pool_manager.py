@@ -56,6 +56,7 @@ class TargetPoolManager(
         self.full_training_cache_requests = 0
         self.frozen_cache = None
         self.frozen_rank_indices = None
+        self.frozen_query_features = None
         self.frozen_index_depth = None
         self.frozen_cache_requests = 0
         self.pool_coverage_counts = [0 for _ in self.records]
@@ -109,10 +110,12 @@ class TargetPoolManager(
         }
 
     def get_train_cache(self, model, batch, epoch, step):
-        if getattr(self.args, "use_freeze_indices", False):
+        use_freeze_indices = getattr(self.args, "use_freeze_indices", False)
+        if use_freeze_indices:
             if self.frozen_cache is None or self.frozen_rank_indices is None:
                 self._build_frozen_index_cache(model)
-            return self._frozen_batch_cache(batch)
+            if not self.use_shared_k:
+                return self._frozen_batch_cache(batch)
 
         if not self.use_shared_k:
             return self._full_training_set_cache(model, epoch, step)
@@ -128,6 +131,8 @@ class TargetPoolManager(
             self.active_interval_id = interval_id
         elif self.interval_cache is not None and "diagnostics" in self.interval_cache:
             self.interval_cache["diagnostics"]["pool_interval_reused"] = 1.0
+        if use_freeze_indices:
+            return self._frozen_shared_k_batch_cache(batch, self.interval_cache)
         return self.interval_cache
 
     def _interval_unit(self, epoch, step):

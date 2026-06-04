@@ -187,7 +187,8 @@ def get_args():
                         help="number of partitions for horizontal/vertical extractors; grid uses num_parts x num_parts") 
     parser.add_argument("--use_freeze_indices", "--freeze_indices",
                         dest="use_freeze_indices", action="store_true", default=False,
-                        help="precompute frozen host top-K rankings once and reuse them for top-M selection")
+                        help="precompute frozen host top-K rankings once and reuse them for top-M selection; "
+                             "with --use_shared_k, top-M is selected only inside each shared K pool")
     parser.add_argument("--pnp_text_only", action="store_true", default=False,
                         help="for frozen plug-and-play global training, encode only batch text and use frozen target cache for images")
     parser.add_argument("--robust_hard_k", "--hard_neg_k", dest="robust_hard_k",

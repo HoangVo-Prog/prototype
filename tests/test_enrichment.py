@@ -692,7 +692,7 @@ class PoolManagerTests(unittest.TestCase):
         self.assertEqual(cache2["diagnostics"]["pool_interval_id"], 0.0)
 
     def test_frozen_indices_bypass_recompute_interval(self):
-        manager = make_pool_manager(use_freeze_indices=True, top_m=2)
+        manager = make_pool_manager(use_freeze_indices=True, use_shared_k=False, top_m=2)
         manager.refresh = lambda model, epoch, step: self.fail("frozen indices should not refresh")
         manager.frozen_cache = {
             "host_image_features": torch.zeros(4, 512),
@@ -727,6 +727,70 @@ class PoolManagerTests(unittest.TestCase):
         self.assertEqual(cache1["diagnostics"]["pool_interval_reused"], 0.0)
         self.assertEqual(cache2["diagnostics"]["pool_interval_reused"], 1.0)
         self.assertEqual(cache2["diagnostics"]["pool_k_mode"], "frozen_indices")
+
+    def test_frozen_shared_k_filters_top_indices_to_pool(self):
+        manager = make_pool_manager(use_freeze_indices=True, use_shared_k=True, top_m=2)
+        manager.frozen_rank_indices = torch.tensor([
+            [1, 2, 0, 3],
+            [3, 1, 0, 2],
+        ])
+        manager.frozen_index_depth = 4
+        manager.frozen_query_features = None
+
+        pool_cache = {
+            "host_image_features": torch.zeros(3, 512),
+            "retrieval_features": torch.zeros(3, 512),
+            "prototypes": torch.zeros(3, 7, 512),
+            "image_ids": torch.tensor([12, 10, 13]),
+            "pids": torch.tensor([2, 0, 3]),
+            "diagnostics": {
+                "pool_k_mode": "static",
+                "pool_shared_k_used": 1.0,
+                "pool_interval_reused": 0.0,
+            },
+        }
+        cache = manager._frozen_shared_k_batch_cache(
+            {"index": torch.tensor([0, 1])},
+            pool_cache,
+        )
+
+        self.assertTrue(torch.equal(cache["top_indices"], torch.tensor([[0, 1], [2, 1]])))
+        self.assertEqual(cache["diagnostics"]["pool_shared_k_used"], 1.0)
+        self.assertEqual(cache["diagnostics"]["frozen_indices_used"], 1.0)
+        self.assertEqual(cache["diagnostics"]["frozen_indices_pool_filtered"], 1.0)
+
+    def test_frozen_shared_k_uses_interval_pool_before_top_m(self):
+        manager = make_pool_manager(use_freeze_indices=True, use_shared_k=True, top_m=2)
+        manager.frozen_cache = {
+            "host_image_features": torch.zeros(4, 512),
+            "retrieval_features": torch.zeros(4, 512),
+            "prototypes": torch.zeros(4, 7, 512),
+            "pids": torch.tensor([0, 1, 2, 3]),
+            "image_ids": torch.tensor([10, 11, 12, 13]),
+        }
+        manager.frozen_rank_indices = torch.tensor([
+            [0, 1, 2, 3],
+            [1, 0, 2, 3],
+            [2, 3, 0, 1],
+            [3, 2, 1, 0],
+        ])
+        manager.frozen_query_features = None
+        manager.frozen_index_depth = 4
+        manager.frozen_cache_requests = 0
+
+        batch = {
+            "index": torch.tensor([0, 2]),
+            "image_ids": torch.tensor([10, 12]),
+            "pids": torch.tensor([0, 2]),
+            "images": torch.randn(2, 3, 8, 8),
+        }
+        cache = manager.get_train_cache(FakeImageEncoder(), batch, epoch=1, step=1)
+
+        self.assertIn("top_indices", cache)
+        self.assertEqual(cache["diagnostics"]["pool_k_mode"], "static")
+        self.assertEqual(cache["diagnostics"]["pool_shared_k_used"], 1.0)
+        self.assertEqual(cache["diagnostics"]["frozen_indices_used"], 1.0)
+        self.assertEqual(cache["diagnostics"]["pool_final_pool_size"], 4.0)
 
     def test_full_training_set_mode_bypasses_shared_k_sampling(self):
         manager = make_pool_manager(use_shared_k=False, pool_k=2)
