@@ -57,6 +57,7 @@ class TargetPoolManager(
         self.frozen_cache = None
         self.frozen_rank_indices = None
         self.frozen_query_features = None
+        self.frozen_gallery_image_ids = None
         self.frozen_index_depth = None
         self.frozen_cache_requests = 0
         self.pool_coverage_counts = [0 for _ in self.records]
@@ -112,7 +113,7 @@ class TargetPoolManager(
     def get_train_cache(self, model, batch, epoch, step):
         use_freeze_indices = getattr(self.args, "use_freeze_indices", False)
         if use_freeze_indices:
-            if self.frozen_cache is None or self.frozen_rank_indices is None:
+            if not self._frozen_index_ready():
                 self._build_frozen_index_cache(model)
             if not self.use_shared_k:
                 return self._frozen_batch_cache(batch)
@@ -121,19 +122,29 @@ class TargetPoolManager(
             return self._full_training_set_cache(model, epoch, step)
 
         if self._should_refresh(epoch, step):
+            self._clear_interval_cache()
             self.refresh(model, epoch, step)
             interval_id = self._interval_id(epoch, step)
-            self.interval_cache = self._build_interval_pool_cache(
+            interval_cache = self._build_interval_pool_cache(
                 model=model,
                 batch=batch,
                 interval_id=interval_id,
             )
+            self.interval_cache = interval_cache
             self.active_interval_id = interval_id
         elif self.interval_cache is not None and "diagnostics" in self.interval_cache:
             self.interval_cache["diagnostics"]["pool_interval_reused"] = 1.0
         if use_freeze_indices:
             return self._frozen_shared_k_batch_cache(batch, self.interval_cache)
         return self.interval_cache
+
+    def _clear_interval_cache(self):
+        if self.interval_cache is None:
+            return
+        self.interval_cache = None
+        self.active_interval_id = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _interval_unit(self, epoch, step):
         return epoch if self.args.recompute_level == "epoch" else step

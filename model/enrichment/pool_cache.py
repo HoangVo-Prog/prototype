@@ -7,24 +7,37 @@ from .pool_common import _PoolImageDataset, _PoolTextDataset, _unwrap_model
 
 
 class TargetPoolCacheMixin:
+    def _frozen_index_ready(self):
+        if self.frozen_rank_indices is None or self.frozen_index_depth is None:
+            return False
+        if getattr(self.args, "use_shared_k", False):
+            return (
+                self.frozen_query_features is not None
+                and self.frozen_gallery_image_ids is not None
+            )
+        return self.frozen_cache is not None
+
     def _build_frozen_index_cache(self, model):
         if not self.records:
             raise ValueError("Cannot build frozen indices from an empty training image pool")
         if not self.query_records:
             raise ValueError("Cannot build frozen indices from an empty training query set")
 
-        cache = self._encode_records(model, self.records, cache_prototypes=True)
+        use_shared_k = getattr(self.args, "use_shared_k", False)
+        cache = self._encode_records(model, self.records, cache_prototypes=not use_shared_k)
         device = cache["host_image_features"].device
-        cache["image_ids"] = torch.tensor(
+        gallery_image_ids = torch.tensor(
             [record["image_id"] for record in self.records],
             dtype=torch.long,
-            device=device,
+            device="cpu",
         )
-        cache["pids"] = torch.tensor(
-            [record["pid"] for record in self.records],
-            dtype=torch.long,
-            device=device,
-        )
+        if not use_shared_k:
+            cache["image_ids"] = gallery_image_ids.to(device)
+            cache["pids"] = torch.tensor(
+                [record["pid"] for record in self.records],
+                dtype=torch.long,
+                device=device,
+            )
 
         host_image_features = F.normalize(cache["host_image_features"].float(), p=2, dim=-1)
         query_features = self._encode_text_records(model, self.query_records)
@@ -46,26 +59,33 @@ class TargetPoolCacheMixin:
                     scores.topk(k=rank_depth, dim=1, largest=True, sorted=True).indices.cpu()
                 )
 
-        self.frozen_cache = cache
         self.frozen_rank_indices = torch.cat(rank_chunks, dim=0)
-        self.frozen_query_features = query_features if getattr(self.args, "use_shared_k", False) else None
+        self.frozen_gallery_image_ids = gallery_image_ids
+        self.frozen_query_features = query_features.cpu() if use_shared_k else None
+        self.frozen_cache = None if use_shared_k else cache
         self.frozen_index_depth = rank_depth
         self.frozen_cache_requests = 0
+
+        gallery_size = len(self.records)
+        if use_shared_k:
+            del cache
+            del host_image_features
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if self.logger is not None:
             self.logger.info(
                 "Frozen host retrieval index built: queries={} gallery={} rank_depth={}".format(
                     self.frozen_rank_indices.shape[0],
-                    cache["pids"].numel(),
+                    gallery_size,
                     rank_depth,
                 )
             )
 
-    def _frozen_query_indices(self, batch):
-        if "index" not in batch:
-            raise ValueError("--use_freeze_indices requires training batches to include dataset indices")
-
-        query_indices = batch["index"].detach().long().cpu()
+    def _coerce_frozen_query_indices(self, query_indices):
+        if not torch.is_tensor(query_indices):
+            query_indices = torch.tensor(query_indices, dtype=torch.long)
+        query_indices = query_indices.detach().long().cpu()
         if query_indices.numel() == 0:
             raise ValueError("Cannot gather frozen indices for an empty batch")
         if int(query_indices.max().item()) >= self.frozen_rank_indices.shape[0]:
@@ -74,7 +94,27 @@ class TargetPoolCacheMixin:
             raise ValueError("Batch query index must be non-negative")
         return query_indices
 
+    def _frozen_query_indices(self, batch):
+        if "index" not in batch:
+            raise ValueError("--use_freeze_indices requires training batches to include dataset indices")
+        return self._coerce_frozen_query_indices(batch["index"])
+
+    def _frozen_ranked_image_ids(self, query_indices, top_n=None):
+        if self.frozen_gallery_image_ids is None:
+            raise ValueError("Frozen gallery image IDs are not available")
+        query_indices = self._coerce_frozen_query_indices(query_indices)
+        rank_rows = self.frozen_rank_indices.index_select(0, query_indices).cpu()
+        if top_n is not None:
+            if top_n < 1:
+                raise ValueError("top_n must be a positive integer")
+            rank_rows = rank_rows[:, :min(int(top_n), rank_rows.shape[1])]
+        flat_indices = rank_rows.reshape(-1).long()
+        image_ids = self.frozen_gallery_image_ids.index_select(0, flat_indices)
+        return image_ids.view(rank_rows.shape)
+
     def _frozen_batch_cache(self, batch):
+        if self.frozen_cache is None:
+            raise ValueError("Frozen full-gallery cache is not available")
         device = self.frozen_cache["host_image_features"].device
         query_indices = self._frozen_query_indices(batch)
 
@@ -150,21 +190,14 @@ class TargetPoolCacheMixin:
             raise ValueError("Cannot select frozen top-M from an empty shared K pool")
 
         query_features = getattr(self, "frozen_query_features", None)
-        if query_features is not None:
-            # Score only the current shared-K pool; this is equivalent to filtering
-            # the frozen full-gallery ranking to pool entries before top-M.
-            query_features = query_features.index_select(0, query_indices).to(device)
-            query_features = F.normalize(query_features.float(), p=2, dim=-1)
-            pool_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
-            scores = query_features @ pool_features.t()
-            return scores.topk(k=top_m, dim=1, largest=True, sorted=True).indices
+        if query_features is None:
+            raise ValueError("Shared-K frozen top-M selection requires frozen query features")
 
-        return self._filter_frozen_rank_indices_to_pool(
-            query_indices=query_indices,
-            pool_cache=pool_cache,
-            top_m=top_m,
-            device=device,
-        )
+        query_features = query_features.index_select(0, query_indices).to(device)
+        query_features = F.normalize(query_features.float(), p=2, dim=-1)
+        pool_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
+        scores = query_features @ pool_features.t()
+        return scores.topk(k=top_m, dim=1, largest=True, sorted=True).indices
 
     def _filter_frozen_rank_indices_to_pool(self, query_indices, pool_cache, top_m, device):
         if "image_ids" not in pool_cache:
