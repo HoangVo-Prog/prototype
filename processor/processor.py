@@ -114,6 +114,100 @@ def _move_train_batch_to_device(batch, device, pnp_text_only=False):
     return {key: value.to(device) for key, value in batch.items()}
 
 
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _set_wandb_summary(wandb_run, summary_values):
+    if wandb_run is None or not hasattr(wandb_run, "summary"):
+        return
+    for key, value in summary_values.items():
+        wandb_run.summary[key] = int(value)
+
+
+def _count_module_tensors(module, name_filter=None):
+    def _include(name):
+        return name_filter is None or name_filter(name)
+
+    total_params = 0
+    trainable_params = 0
+    for name, parameter in module.named_parameters():
+        if not _include(name):
+            continue
+        total_params += parameter.numel()
+        if parameter.requires_grad:
+            trainable_params += parameter.numel()
+
+    buffer_params = sum(
+        buffer.numel()
+        for name, buffer in module.named_buffers()
+        if _include(name)
+    )
+    return {
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "frozen_params": total_params - trainable_params,
+        "buffers": buffer_params,
+    }
+
+
+def _flatten_param_summary(prefix, stats):
+    return {
+        f"{prefix}_total_params": stats["total_params"],
+        f"{prefix}_trainable_params": stats["trainable_params"],
+        f"{prefix}_frozen_params": stats["frozen_params"],
+        f"{prefix}_buffers": stats["buffers"],
+    }
+
+
+def _log_param_scope(logger, label, stats):
+    logger.info(
+        "%s params: total=%s (%.3fM), trainable=%s (%.3fM), frozen=%s (%.3fM), "
+        "buffers=%s (%.3fM)",
+        label,
+        f"{stats['total_params']:,}",
+        stats["total_params"] / 1_000_000.0,
+        f"{stats['trainable_params']:,}",
+        stats["trainable_params"] / 1_000_000.0,
+        f"{stats['frozen_params']:,}",
+        stats["frozen_params"] / 1_000_000.0,
+        f"{stats['buffers']:,}",
+        stats["buffers"] / 1_000_000.0,
+    )
+
+
+def _log_enrichment_branch_size(model, logger, wandb_run=None):
+    model = _unwrap_model(model)
+    target_enricher = getattr(model, "target_enricher", None)
+    model_stats = _count_module_tensors(model)
+    host_stats = _count_module_tensors(
+        model,
+        name_filter=lambda name: not name.startswith("target_enricher."),
+    )
+    summary = {}
+    summary.update(_flatten_param_summary("model", model_stats))
+    summary.update(_flatten_param_summary("host", host_stats))
+
+    _log_param_scope(logger, "Model", model_stats)
+    _log_param_scope(logger, "Host", host_stats)
+
+    if target_enricher is None:
+        logger.info("Target enrichment branch params: disabled")
+        summary.update(_flatten_param_summary("target_enrichment_branch", {
+            "total_params": 0,
+            "trainable_params": 0,
+            "frozen_params": 0,
+            "buffers": 0,
+        }))
+        _set_wandb_summary(wandb_run, summary)
+        return
+
+    target_stats = _count_module_tensors(target_enricher)
+    _log_param_scope(logger, "Target enrichment branch", target_stats)
+    summary.update(_flatten_param_summary("target_enrichment_branch", target_stats))
+    _set_wandb_summary(wandb_run, summary)
+
+
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
              scheduler, checkpointer, target_pool=None, wandb_run=None):
 
@@ -127,6 +221,8 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
     logger = logging.getLogger("ITSELF.train")
     logger.info('start training')
+    if get_rank() == 0:
+        _log_enrichment_branch_size(model, logger, wandb_run=wandb_run)
     if target_pool is not None and getattr(args, "enrichment_start", 1) > 1:
         logger.info(
             "Target enrichment delayed until epoch {}; earlier epochs use host training only".format(
