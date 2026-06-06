@@ -18,31 +18,6 @@ def _pool_transform(img_size):
     ])
 
 
-def _js_distance(p, q, eps=1e-12):
-    p = p.float().clamp_min(eps)
-    q = q.float().clamp_min(eps)
-    p = p / p.sum()
-    q = q / q.sum()
-    m = 0.5 * (p + q)
-    kl_pm = (p * (p / m).log()).sum()
-    kl_qm = (q * (q / m).log()).sum()
-    return float((0.5 * (kl_pm + kl_qm)).sqrt().item())
-
-
-def _parse_pool_k_candidates(value):
-    if isinstance(value, (list, tuple)):
-        candidates = value
-    else:
-        candidates = str(value).split(",")
-
-    parsed = []
-    for candidate in candidates:
-        if str(candidate).strip() == "":
-            continue
-        parsed.append(int(candidate))
-    return sorted({candidate for candidate in parsed if candidate > 0})
-
-
 class _PoolImageDataset(Dataset):
     def __init__(self, records, transform):
         self.records = records

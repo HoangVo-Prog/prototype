@@ -62,7 +62,7 @@ def get_args():
     parser.add_argument("--output_dir", default="run_logs")
     parser.add_argument("--name", default="ITSELF", help="experiment name to save")
     parser.add_argument("--seed", default=1, type=int,
-                        help="base seed for model init, samplers, dataloader workers, and target-pool sampling")
+                        help="base seed for model init, samplers, and dataloader workers")
     deterministic_group = parser.add_mutually_exclusive_group()
     deterministic_group.add_argument("--deterministic", dest="deterministic", action="store_true",
                                      help="enable deterministic PyTorch/CUDA settings")
@@ -167,18 +167,6 @@ def get_args():
     parser.add_argument("--enrichment_space", type=str, default="global",
                         choices=["global", "grab"],
                         help="feature space to enrich when target_enrichment is enabled")
-    parser.add_argument("--pool_k_mode", type=str, default="static",
-                        choices=["static", "adaptive"],
-                        help="static uses --pool_k; adaptive computes K=max(K_valid,K_dilute,K_dist)")
-    parser.add_argument("--pool_k", type=int, default=1024,
-                        help="number of images in the training pseudo-target pool")
-    parser.add_argument("--pool_k_candidates", type=str, default="512,1024,2048,4096,8192",
-                        help="comma-separated candidate K values used when --pool_k_mode adaptive")
-    parser.add_argument("--use_shared_k", action="store_true", default=False,
-                        help="sample a shared K-sized target pool before top-M selection; "
-                             "without this flag, top-M is selected from the full training set")
-    parser.add_argument("--pool_coverage_epochs", type=int, default=15,
-                        help="number of shared-K refreshes expected to cover every training image")
     parser.add_argument("--top_m", type=int, default=32,
                         help="number of host-ranked local images used for enrichment")
     parser.add_argument("--extractor_mode", type=parse_extractor_mode, default="global,horizontal",
@@ -187,24 +175,12 @@ def get_args():
                         help="number of partitions for horizontal/vertical extractors; grid uses num_parts x num_parts") 
     parser.add_argument("--use_freeze_indices", "--freeze_indices",
                         dest="use_freeze_indices", action="store_true", default=False,
-                        help="precompute frozen host top-K rankings once and reuse them for top-M selection; "
-                             "with --use_shared_k, top-M is selected only inside each shared K pool")
+                        help="precompute frozen host top-M rankings once and reuse them for top-M selection")
     parser.add_argument("--pnp_text_only", action="store_true", default=False,
                         help="for frozen plug-and-play global training, encode only batch text and use frozen target cache for images")
     parser.add_argument("--robust_hard_k", "--hard_neg_k", dest="robust_hard_k",
                         type=int, default=32,
                         help="number of raw-score hard negatives R used by robust margin loss")
-    parser.add_argument("--pool_clusters", type=int, default=16,
-                        help="visual clusters used for distribution-preserving pool sampling")
-    parser.add_argument("--positive_ratio_max", "--eta", dest="positive_ratio_max",
-                        type=float, default=0.5,
-                        help="maximum allowed required-positive ratio in a target pool")
-    parser.add_argument("--pool_dist_metric", type=str, default="l1",
-                        choices=["l1", "js"],
-                        help="distance metric for final-pool vs train-set cluster distribution")
-    parser.add_argument("--pool_dist_threshold", "--epsilon", dest="pool_dist_threshold",
-                        type=float, default=0.25,
-                        help="warning threshold for target-pool cluster distribution distance")
     parser.add_argument("--enrich_gamma", type=float, default=None,
                         help="static residual strength; valid only with --residual_gate static")
     parser.add_argument("--residual_gate", "--gate_mode", dest="residual_gate",
@@ -268,8 +244,6 @@ def get_args():
         parser.error("--freeze_host requires --target_enrichment")
     if args.use_freeze_indices and not args.target_enrichment:
         parser.error("--use_freeze_indices requires --target_enrichment")
-    if args.use_shared_k and not args.target_enrichment:
-        parser.error("--use_shared_k requires --target_enrichment")
     if args.pnp_text_only:
         if not args.freeze_host:
             parser.error("--pnp_text_only requires --freeze_host")
@@ -279,8 +253,6 @@ def get_args():
             parser.error("--pnp_text_only requires --use_freeze_indices")
         if args.enrichment_space != "global":
             parser.error("--pnp_text_only requires --enrichment_space global")
-    if args.pool_coverage_epochs < 1:
-        parser.error("--pool_coverage_epochs must be a positive integer")
     if args.num_parts < 1:
         parser.error("--num_parts must be a positive integer")
     if args.residual_gate == "static" and args.enrich_gamma is None:

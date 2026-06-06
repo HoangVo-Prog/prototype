@@ -2,8 +2,6 @@ try:
     from .pool_common import (
         _PoolImageDataset,
         _PoolTextDataset,
-        _js_distance,
-        _parse_pool_k_candidates,
         _pool_transform,
         _unwrap_model,
     )
@@ -36,8 +34,6 @@ except ImportError:
 
     _PoolImageDataset = _common._PoolImageDataset
     _PoolTextDataset = _common._PoolTextDataset
-    _js_distance = _common._js_distance
-    _parse_pool_k_candidates = _common._parse_pool_k_candidates
     _pool_transform = _common._pool_transform
     _unwrap_model = _common._unwrap_model
     TargetPoolManager = _manager.TargetPoolManager

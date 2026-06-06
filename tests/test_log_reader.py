@@ -17,9 +17,6 @@ SAMPLE_LOG = """2026-05-31 12:21:56,993 ITSELF INFO: Namespace(tau=0.015
  milestones=(45
  50)
  dataset_name='RSTPReid'
- pool_k_candidates='512
-1024
-2048'
  extractor_mode='global
 horizontal'
  target_enrichment=True
@@ -41,7 +38,6 @@ class LogReaderTests(unittest.TestCase):
 
         self.assertEqual(config["img_size"], (384, 128))
         self.assertEqual(config["milestones"], (45, 50))
-        self.assertEqual(config["pool_k_candidates"], "512,1024,2048")
         self.assertEqual(config["extractor_mode"], "global,horizontal")
         self.assertFalse(config["distributed"])
 

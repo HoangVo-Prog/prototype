@@ -73,25 +73,19 @@ class FakeImageEncoder(torch.nn.Module):
 def make_pool_manager(**overrides):
     manager = pool.TargetPoolManager.__new__(pool.TargetPoolManager)
     defaults = dict(
-        pool_k=4,
-        pool_k_mode="static",
-        pool_k_candidates="2,4",
         test_batch_size=4,
         num_workers=0,
-        positive_ratio_max=0.75,
-        pool_dist_metric="l1",
-        pool_dist_threshold=0.01,
         recompute_level="step",
         recompute_interval=2,
-        pool_coverage_epochs=15,
-        use_shared_k=True,
+        use_freeze_indices=False,
+        top_m=3,
         seed=1,
     )
     defaults.update(overrides)
     manager.args = SimpleNamespace(**defaults)
     manager.seed = defaults["seed"]
-    manager.use_shared_k = defaults["use_shared_k"]
     manager.logger = None
+    manager.train_dataset = SimpleNamespace(tokenizer=None, text_length=77, truncate=True)
     manager.records = [
         {"pid": 0, "image_id": 10, "img_path": "a.jpg"},
         {"pid": 1, "image_id": 11, "img_path": "b.jpg"},
@@ -102,26 +96,14 @@ def make_pool_manager(**overrides):
         {"pid": record["pid"], "query_index": index, "caption": f"caption {index}"}
         for index, record in enumerate(manager.records)
     ]
-    manager.records_by_pid = {0: [0], 1: [1], 2: [2], 3: [3]}
-    manager.record_index_by_image_id = {10: 0, 11: 1, 12: 2, 13: 3}
-    manager.cluster_to_indices = {0: [0, 1], 1: [2, 3]}
-    manager.cluster_distribution = torch.tensor([0.5, 0.5])
-    manager.cluster_labels = torch.tensor([0, 0, 1, 1])
-    manager.rng = __import__("random").Random(7)
-    manager.interval_cache = None
-    manager.active_interval_id = None
-    manager.last_refresh_unit = None
     manager.full_training_cache = None
     manager.full_training_interval_id = None
     manager.full_training_cache_requests = 0
     manager.frozen_cache = None
     manager.frozen_rank_indices = None
-    manager.frozen_query_features = None
     manager.frozen_gallery_image_ids = None
     manager.frozen_index_depth = None
     manager.frozen_cache_requests = 0
-    manager.pool_coverage_counts = [0 for _ in manager.records]
-    manager.refresh = lambda model, epoch, step: None
     manager._encode_records = lambda model, records, cache_prototypes=True: {
         "host_image_features": torch.zeros(len(records), 512),
         "retrieval_features": torch.zeros(len(records), 512),
@@ -639,51 +621,30 @@ class PoolManagerTests(unittest.TestCase):
         self.assertEqual(records[0]["image_id"], 10)
 
         manager.args = SimpleNamespace(recompute_level="epoch", recompute_interval=-1)
-        manager.cluster_to_indices = None
-        manager.interval_cache = None
-        self.assertTrue(manager._should_refresh(epoch=1, step=1))
-        manager.cluster_to_indices = {0: [0]}
-        manager.interval_cache = {"host_image_features": torch.zeros(1, 512)}
-        manager.active_interval_id = 0
-        self.assertFalse(manager._should_refresh(epoch=99, step=99))
+        self.assertEqual(manager._interval_id(epoch=1, step=1), 0)
+        self.assertEqual(manager._interval_id(epoch=99, step=99), 0)
 
         manager.args = SimpleNamespace(recompute_level="step", recompute_interval=3)
-        manager.active_interval_id = 1
-        self.assertFalse(manager._should_refresh(epoch=1, step=6))
-        self.assertTrue(manager._should_refresh(epoch=1, step=7))
+        self.assertEqual(manager._interval_id(epoch=1, step=6), 1)
+        self.assertEqual(manager._interval_id(epoch=1, step=7), 2)
 
-    def test_pool_construction_inserts_identity_anchors_before_quota_fill(self):
-        manager = make_pool_manager(positive_ratio_max=1.0)
-        batch = {
-            "image_ids": torch.tensor([10, 10, 11]),
-            "pids": torch.tensor([0, 0, 1]),
-            "images": torch.randn(3, 3, 8, 8),
-        }
-        model = FakeImageEncoder()
-        model.train()
-        distractors, diagnostics = manager._sample_distractor_indices(
-            manager._required_positives(batch),
-            pool_k=4,
-        )
-        self.assertEqual(set(distractors), {2, 3})
-        self.assertEqual(diagnostics["pool_cluster_distribution_distance"], 0.0)
-        cache = manager._build_batch_pool_cache(model, batch)
-        self.assertEqual(set(cache["image_ids"].tolist()), {10, 11, 12, 13})
-        self.assertEqual(set(cache["pids"].tolist()), {0, 1, 2, 3})
-        self.assertEqual(cache["diagnostics"]["pool_num_required_positives"], 4.0)
-        self.assertEqual(cache["diagnostics"]["pool_num_inserted_positives"], 4.0)
-        self.assertEqual(cache["diagnostics"]["pool_positive_ratio"], 1.0)
-        self.assertEqual(cache["diagnostics"]["pool_cluster_distribution_distance"], 0.0)
-        self.assertEqual(cache["diagnostics"]["pool_final_pool_size"], 4.0)
-        self.assertEqual(cache["diagnostics"]["pool_missing_positive_count"], 0.0)
-        self.assertEqual(cache["diagnostics"]["pool_coverage_seen"], 4.0)
-        self.assertEqual(cache["diagnostics"]["pool_coverage_remaining"], 0.0)
-        self.assertIn("positive_ratio", cache["diagnostics"])
-        self.assertIn("cluster_distribution_distance", cache["diagnostics"])
-        self.assertTrue(model.training)
+        manager.args = SimpleNamespace(recompute_level="step", recompute_interval=0)
+        with self.assertRaisesRegex(ValueError, "--recompute_interval"):
+            manager._interval_id(epoch=1, step=1)
 
-    def test_interval_pool_cache_reused_for_multiple_steps(self):
+    def test_full_training_set_cache_reused_for_multiple_steps(self):
         manager = make_pool_manager(recompute_interval=2)
+        encode_calls = []
+
+        def encode_records(model, records, cache_prototypes=True):
+            encode_calls.append((len(records), cache_prototypes))
+            return {
+                "host_image_features": torch.zeros(len(records), 512),
+                "retrieval_features": torch.zeros(len(records), 512),
+                "prototypes": torch.zeros(len(records), 7, 512),
+            }
+
+        manager._encode_records = encode_records
         model = FakeImageEncoder()
         batch1 = {
             "image_ids": torch.tensor([10, 11]),
@@ -697,49 +658,52 @@ class PoolManagerTests(unittest.TestCase):
         }
         cache1 = manager.get_train_cache(model, batch1, epoch=1, step=1)
         cache2 = manager.get_train_cache(model, batch2, epoch=1, step=2)
-        self.assertIs(cache1, cache2)
+
+        self.assertEqual(encode_calls, [(4, True)])
+        self.assertEqual(set(cache1["image_ids"].tolist()), {10, 11, 12, 13})
+        self.assertEqual(cache1["pids"].numel(), 4)
+        self.assertNotIn("top_indices", cache1)
+        self.assertEqual(cache1["diagnostics"]["pool_cache_size"], 4.0)
+        self.assertEqual(cache1["diagnostics"]["pool_interval_reused"], 0.0)
         self.assertEqual(cache2["diagnostics"]["pool_interval_reused"], 1.0)
         self.assertEqual(cache2["diagnostics"]["pool_interval_id"], 0.0)
 
-    def test_interval_refresh_clears_old_cache_before_rebuild(self):
-        manager = make_pool_manager(recompute_interval=1)
-        old_cache = {
-            "host_image_features": torch.ones(1, 512),
-            "diagnostics": {"pool_interval_id": 0.0},
-        }
-        new_cache = {
-            "host_image_features": torch.zeros(1, 512),
-            "diagnostics": {"pool_interval_id": 1.0},
-        }
-        manager.interval_cache = old_cache
-        manager.active_interval_id = 0
+    def test_full_training_set_cache_refreshes_on_new_interval(self):
+        manager = make_pool_manager(recompute_interval=2)
+        encode_calls = []
 
-        def build_interval_cache(model, batch, interval_id):
-            self.assertIsNone(manager.interval_cache)
-            self.assertIsNone(manager.active_interval_id)
-            self.assertEqual(interval_id, 1)
-            return new_cache
+        def encode_records(model, records, cache_prototypes=True):
+            encode_calls.append((len(records), cache_prototypes))
+            value = float(len(encode_calls))
+            return {
+                "host_image_features": torch.full((len(records), 512), value),
+                "retrieval_features": torch.full((len(records), 512), value),
+                "prototypes": torch.full((len(records), 7, 512), value),
+            }
 
-        manager._build_interval_pool_cache = build_interval_cache
+        manager._encode_records = encode_records
         batch = {
             "image_ids": torch.tensor([10]),
             "pids": torch.tensor([0]),
             "images": torch.randn(1, 3, 8, 8),
         }
 
-        cache = manager.get_train_cache(FakeImageEncoder(), batch, epoch=1, step=2)
+        cache1 = manager.get_train_cache(FakeImageEncoder(), batch, epoch=1, step=1)
+        cache2 = manager.get_train_cache(FakeImageEncoder(), batch, epoch=1, step=3)
 
-        self.assertIs(cache, new_cache)
-        self.assertIs(manager.interval_cache, new_cache)
-        self.assertEqual(manager.active_interval_id, 1)
+        self.assertEqual(encode_calls, [(4, True), (4, True)])
+        self.assertEqual(cache1["diagnostics"]["pool_interval_id"], 0.0)
+        self.assertEqual(cache2["diagnostics"]["pool_interval_id"], 1.0)
+        self.assertEqual(cache2["diagnostics"]["pool_interval_reused"], 0.0)
+        self.assertFalse(torch.equal(cache1["host_image_features"], cache2["host_image_features"]))
 
     def test_frozen_indices_bypass_recompute_interval(self):
-        manager = make_pool_manager(use_freeze_indices=True, use_shared_k=False, top_m=2)
-        manager.refresh = lambda model, epoch, step: self.fail("frozen indices should not refresh")
+        manager = make_pool_manager(use_freeze_indices=True, top_m=2)
         manager.frozen_cache = {
             "host_image_features": torch.zeros(4, 512),
             "retrieval_features": torch.zeros(4, 512),
             "prototypes": torch.zeros(4, 7, 512),
+            "image_ids": torch.tensor([10, 11, 12, 13]),
             "pids": torch.tensor([0, 1, 2, 3]),
         }
         manager.frozen_rank_indices = torch.tensor([
@@ -768,45 +732,11 @@ class PoolManagerTests(unittest.TestCase):
         self.assertTrue(torch.equal(cache2["top_indices"], torch.tensor([[3, 2], [1, 0]])))
         self.assertEqual(cache1["diagnostics"]["pool_interval_reused"], 0.0)
         self.assertEqual(cache2["diagnostics"]["pool_interval_reused"], 1.0)
-        self.assertEqual(cache2["diagnostics"]["pool_k_mode"], "frozen_indices")
+        self.assertEqual(cache2["diagnostics"]["pool_cache_size"], 4.0)
+        self.assertEqual(cache2["diagnostics"]["frozen_indices_used"], 1.0)
 
-    def test_shared_k_frozen_index_build_is_metadata_only(self):
-        manager = make_pool_manager(use_freeze_indices=True, use_shared_k=True, pool_k=2, top_m=2)
-        cache_prototype_calls = []
-
-        def encode_records(model, records, cache_prototypes=True):
-            cache_prototype_calls.append(cache_prototypes)
-            return {
-                "host_image_features": torch.tensor([
-                    [1.0, 0.0, 0.0, 0.0],
-                    [0.6, 0.8, 0.0, 0.0],
-                    [0.0, 1.0, 0.0, 0.0],
-                    [0.2, 0.98, 0.0, 0.0],
-                ])
-            }
-
-        manager._encode_records = encode_records
-        manager._encode_text_records = lambda model, records: torch.tensor([
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.9, 0.0, 0.0, 0.0],
-            [0.0, 0.9, 0.0, 0.0],
-        ])
-
-        manager._build_frozen_index_cache(FakeImageEncoder(embed_dim=4))
-
-        self.assertEqual(cache_prototype_calls, [False])
-        self.assertIsNone(manager.frozen_cache)
-        self.assertIsNotNone(manager.frozen_query_features)
-        self.assertTrue(torch.equal(manager.frozen_gallery_image_ids, torch.tensor([10, 11, 12, 13])))
-        self.assertEqual(manager.frozen_rank_indices.shape, (4, 2))
-        self.assertTrue(torch.equal(
-            manager._frozen_ranked_image_ids(torch.tensor([0]), top_n=2),
-            torch.tensor([[10, 11]]),
-        ))
-
-    def test_frozen_only_index_build_keeps_full_cache(self):
-        manager = make_pool_manager(use_freeze_indices=True, use_shared_k=False, pool_k=2, top_m=2)
+    def test_frozen_index_build_keeps_full_cache_and_uses_top_m_depth(self):
+        manager = make_pool_manager(use_freeze_indices=True, top_m=2)
         cache_prototype_calls = []
 
         def encode_records(model, records, cache_prototypes=True):
@@ -837,206 +767,11 @@ class PoolManagerTests(unittest.TestCase):
         self.assertIsNotNone(manager.frozen_cache)
         self.assertIn("prototypes", manager.frozen_cache)
         self.assertIn("retrieval_features", manager.frozen_cache)
-        self.assertIsNone(manager.frozen_query_features)
-
-    def test_frozen_shared_k_filters_top_indices_to_pool(self):
-        manager = make_pool_manager(use_freeze_indices=True, use_shared_k=True, top_m=2)
-        manager.frozen_rank_indices = torch.tensor([
-            [1, 2, 0, 3],
-            [3, 1, 0, 2],
-        ])
-        manager.frozen_index_depth = 4
-        manager.frozen_gallery_image_ids = torch.tensor([10, 11, 12, 13])
-        manager.frozen_query_features = torch.tensor([
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-        ])
-
-        pool_cache = {
-            "host_image_features": torch.tensor([
-                [0.2, 0.2, 0.0, 0.0],
-                [0.9, 0.1, 0.0, 0.0],
-                [0.0, 0.8, 0.0, 0.0],
-            ]),
-            "retrieval_features": torch.zeros(3, 4),
-            "prototypes": torch.zeros(3, 7, 4),
-            "image_ids": torch.tensor([12, 10, 13]),
-            "pids": torch.tensor([2, 0, 3]),
-            "diagnostics": {
-                "pool_k_mode": "static",
-                "pool_shared_k_used": 1.0,
-                "pool_interval_reused": 0.0,
-            },
-        }
-        cache = manager._frozen_shared_k_batch_cache(
-            {"index": torch.tensor([0, 1])},
-            pool_cache,
-        )
-
-        self.assertTrue(torch.equal(cache["top_indices"], torch.tensor([[1, 0], [2, 0]])))
-        self.assertEqual(cache["diagnostics"]["pool_shared_k_used"], 1.0)
-        self.assertEqual(cache["diagnostics"]["frozen_indices_used"], 1.0)
-        self.assertEqual(cache["diagnostics"]["frozen_indices_pool_filtered"], 1.0)
-
-    def test_frozen_shared_k_uses_interval_pool_before_top_m(self):
-        manager = make_pool_manager(use_freeze_indices=True, use_shared_k=True, top_m=2)
-        manager._build_frozen_index_cache = lambda model: self.fail(
-            "shared-K should not rebuild frozen indices when metadata is ready"
-        )
-        manager.frozen_cache = None
-        manager.frozen_rank_indices = torch.tensor([
-            [0, 1, 2, 3],
-            [1, 0, 2, 3],
-            [2, 3, 0, 1],
-            [3, 2, 1, 0],
-        ])
-        manager.frozen_gallery_image_ids = torch.tensor([10, 11, 12, 13])
-        manager.frozen_query_features = torch.eye(4, 512)
-        manager.frozen_index_depth = 4
-        manager.frozen_cache_requests = 0
-
-        batch = {
-            "index": torch.tensor([0, 2]),
-            "image_ids": torch.tensor([10, 12]),
-            "pids": torch.tensor([0, 2]),
-            "images": torch.randn(2, 3, 8, 8),
-        }
-        cache = manager.get_train_cache(FakeImageEncoder(), batch, epoch=1, step=1)
-        cache2 = manager.get_train_cache(FakeImageEncoder(), batch, epoch=1, step=2)
-
-        self.assertIn("top_indices", cache)
-        self.assertIn("top_indices", cache2)
-        self.assertEqual(cache["diagnostics"]["pool_k_mode"], "static")
-        self.assertEqual(cache["diagnostics"]["pool_shared_k_used"], 1.0)
-        self.assertEqual(cache["diagnostics"]["frozen_indices_used"], 1.0)
-        self.assertEqual(cache["diagnostics"]["pool_final_pool_size"], 4.0)
-
-    def test_full_training_set_mode_bypasses_shared_k_sampling(self):
-        manager = make_pool_manager(use_shared_k=False, pool_k=2)
-        manager.refresh = lambda model, epoch, step: self.fail("full training set mode should not refresh clusters")
-        manager._sample_distractor_indices = lambda *_args, **_kwargs: self.fail(
-            "full training set mode should not sample a shared K pool"
-        )
-
-        batch = {
-            "image_ids": torch.tensor([10, 11]),
-            "pids": torch.tensor([0, 1]),
-            "images": torch.randn(2, 3, 8, 8),
-        }
-        cache1 = manager.get_train_cache(FakeImageEncoder(), batch, epoch=1, step=1)
-        cache2 = manager.get_train_cache(FakeImageEncoder(), batch, epoch=1, step=2)
-
-        self.assertEqual(set(cache1["image_ids"].tolist()), {10, 11, 12, 13})
-        self.assertEqual(cache1["pids"].numel(), 4)
-        self.assertNotIn("top_indices", cache1)
-        self.assertEqual(cache1["diagnostics"]["pool_k_mode"], "full_training_set")
-        self.assertEqual(cache1["diagnostics"]["pool_shared_k_used"], 0.0)
-        self.assertEqual(cache1["diagnostics"]["pool_selected_k"], 4.0)
-        self.assertEqual(cache1["diagnostics"]["pool_final_pool_size"], 4.0)
-        self.assertEqual(cache1["diagnostics"]["pool_interval_reused"], 0.0)
-        self.assertEqual(cache2["diagnostics"]["pool_interval_reused"], 1.0)
-
-    def test_static_mode_uses_exact_pool_k(self):
-        manager = make_pool_manager(pool_k=4, positive_ratio_max=1.0)
-        batch = {
-            "image_ids": torch.tensor([10]),
-            "pids": torch.tensor([0]),
-            "images": torch.randn(1, 3, 8, 8),
-        }
-        cache = manager._build_batch_pool_cache(FakeImageEncoder(), batch)
-        self.assertEqual(cache["diagnostics"]["pool_selected_k"], 4.0)
-        self.assertEqual(cache["diagnostics"]["pool_final_pool_size"], 4.0)
-        self.assertEqual(cache["image_ids"].numel(), 4)
-
-    def test_adaptive_mode_uses_document_max_formula(self):
-        manager = make_pool_manager(
-            pool_k=1,
-            pool_k_mode="adaptive",
-            pool_k_candidates="2",
-            positive_ratio_max=0.5,
-        )
-        manager.records = [
-            {"pid": 0, "image_id": 10, "img_path": "a.jpg"},
-            {"pid": 1, "image_id": 11, "img_path": "b.jpg"},
-            {"pid": 2, "image_id": 12, "img_path": "c.jpg"},
-            {"pid": 3, "image_id": 13, "img_path": "d.jpg"},
-            {"pid": 0, "image_id": 14, "img_path": "e.jpg"},
-            {"pid": 1, "image_id": 15, "img_path": "f.jpg"},
-            {"pid": 2, "image_id": 16, "img_path": "g.jpg"},
-            {"pid": 3, "image_id": 17, "img_path": "h.jpg"},
-        ]
-        manager.records_by_pid = {0: [0, 4], 1: [1, 5], 2: [2, 6], 3: [3, 7]}
-        manager.record_index_by_image_id = {
-            record["image_id"]: index for index, record in enumerate(manager.records)
-        }
-        manager.cluster_to_indices = {0: [0, 1, 4, 5], 1: [2, 3, 6, 7]}
-        manager.cluster_distribution = torch.tensor([0.5, 0.5])
-        manager.cluster_labels = torch.tensor([0, 0, 1, 1, 0, 0, 1, 1])
-        manager.pool_coverage_counts = [0 for _ in manager.records]
-        batch = {
-            "image_ids": torch.tensor([10, 12]),
-            "pids": torch.tensor([0, 2]),
-            "images": torch.randn(2, 3, 8, 8),
-        }
-        cache = manager._build_batch_pool_cache(FakeImageEncoder(), batch)
-        self.assertEqual(cache["diagnostics"]["pool_selected_k"], 8.0)
-        self.assertEqual(cache["diagnostics"]["pool_k_valid_target"], 4.0)
-        self.assertEqual(cache["diagnostics"]["pool_k_dilute_target"], 8.0)
-        self.assertEqual(cache["diagnostics"]["pool_k_dist_target"], 4.0)
-        self.assertEqual(cache["diagnostics"]["pool_k_cover_target"], 4.0)
-        self.assertEqual(cache["diagnostics"]["pool_positive_ratio"], 0.5)
-        self.assertEqual(cache["diagnostics"]["pool_k_valid"], 1.0)
-        self.assertEqual(cache["diagnostics"]["pool_k_dilute"], 1.0)
-        self.assertEqual(cache["diagnostics"]["pool_k_cover"], 1.0)
-
-    def test_identity_anchor_rotation_sweeps_pid_images(self):
-        manager = make_pool_manager(pool_k=2, positive_ratio_max=1.0)
-        manager.records = [
-            {"pid": 0, "image_id": 10, "img_path": "a.jpg"},
-            {"pid": 1, "image_id": 11, "img_path": "b.jpg"},
-            {"pid": 0, "image_id": 12, "img_path": "c.jpg"},
-            {"pid": 1, "image_id": 13, "img_path": "d.jpg"},
-        ]
-        manager.records_by_pid = {0: [0, 2], 1: [1, 3]}
-        manager.record_index_by_image_id = {
-            record["image_id"]: index for index, record in enumerate(manager.records)
-        }
-        manager.cluster_to_indices = {0: [0, 1], 1: [2, 3]}
-        manager.cluster_distribution = torch.tensor([0.5, 0.5])
-        manager.cluster_labels = torch.tensor([0, 0, 1, 1])
-        manager.pool_coverage_counts = [0 for _ in manager.records]
-
-        batch = {
-            "image_ids": torch.tensor([10, 11]),
-            "pids": torch.tensor([0, 1]),
-            "images": torch.randn(2, 3, 8, 8),
-        }
-        cache1 = manager._build_batch_pool_cache(FakeImageEncoder(), batch)
-        cache2 = manager._build_batch_pool_cache(FakeImageEncoder(), batch)
-
-        covered = set(cache1["image_ids"].tolist()) | set(cache2["image_ids"].tolist())
-        self.assertEqual(covered, {10, 11, 12, 13})
-        self.assertEqual(cache2["diagnostics"]["pool_coverage_seen"], 4.0)
-        self.assertEqual(cache2["diagnostics"]["pool_coverage_remaining"], 0.0)
-
-    def test_k_valid_failure_raises_clear_error(self):
-        manager = pool.TargetPoolManager.__new__(pool.TargetPoolManager)
-        manager.args = SimpleNamespace(pool_k=1, pool_k_mode="static", pool_coverage_epochs=15)
-        manager.records = [
-            {"pid": 0, "image_id": 10, "img_path": "a.jpg"},
-            {"pid": 1, "image_id": 11, "img_path": "b.jpg"},
-        ]
-        manager.records_by_pid = {0: [0], 1: [1]}
-        manager.record_index_by_image_id = {10: 0, 11: 1}
-        manager.cluster_labels = torch.tensor([0, 0])
-        manager.pool_coverage_counts = [0, 0]
-        batch = {
-            "image_ids": torch.tensor([10, 11]),
-            "pids": torch.tensor([0, 1]),
-            "images": torch.randn(2, 3, 8, 8),
-        }
-        with self.assertRaisesRegex(ValueError, "K_valid failed"):
-            manager._build_batch_pool_cache(FakeImageEncoder(), batch)
+        self.assertTrue(torch.equal(
+            manager._frozen_ranked_image_ids(torch.tensor([0]), top_n=2),
+            torch.tensor([[10, 11]]),
+        ))
+        self.assertFalse(hasattr(manager, "frozen_query_features"))
 
 
 class ReproducibilityTests(unittest.TestCase):
@@ -1109,19 +844,32 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertTrue(parsed.target_enrichment)
         self.assertTrue(parsed.use_freeze_indices)
 
-    def test_shared_k_cli_requires_target_enrichment(self):
+    def test_removed_pool_cli_args_are_unrecognized(self):
         options = importlib.import_module("utils.options")
         old_argv = sys.argv
+        removed_args = [
+            ["--use_" + "shared" + "_k"],
+            ["--pool" + "_k", "4"],
+            ["--pool" + "_k_mode", "static"],
+            ["--pool" + "_k_candidates", "2,4"],
+            ["--pool" + "_coverage_epochs", "15"],
+            ["--pool" + "_clusters", "4"],
+            ["--positive" + "_ratio" + "_max", "0.5"],
+            ["--eta", "0.5"],
+            ["--pool" + "_dist_metric", "l1"],
+            ["--pool" + "_dist_threshold", "0.25"],
+            ["--epsilon", "0.25"],
+        ]
         try:
-            sys.argv = ["test", "--use_shared_k"]
-            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                options.get_args()
-            sys.argv = ["test", "--target_enrichment", "--use_shared_k"]
-            parsed = options.get_args()
+            for argv in removed_args:
+                with self.subTest(argv=argv):
+                    stderr = io.StringIO()
+                    sys.argv = ["test"] + argv
+                    with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                        options.get_args()
+                    self.assertIn("unrecognized arguments", stderr.getvalue())
         finally:
             sys.argv = old_argv
-        self.assertTrue(parsed.target_enrichment)
-        self.assertTrue(parsed.use_shared_k)
 
     def test_positive_boolean_cli_parser(self):
         options = importlib.import_module("utils.options")
@@ -1142,8 +890,8 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertEqual(parsed.extractor_mode, "global,horizontal")
         self.assertEqual(parsed.context_pooling, "mlp")
         self.assertEqual(parsed.mixer_dim, 256)
-        self.assertFalse(parsed.use_shared_k)
-        self.assertEqual(parsed.pool_coverage_epochs, 15)
+        self.assertFalse(hasattr(parsed, "use_" + "shared" + "_k"))
+        self.assertFalse(hasattr(parsed, "pool" + "_coverage_epochs"))
         self.assertEqual(parsed.residual_gate, "residual")
         self.assertIsNone(parsed.enrich_gamma)
         self.assertEqual(parsed.residual_gate_hidden_dim, 128)

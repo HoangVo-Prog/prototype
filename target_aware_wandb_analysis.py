@@ -29,21 +29,12 @@ GROUPS = {
         "target_enrichment",
         "enrichment_start",
         "enrichment_space",
-        "pool_k_mode",
-        "pool_k",
-        "pool_k_candidates",
-        "use_shared_k",
-        "pool_coverage_epochs",
         "top_m",
         "extractor_mode",
         "num_parts",
         "use_freeze_indices",
         "pnp_text_only",
         "robust_hard_k",
-        "pool_clusters",
-        "positive_ratio_max",
-        "pool_dist_metric",
-        "pool_dist_threshold",
         "enrich_gamma",
         "residual_gate",
         "residual_gate_hidden_dim",
@@ -74,8 +65,6 @@ PARAMS = [param for params in GROUPS.values() for param in params]
 ALIASES = {
     "freeze_indices": "use_freeze_indices",
     "hard_neg_k": "robust_hard_k",
-    "eta": "positive_ratio_max",
-    "epsilon": "pool_dist_threshold",
     "gate_mode": "residual_gate",
     "pool_interval": "recompute_interval",
     "mixer_context_pooling": "context_pooling",
@@ -85,11 +74,6 @@ CLI_META = {
     "target_enrichment": {"default": False, "kind": "flag", "choices": "", "aliases": "", "validation": ""},
     "enrichment_start": {"default": 1, "kind": "int", "choices": "", "aliases": "", "validation": ">= 1"},
     "enrichment_space": {"default": "global", "kind": "str", "choices": "global, grab", "aliases": "", "validation": ""},
-    "pool_k_mode": {"default": "static", "kind": "str", "choices": "static, adaptive", "aliases": "", "validation": ""},
-    "pool_k": {"default": 1024, "kind": "int", "choices": "", "aliases": "", "validation": ""},
-    "pool_k_candidates": {"default": "512,1024,2048,4096,8192", "kind": "str", "choices": "", "aliases": "", "validation": ""},
-    "use_shared_k": {"default": False, "kind": "flag", "choices": "", "aliases": "", "validation": "requires target_enrichment"},
-    "pool_coverage_epochs": {"default": 15, "kind": "int", "choices": "", "aliases": "", "validation": ">= 1"},
     "top_m": {"default": 32, "kind": "int", "choices": "", "aliases": "", "validation": ""},
     "extractor_mode": {
         "default": "global,horizontal",
@@ -108,10 +92,6 @@ CLI_META = {
         "validation": "requires freeze_host, no_use_host_loss, use_freeze_indices, enrichment_space=global",
     },
     "robust_hard_k": {"default": 32, "kind": "int", "choices": "", "aliases": "--hard_neg_k", "validation": ""},
-    "pool_clusters": {"default": 16, "kind": "int", "choices": "", "aliases": "", "validation": ""},
-    "positive_ratio_max": {"default": 0.5, "kind": "float", "choices": "", "aliases": "--eta", "validation": ""},
-    "pool_dist_metric": {"default": "l1", "kind": "str", "choices": "l1, js", "aliases": "", "validation": ""},
-    "pool_dist_threshold": {"default": 0.25, "kind": "float", "choices": "", "aliases": "--epsilon", "validation": ""},
     "enrich_gamma": {"default": None, "kind": "optional_float", "choices": "", "aliases": "", "validation": "required only when residual_gate=static; forbidden when residual_gate=residual"},
     "residual_gate": {"default": "residual", "kind": "str", "choices": "static, residual", "aliases": "--gate_mode", "validation": ""},
     "residual_gate_hidden_dim": {"default": 128, "kind": "int", "choices": "", "aliases": "", "validation": ">= 1"},
@@ -504,10 +484,10 @@ def loss_profile(row: pd.Series) -> str:
     return "neither"
 
 
-def pool_profile(row: pd.Series) -> str:
+def cache_profile(row: pd.Series) -> str:
     return (
-        f"{value_key(row['cfg__pool_k_mode'])}/k={value_key(row['cfg__pool_k'])}/"
-        f"top_m={value_key(row['cfg__top_m'])}/shared={value_key(row['cfg__use_shared_k'])}"
+        f"top_m={value_key(row['cfg__top_m'])}/"
+        f"frozen={value_key(row['cfg__use_freeze_indices'])}"
     )
 
 
@@ -535,11 +515,11 @@ def run_analysis() -> str:
     data["_capacity_score"] = data.apply(capacity_score, axis=1)
     data["_capacity_bucket"] = data["_capacity_score"].map(capacity_bucket)
     data["_loss_profile"] = data.apply(loss_profile, axis=1)
-    data["_pool_profile"] = data.apply(pool_profile, axis=1)
+    data["_cache_profile"] = data.apply(cache_profile, axis=1)
     valid["_capacity_score"] = valid.apply(capacity_score, axis=1)
     valid["_capacity_bucket"] = valid["_capacity_score"].map(capacity_bucket)
     valid["_loss_profile"] = valid.apply(loss_profile, axis=1)
-    valid["_pool_profile"] = valid.apply(pool_profile, axis=1)
+    valid["_cache_profile"] = valid.apply(cache_profile, axis=1)
 
     parser_default_values = {param: parser_defaults.get(param, CLI_META[param]["default"]) for param in PARAMS}
     default_runs = valid[valid["_diff_count"].eq(0)].copy()
@@ -804,14 +784,10 @@ def run_analysis() -> str:
     lines.append("")
     interaction_specs = [
         ("enrichment_space x extractor_mode", ["enrichment_space", "extractor_mode"]),
-        ("pool_k_mode x pool_k", ["pool_k_mode", "pool_k"]),
-        ("use_shared_k x pool_k x top_m", ["use_shared_k", "pool_k", "top_m"]),
         ("top_m x robust_hard_k", ["top_m", "robust_hard_k"]),
         ("residual_gate x enrich_gamma", ["residual_gate", "enrich_gamma"]),
         ("residual_gate x residual_gate_hidden_dim", ["residual_gate", "residual_gate_hidden_dim"]),
         ("recompute_level x recompute_interval", ["recompute_level", "recompute_interval"]),
-        ("positive_ratio_max x pool_dist_threshold", ["positive_ratio_max", "pool_dist_threshold"]),
-        ("pool_clusters x pool_dist_metric", ["pool_clusters", "pool_dist_metric"]),
         ("mixer_dim x mixer_depth", ["mixer_dim", "mixer_depth"]),
         ("mixer_depth x mixer_hidden_channel", ["mixer_depth", "mixer_hidden_channel"]),
         ("mixer_depth x mixer_hidden_readout", ["mixer_depth", "mixer_hidden_readout"]),
@@ -822,7 +798,7 @@ def run_analysis() -> str:
         ("lambda_rob x lambda_gain", ["lambda_rob", "lambda_gain"]),
         ("lambda_gain x gain_margin", ["lambda_gain", "gain_margin"]),
         ("extractor_mode/num_parts x mixer_hidden_part", ["extractor_mode", "num_parts", "mixer_hidden_part"]),
-        ("top_m/pool_k x mixer_hidden_rank", ["top_m", "pool_k", "mixer_hidden_rank"]),
+        ("top_m x mixer_hidden_rank", ["top_m", "mixer_hidden_rank"]),
         ("robust_hard_k x lambda_rob/gain_margin", ["robust_hard_k", "lambda_rob", "gain_margin"]),
     ]
     interaction_rows = []
@@ -833,7 +809,7 @@ def run_analysis() -> str:
     derived_specs = [
         ("small-capacity vs large-capacity mixer profile", ["_capacity_bucket"]),
         ("retrieval loss only vs robust loss only vs both", ["_loss_profile"]),
-        ("target enrichment pool settings x mixer capacity", ["_pool_profile", "_capacity_bucket"]),
+        ("target enrichment cache profile x mixer capacity", ["_cache_profile", "_capacity_bucket"]),
         ("residual gate settings x target-aware loss profile", ["cfg__residual_gate", "_loss_profile"]),
     ]
     for label, cols in derived_specs:
@@ -861,7 +837,7 @@ def run_analysis() -> str:
     lines.append("## 7. Capacity And Stability Analysis")
     lines.append("")
     cap_rows = []
-    for param in ["mixer_dim", "mixer_depth", "mixer_hidden_channel", "mixer_hidden_readout", "mixer_hidden_part", "mixer_hidden_rank", "top_m", "pool_k", "num_parts", "robust_hard_k", "residual_gate_hidden_dim"]:
+    for param in ["mixer_dim", "mixer_depth", "mixer_hidden_channel", "mixer_hidden_readout", "mixer_hidden_part", "mixer_hidden_rank", "top_m", "num_parts", "robust_hard_k", "residual_gate_hidden_dim"]:
         rows = marginal_table(valid, param)
         if len(rows) <= 1:
             cap_rows.append([param, "fixed", rows[0][0] if rows else value_key(CLI_META[param]["default"]), "not enough evidence"])
@@ -886,7 +862,7 @@ def run_analysis() -> str:
     lines.append(md_table(["Capacity parameter", "Observed values", "Fixed value", "Direction"], cap_rows))
     lines.append("")
     crash_rows = []
-    for param in ["mixer_dim", "mixer_depth", "mixer_hidden_channel", "mixer_hidden_readout", "mixer_hidden_part", "mixer_hidden_rank", "top_m", "pool_k", "num_parts", "robust_hard_k", "residual_gate_hidden_dim"]:
+    for param in ["mixer_dim", "mixer_depth", "mixer_hidden_channel", "mixer_hidden_readout", "mixer_hidden_part", "mixer_hidden_rank", "top_m", "num_parts", "robust_hard_k", "residual_gate_hidden_dim"]:
         if param in data.columns:
             for value, df in data.groupby(f"cfg__{param}", dropna=False):
                 crashes = int(df["_state"].eq("crashed").sum())
