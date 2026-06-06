@@ -193,6 +193,9 @@ class Evaluator():
         for key in cache_chunks[0].keys():
             target_cache[key] = torch.cat([chunk[key] for chunk in cache_chunks], dim=0).to(device)
         target_cache["pids"] = gids.to(device)
+        core_model = model.module if hasattr(model, "module") else model
+        if hasattr(core_model, "finalize_target_cache"):
+            target_cache = core_model.finalize_target_cache(target_cache)
         return target_cache, gids.cpu()
 
     def _compute_enriched_text_embedding(self, model, target_cache):

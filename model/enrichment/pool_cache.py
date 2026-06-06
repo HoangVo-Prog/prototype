@@ -249,6 +249,8 @@ class TargetPoolCacheMixin:
         merged = {}
         for key in chunks[0].keys():
             merged[key] = torch.cat([chunk[key] for chunk in chunks], dim=0)
+        if cache_prototypes and hasattr(core_model, "finalize_target_cache"):
+            merged = core_model.finalize_target_cache(merged)
         return merged
 
     def _encode_text_records(self, model, records):

@@ -244,6 +244,60 @@ class EnrichmentShapeTests(unittest.TestCase):
                 norms = prototypes.norm(dim=-1)
                 self.assertTrue(torch.allclose(norms, torch.ones_like(norms), atol=1e-5))
 
+    def test_evidence_modes_produce_expected_slot_counts(self):
+        token_features = torch.randn(2, 13, 16)
+        retrieval_features = torch.randn(2, 16)
+        expected_slots = {
+            "retrieval_backbone": 1,
+            "cluster": 1,
+            "cluster_residual": 1,
+            "cluster_density": 1,
+            "cluster_rarity": 1,
+            "global,retrieval_backbone,cluster": 3,
+            "grid,cluster,cluster_residual,cluster_density,cluster_rarity": 8,
+        }
+        for mode, slot_count in expected_slots.items():
+            with self.subTest(mode=mode):
+                evidence = modules.build_evidence_bank(
+                    token_features,
+                    num_parts=2,
+                    grid_size=(3, 4),
+                    mode=mode,
+                    retrieval_features=retrieval_features,
+                )
+                self.assertEqual(evidence.shape, (2, slot_count, 16))
+                self.assertEqual(modules.prototype_slot_count(mode, 2), slot_count)
+
+    def test_target_relative_finalizer_fills_full_pool_evidence(self):
+        cfg = args(
+            extractor_mode="cluster,cluster_residual,cluster_density,cluster_rarity",
+            target_relative_space="host_global",
+            target_relative_num_clusters=2,
+            target_relative_cluster_method="kmeans",
+            evidence_projection="auto",
+        )
+        cache = {
+            "host_image_features": torch.tensor([
+                [1.0, 0.0],
+                [0.9, 0.1],
+                [0.0, 1.0],
+                [0.1, 0.9],
+            ]),
+            "retrieval_features": torch.randn(4, 2),
+            "evidence_bank": torch.zeros(4, 4, 2),
+        }
+        finalized = modules.finalize_target_evidence_cache(cache, cfg, evidence_dim=2)
+        self.assertTrue(torch.equal(finalized["prototypes"], finalized["evidence_bank"]))
+        self.assertEqual(finalized["evidence_bank"].shape, (4, 4, 2))
+        self.assertIn("cluster_density_scalar", finalized)
+        self.assertIn("cluster_rarity_scalar", finalized)
+        self.assertIn("target_relative_cluster_ids", finalized)
+        self.assertEqual(finalized["cluster_density_scalar"].shape, (4, 1))
+        self.assertEqual(finalized["cluster_rarity_scalar"].shape, (4, 1))
+        self.assertTrue(torch.isfinite(finalized["evidence_bank"]).all())
+        self.assertTrue(torch.isfinite(finalized["cluster_density_scalar"]).all())
+        self.assertTrue(torch.isfinite(finalized["cluster_rarity_scalar"]).all())
+
     def test_vertical_and_grid_extractors_require_grid_shape(self):
         token_features = torch.randn(2, 13, 16)
         with self.assertRaisesRegex(ValueError, "requires a valid patch grid_size"):
@@ -624,6 +678,74 @@ class EnrichmentShapeTests(unittest.TestCase):
             space="global",
         )
         self.assertTrue(torch.equal(out["top_indices"].cpu(), torch.tensor([[2]])))
+
+    def test_extractor_mode_does_not_override_topm_rank_space(self):
+        enricher = modules.TargetPrototypeEnricher(
+            4,
+            8,
+            args(
+                extractor_mode="retrieval_backbone",
+                top_m=1,
+                robust_hard_k=1,
+                use_target_retrieval_loss=False,
+                use_target_robust_loss=False,
+                topm_rank_space="host_global",
+            ),
+        ).float()
+        cache = {
+            "host_image_features": torch.tensor([
+                [0.0, 1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+            ]),
+            "retrieval_features": torch.tensor([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+            ]),
+            "evidence_bank": torch.randn(2, 1, 4),
+            "prototypes": torch.randn(2, 1, 4),
+            "pids": torch.tensor([0, 1]),
+        }
+        out = enricher(
+            query_features=torch.tensor([[1.0, 0.0, 0.0, 0.0]], requires_grad=True),
+            host_text_features=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            query_pids=torch.tensor([0]),
+            pool_cache=cache,
+            space="global",
+        )
+        self.assertTrue(torch.equal(out["top_indices"].cpu(), torch.tensor([[1]])))
+
+    def test_scalar_target_relative_evidence_is_projected_after_gather(self):
+        enricher = modules.TargetPrototypeEnricher(
+            4,
+            8,
+            args(
+                extractor_mode="cluster_density",
+                top_m=2,
+                robust_hard_k=1,
+                use_target_retrieval_loss=False,
+                use_target_robust_loss=False,
+            ),
+        ).float()
+        cache = {
+            "host_image_features": torch.randn(3, 4),
+            "retrieval_features": torch.randn(3, 4),
+            "evidence_bank": torch.zeros(3, 1, 4),
+            "prototypes": torch.zeros(3, 1, 4),
+            "cluster_density_scalar": torch.tensor([[0.0], [1.0], [-1.0]]),
+            "target_relative_cluster_ids": torch.tensor([0, 0, 1]),
+            "pids": torch.tensor([0, 1, 2]),
+        }
+        out = enricher(
+            query_features=torch.randn(2, 4, requires_grad=True),
+            host_text_features=torch.randn(2, 4),
+            query_pids=torch.tensor([0, 1]),
+            pool_cache=cache,
+            space="global",
+        )
+        out["enriched_features"].sum().backward()
+        grad = enricher.scalar_evidence_projectors["cluster_density"].weight.grad
+        self.assertIsNotNone(grad)
+        self.assertTrue(torch.isfinite(grad).all())
 
     def test_top_m_rank_space_hybrid_fuses_global_and_grab_scores(self):
         enricher = modules.TargetPrototypeEnricher(
@@ -1034,6 +1156,11 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertFalse(parsed.pnp_text_only)
         self.assertEqual(parsed.topm_rank_space, "host_global")
         self.assertEqual(parsed.topm_rank_lambda, 0.5)
+        self.assertEqual(parsed.target_relative_space, "host_global")
+        self.assertEqual(parsed.target_relative_num_clusters, 16)
+        self.assertEqual(parsed.target_relative_cluster_method, "kmeans")
+        self.assertEqual(parsed.evidence_token_budget, 0)
+        self.assertEqual(parsed.evidence_projection, "auto")
         self.assertEqual(parsed.wandb_project, "enrichment")
 
     def test_wandb_project_cli_parses_and_validates_name(self):
@@ -1100,10 +1227,31 @@ class SchedulerOptionTests(unittest.TestCase):
         options = importlib.import_module("utils.options")
         old_argv = sys.argv
         try:
-            sys.argv = ["test", "--extractor_mode", "global,grid,vertical,horizontal", "--num_parts", "3"]
+            sys.argv = [
+                "test",
+                "--extractor_mode",
+                "global,grid,vertical,horizontal,retrieval_backbone,cluster,cluster_residual,cluster_density,cluster_rarity",
+                "--num_parts",
+                "3",
+                "--target_relative_space",
+                "retrieval",
+                "--target_relative_num_clusters",
+                "8",
+                "--evidence_token_budget",
+                "64",
+                "--evidence_projection",
+                "linear",
+            ]
             parsed = options.get_args()
-            self.assertEqual(parsed.extractor_mode, "global,grid,vertical,horizontal")
+            self.assertEqual(
+                parsed.extractor_mode,
+                "global,grid,vertical,horizontal,retrieval_backbone,cluster,cluster_residual,cluster_density,cluster_rarity",
+            )
             self.assertEqual(parsed.num_parts, 3)
+            self.assertEqual(parsed.target_relative_space, "retrieval")
+            self.assertEqual(parsed.target_relative_num_clusters, 8)
+            self.assertEqual(parsed.evidence_token_budget, 64)
+            self.assertEqual(parsed.evidence_projection, "linear")
 
             sys.argv = ["test", "--extractor_mode", "global_grid"]
             parsed = options.get_args()
@@ -1114,6 +1262,10 @@ class SchedulerOptionTests(unittest.TestCase):
                 options.get_args()
 
             sys.argv = ["test", "--num_parts", "0"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+
+            sys.argv = ["test", "--extractor_mode", "grid", "--num_parts", "3", "--evidence_token_budget", "8"]
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 options.get_args()
         finally:

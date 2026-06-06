@@ -5,7 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .mixer import RankPartQueryConditionedMixerAdapter, _FusionMLP
-from .prototypes import prototype_slot_count
+from .prototypes import (
+    SCALAR_TARGET_RELATIVE_MODES,
+    TARGET_RELATIVE_MODES,
+    evidence_slot_indices,
+    prototype_slot_count,
+)
 
 
 DEFAULT_RESIDUAL_GATE_INIT = 0.1
@@ -85,6 +90,25 @@ class TargetPrototypeEnricher(nn.Module):
         self.extractor_mode = getattr(args, "extractor_mode", "global,horizontal")
         self.num_parts = getattr(args, "num_parts", 6)
         num_slots = prototype_slot_count(self.extractor_mode, self.num_parts)
+        self.evidence_slot_indices = evidence_slot_indices(self.extractor_mode, self.num_parts)
+        self.requires_target_relative = any(
+            mode in self.evidence_slot_indices for mode in TARGET_RELATIVE_MODES
+        )
+        self.scalar_evidence_projectors = nn.ModuleDict()
+        for mode in SCALAR_TARGET_RELATIVE_MODES:
+            if mode in self.evidence_slot_indices:
+                self.scalar_evidence_projectors[mode] = nn.Linear(1, embed_dim)
+        needs_raw_retrieval_projection = (
+            "retrieval_backbone" in self.evidence_slot_indices
+            and self.enrichment_space == "grab"
+        )
+        needs_raw_target_relative_projection = (
+            getattr(args, "target_relative_space", "host_global") == "retrieval"
+            and self.enrichment_space == "grab"
+            and any(mode in self.evidence_slot_indices for mode in ("cluster", "cluster_residual"))
+        )
+        if needs_raw_retrieval_projection or needs_raw_target_relative_projection:
+            self.raw_vector_evidence_to_proto = nn.Linear(grab_embed_dim, embed_dim)
         mixer_kwargs = dict(
             num_ranks=self.top_m,
             num_slots=num_slots,
@@ -131,6 +155,60 @@ class TargetPrototypeEnricher(nn.Module):
             self._require_grab()
             prototypes = self.proto_to_grab(prototypes.float())
         return F.normalize(prototypes.float(), p=2, dim=-1)
+
+    def _gather_bank(self, bank, top_indices, trailing_shape):
+        bank = bank.to(device=top_indices.device)
+        gathered = bank.index_select(0, top_indices.reshape(-1))
+        return gathered.view(*top_indices.shape, *trailing_shape)
+
+    def _project_raw_vector_evidence(self, values):
+        values = values.float()
+        if values.shape[-1] == self.embed_dim:
+            return values
+        if not hasattr(self, "raw_vector_evidence_to_proto"):
+            raise ValueError(
+                "Raw vector evidence requires a projection to the shared evidence dim"
+            )
+        if values.shape[-1] != self.grab_embed_dim:
+            raise ValueError(
+                "Raw vector evidence dim must match either embed_dim or grab_embed_dim"
+            )
+        return self.raw_vector_evidence_to_proto(values)
+
+    def _apply_auxiliary_evidence(self, gathered, top_indices, pool_cache):
+        if self.requires_target_relative and "target_relative_cluster_ids" not in pool_cache:
+            raise ValueError(
+                "Target-relative evidence requires a finalized target cache; "
+                "call finalize_target_cache after merging the full target pool"
+            )
+
+        updated = gathered.clone()
+        vector_keys = {
+            "retrieval_backbone": "retrieval_backbone_features",
+            "cluster": "cluster_features",
+            "cluster_residual": "cluster_residual_features",
+        }
+        for mode, key in vector_keys.items():
+            if mode not in self.evidence_slot_indices or key not in pool_cache:
+                continue
+            slot = self.evidence_slot_indices[mode][0]
+            bank = pool_cache[key].float()
+            selected = self._gather_bank(bank, top_indices, (bank.shape[-1],))
+            projected = self._project_raw_vector_evidence(selected)
+            updated[:, :, slot, :] = F.normalize(projected.float(), p=2, dim=-1)
+
+        for mode, projector in self.scalar_evidence_projectors.items():
+            key = f"{mode}_scalar"
+            if key not in pool_cache:
+                raise ValueError(
+                    f"--extractor_mode {mode} requires finalized target cache key '{key}'"
+                )
+            slot = self.evidence_slot_indices[mode][0]
+            bank = pool_cache[key].float()
+            selected = self._gather_bank(bank, top_indices, (1,))
+            projected = projector(selected.float())
+            updated[:, :, slot, :] = F.normalize(projected.float(), p=2, dim=-1)
+        return updated
 
     def _context(self, query_features, selected_prototypes, space):
         if space == "grab":
@@ -265,7 +343,7 @@ class TargetPrototypeEnricher(nn.Module):
     def forward(self, query_features, host_text_features, query_pids, pool_cache, space, grab_text_features=None):
         host_image_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
         retrieval_features = F.normalize(pool_cache["retrieval_features"].float(), p=2, dim=-1)
-        prototypes = pool_cache["prototypes"].float()
+        prototypes = pool_cache.get("evidence_bank", pool_cache["prototypes"]).float()
         pool_pids = pool_cache["pids"].long()
 
         normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
@@ -281,6 +359,7 @@ class TargetPrototypeEnricher(nn.Module):
         )
 
         gathered = prototypes[top_indices]
+        gathered = self._apply_auxiliary_evidence(gathered, top_indices, pool_cache)
         selected_prototypes = self._project_prototypes(gathered, space)
 
         context = self._context(normalized_query, selected_prototypes, space)
@@ -319,7 +398,7 @@ class TargetPrototypeEnricher(nn.Module):
     def enrich_only(self, query_features, host_text_features, pool_cache, space, grab_text_features=None):
         host_image_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
         retrieval_features = F.normalize(pool_cache["retrieval_features"].float(), p=2, dim=-1)
-        prototypes = pool_cache["prototypes"].float()
+        prototypes = pool_cache.get("evidence_bank", pool_cache["prototypes"]).float()
         normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
         host_text_features = F.normalize(host_text_features.float(), p=2, dim=-1)
         top_indices = self._top_indices(
@@ -333,6 +412,7 @@ class TargetPrototypeEnricher(nn.Module):
         )
 
         gathered = prototypes[top_indices]
+        gathered = self._apply_auxiliary_evidence(gathered, top_indices, pool_cache)
         selected_prototypes = self._project_prototypes(gathered, space)
         context = self._context(normalized_query, selected_prototypes, space)
         return self._fuse(normalized_query, context, space)

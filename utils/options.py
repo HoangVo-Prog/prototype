@@ -1,7 +1,17 @@
 import argparse
 
 
-_EXTRACTOR_BASE_MODES = ("global", "horizontal", "vertical", "grid")
+_EXTRACTOR_BASE_MODES = (
+    "global",
+    "horizontal",
+    "vertical",
+    "grid",
+    "retrieval_backbone",
+    "cluster",
+    "cluster_residual",
+    "cluster_density",
+    "cluster_rarity",
+)
 _LEGACY_EXTRACTOR_MODE_ALIASES = {
     "global_horizontal": "global,horizontal",
     "global_vertical": "global,vertical",
@@ -176,9 +186,22 @@ def get_args():
                         help="global score weight for --topm_rank_space hybrid_global_grab: "
                              "lambda*global + (1-lambda)*grab")
     parser.add_argument("--extractor_mode", type=parse_extractor_mode, default="global,horizontal",
-                        help="comma-separated prototype extractors (supported: global,horizontal,vertical,grid)")
+                        help="comma-separated evidence providers")
     parser.add_argument("--num_parts", type=int, default=6,
                         help="number of partitions for horizontal/vertical extractors; grid uses num_parts x num_parts") 
+    parser.add_argument("--target_relative_space", type=str, default="host_global",
+                        choices=["host_global", "retrieval"],
+                        help="target-pool feature space used for target-relative evidence providers")
+    parser.add_argument("--target_relative_num_clusters", type=int, default=16,
+                        help="number of label-free clusters for target-relative evidence providers")
+    parser.add_argument("--target_relative_cluster_method", type=str, default="kmeans",
+                        choices=["kmeans"],
+                        help="label-free clustering method for target-relative evidence providers")
+    parser.add_argument("--evidence_token_budget", type=int, default=0,
+                        help="0 disables the evidence-token budget; positive values validate extractor token count")
+    parser.add_argument("--evidence_projection", type=str, default="auto",
+                        choices=["auto", "linear", "none"],
+                        help="projection policy for evidence providers whose source dim differs from the shared dim")
     parser.add_argument("--use_freeze_indices", "--freeze_indices",
                         dest="use_freeze_indices", action="store_true", default=False,
                         help="precompute frozen host top-M rankings once and reuse them for top-M selection")
@@ -252,6 +275,14 @@ def get_args():
         parser.error("--use_freeze_indices requires --target_enrichment")
     if args.topm_rank_lambda < 0.0 or args.topm_rank_lambda > 1.0:
         parser.error("--topm_rank_lambda must be in [0, 1]")
+    if args.target_relative_num_clusters < 1:
+        parser.error("--target_relative_num_clusters must be a positive integer")
+    if args.evidence_token_budget < 0:
+        parser.error("--evidence_token_budget must be non-negative")
+    if args.evidence_token_budget > 0:
+        from model.enrichment.prototypes import prototype_slot_count
+        if prototype_slot_count(args.extractor_mode, args.num_parts) > args.evidence_token_budget:
+            parser.error("--extractor_mode exceeds --evidence_token_budget")
     if (
         args.target_enrichment
         and args.topm_rank_space == "hybrid_global_grab"

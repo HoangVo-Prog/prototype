@@ -4,7 +4,12 @@ from .clip_model import Transformer, LayerNorm, build_CLIP_from_openai_pretraine
 import torch
 import torch.nn as nn
 from .grab import TexualEmbeddingLayer, VisualEmbeddingLayer
-from .enrichment import TargetPrototypeEnricher, build_part_prototypes
+from .enrichment import (
+    TargetPrototypeEnricher,
+    build_evidence_bank,
+    evidence_slot_indices,
+    finalize_target_evidence_cache,
+)
 from torch.cuda.amp import autocast
 
 
@@ -160,15 +165,6 @@ class ITSELF(nn.Module):
         if not cache_prototypes:
             return cache
 
-        grid_size = None
-        if hasattr(self.base_model.visual, "num_y") and hasattr(self.base_model.visual, "num_x"):
-            grid_size = (self.base_model.visual.num_y, self.base_model.visual.num_x)
-        cache["prototypes"] = build_part_prototypes(
-            image_feats,
-            getattr(self.args, "num_parts", 6),
-            grid_size=grid_size,
-            mode=getattr(self.args, "extractor_mode", "global,horizontal"),
-        )
         needs_grab_rank = getattr(self.args, "topm_rank_space", "host_global") == "hybrid_global_grab"
         grab_features = None
         if getattr(self.args, "enrichment_space", "global") == "grab" or needs_grab_rank:
@@ -179,7 +175,38 @@ class ITSELF(nn.Module):
             cache["retrieval_features"] = host_features
         if needs_grab_rank:
             cache["grab_image_features"] = grab_features
+
+        grid_size = None
+        if hasattr(self.base_model.visual, "num_y") and hasattr(self.base_model.visual, "num_x"):
+            grid_size = (self.base_model.visual.num_y, self.base_model.visual.num_x)
+        evidence_bank = build_evidence_bank(
+            image_feats,
+            getattr(self.args, "num_parts", 6),
+            grid_size=grid_size,
+            mode=getattr(self.args, "extractor_mode", "global,horizontal"),
+            retrieval_features=cache["retrieval_features"],
+        )
+        cache["evidence_bank"] = evidence_bank
+        cache["prototypes"] = evidence_bank
+
+        slots = evidence_slot_indices(
+            getattr(self.args, "extractor_mode", "global,horizontal"),
+            getattr(self.args, "num_parts", 6),
+        )
+        if (
+            "retrieval_backbone" in slots
+            and cache["retrieval_features"].shape[-1] != self.embed_dim
+        ):
+            if getattr(self.args, "evidence_projection", "auto") == "none":
+                raise ValueError(
+                    "--extractor_mode retrieval_backbone requires evidence projection "
+                    "when retrieval feature dim differs from the shared evidence dim"
+                )
+            cache["retrieval_backbone_features"] = cache["retrieval_features"]
         return cache
+
+    def finalize_target_cache(self, cache):
+        return finalize_target_evidence_cache(cache, self.args, self.embed_dim)
 
     def enrich_text_features(self, query_features, host_text_features, target_cache, grab_text_features=None):
         self.target_enricher = self.target_enricher.float()

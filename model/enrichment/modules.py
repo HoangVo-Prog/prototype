@@ -6,7 +6,15 @@ try:
         _RankPartMixerBlock,
         _two_layer_mlp,
     )
-    from .prototypes import EXTRACTOR_MODES, build_part_prototypes, prototype_slot_count
+    from .prototypes import (
+        EXTRACTOR_MODES,
+        TARGET_RELATIVE_MODES,
+        build_evidence_bank,
+        build_part_prototypes,
+        evidence_slot_indices,
+        finalize_target_evidence_cache,
+        prototype_slot_count,
+    )
 except ImportError:
     import importlib.util
     import pathlib
@@ -42,13 +50,21 @@ except ImportError:
     _RankPartMixerBlock = _mixer._RankPartMixerBlock
     _two_layer_mlp = _mixer._two_layer_mlp
     EXTRACTOR_MODES = _prototypes.EXTRACTOR_MODES
+    TARGET_RELATIVE_MODES = _prototypes.TARGET_RELATIVE_MODES
+    build_evidence_bank = _prototypes.build_evidence_bank
     build_part_prototypes = _prototypes.build_part_prototypes
+    evidence_slot_indices = _prototypes.evidence_slot_indices
+    finalize_target_evidence_cache = _prototypes.finalize_target_evidence_cache
     prototype_slot_count = _prototypes.prototype_slot_count
 
 __all__ = [
     "EXTRACTOR_MODES",
     "RankPartQueryConditionedMixerAdapter",
+    "TARGET_RELATIVE_MODES",
     "TargetPrototypeEnricher",
+    "build_evidence_bank",
     "build_part_prototypes",
+    "evidence_slot_indices",
+    "finalize_target_evidence_cache",
     "prototype_slot_count",
 ]
