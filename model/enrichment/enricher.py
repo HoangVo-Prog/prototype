@@ -9,6 +9,7 @@ from .prototypes import prototype_slot_count
 
 
 DEFAULT_RESIDUAL_GATE_INIT = 0.1
+TOPM_RANK_SPACES = ("host_global", "retrieval", "hybrid_global_grab")
 
 
 def _masked_logsumexp(values, mask, dim):
@@ -70,6 +71,14 @@ class TargetPrototypeEnricher(nn.Module):
             raise ValueError("--enrichment_space must be either 'global' or 'grab'")
         if self.enrichment_space == "grab" and getattr(args, "only_global", False):
             raise ValueError("--enrichment_space grab requires GRAB features; remove --only_global")
+        self.topm_rank_space = getattr(args, "topm_rank_space", "host_global")
+        if self.topm_rank_space not in TOPM_RANK_SPACES:
+            raise ValueError("--topm_rank_space must be one of {}".format(TOPM_RANK_SPACES))
+        self.topm_rank_lambda = float(getattr(args, "topm_rank_lambda", 0.5))
+        if self.topm_rank_lambda < 0.0 or self.topm_rank_lambda > 1.0:
+            raise ValueError("--topm_rank_lambda must be in [0, 1]")
+        if self.topm_rank_space == "hybrid_global_grab" and getattr(args, "only_global", False):
+            raise ValueError("--topm_rank_space hybrid_global_grab requires GRAB features; remove --only_global")
         self.enable_global = self.enrichment_space == "global"
         self.enable_grab = self.enrichment_space == "grab"
 
@@ -166,7 +175,65 @@ class TargetPrototypeEnricher(nn.Module):
         enriched = F.normalize(query_features.float() + residual_gate * delta, p=2, dim=-1)
         return enriched, delta, residual_gate
 
-    def _top_indices(self, host_text_features, host_image_features, pool_cache):
+    def _rank_scores(
+        self,
+        query_features,
+        host_text_features,
+        host_image_features,
+        retrieval_features,
+        pool_cache,
+        space,
+        grab_text_features=None,
+    ):
+        if self.topm_rank_space == "host_global":
+            return host_text_features @ host_image_features.t()
+
+        if self.topm_rank_space == "retrieval":
+            if query_features.shape[-1] != retrieval_features.shape[-1]:
+                raise ValueError(
+                    "--topm_rank_space retrieval requires query_features and "
+                    "pool_cache['retrieval_features'] to have the same dimension"
+                )
+            return query_features @ retrieval_features.t()
+
+        if grab_text_features is None:
+            if space == "grab":
+                grab_text_features = query_features
+            else:
+                raise ValueError(
+                    "--topm_rank_space hybrid_global_grab requires GRAB text features"
+                )
+        grab_image_features = pool_cache.get("grab_image_features")
+        if grab_image_features is None:
+            if retrieval_features.shape[-1] == grab_text_features.shape[-1]:
+                grab_image_features = retrieval_features
+            else:
+                raise ValueError(
+                    "--topm_rank_space hybrid_global_grab requires "
+                    "pool_cache['grab_image_features']"
+                )
+        grab_text_features = F.normalize(grab_text_features.float(), p=2, dim=-1)
+        grab_image_features = F.normalize(grab_image_features.float(), p=2, dim=-1)
+        if grab_text_features.shape[-1] != grab_image_features.shape[-1]:
+            raise ValueError(
+                "--topm_rank_space hybrid_global_grab requires GRAB text/image "
+                "features to have the same dimension"
+            )
+
+        global_scores = host_text_features @ host_image_features.t()
+        grab_scores = grab_text_features @ grab_image_features.t()
+        return self.topm_rank_lambda * global_scores + (1.0 - self.topm_rank_lambda) * grab_scores
+
+    def _top_indices(
+        self,
+        query_features,
+        host_text_features,
+        host_image_features,
+        retrieval_features,
+        pool_cache,
+        space,
+        grab_text_features=None,
+    ):
         supplied = pool_cache.get("top_indices")
         if supplied is not None:
             top_indices = supplied.long()
@@ -183,23 +250,39 @@ class TargetPrototypeEnricher(nn.Module):
             return top_indices
 
         with torch.no_grad():
-            host_scores = host_text_features @ host_image_features.t()
+            host_scores = self._rank_scores(
+                query_features=query_features,
+                host_text_features=host_text_features,
+                host_image_features=host_image_features,
+                retrieval_features=retrieval_features,
+                pool_cache=pool_cache,
+                space=space,
+                grab_text_features=grab_text_features,
+            )
             top_m = min(self.top_m, host_image_features.shape[0])
             return host_scores.topk(k=top_m, dim=1, largest=True, sorted=True).indices
 
-    def forward(self, query_features, host_text_features, query_pids, pool_cache, space):
+    def forward(self, query_features, host_text_features, query_pids, pool_cache, space, grab_text_features=None):
         host_image_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
         retrieval_features = F.normalize(pool_cache["retrieval_features"].float(), p=2, dim=-1)
         prototypes = pool_cache["prototypes"].float()
         pool_pids = pool_cache["pids"].long()
 
+        normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
         host_text_features = F.normalize(host_text_features.float(), p=2, dim=-1)
-        top_indices = self._top_indices(host_text_features, host_image_features, pool_cache)
+        top_indices = self._top_indices(
+            query_features=normalized_query,
+            host_text_features=host_text_features,
+            host_image_features=host_image_features,
+            retrieval_features=retrieval_features,
+            pool_cache=pool_cache,
+            space=space,
+            grab_text_features=grab_text_features,
+        )
 
         gathered = prototypes[top_indices]
         selected_prototypes = self._project_prototypes(gathered, space)
 
-        normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
         context = self._context(normalized_query, selected_prototypes, space)
         enriched, delta, residual_gate = self._fuse_with_delta(normalized_query, context, space)
 
@@ -233,15 +316,24 @@ class TargetPrototypeEnricher(nn.Module):
             **diagnostics,
         }
 
-    def enrich_only(self, query_features, host_text_features, pool_cache, space):
+    def enrich_only(self, query_features, host_text_features, pool_cache, space, grab_text_features=None):
         host_image_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
+        retrieval_features = F.normalize(pool_cache["retrieval_features"].float(), p=2, dim=-1)
         prototypes = pool_cache["prototypes"].float()
+        normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
         host_text_features = F.normalize(host_text_features.float(), p=2, dim=-1)
-        top_indices = self._top_indices(host_text_features, host_image_features, pool_cache)
+        top_indices = self._top_indices(
+            query_features=normalized_query,
+            host_text_features=host_text_features,
+            host_image_features=host_image_features,
+            retrieval_features=retrieval_features,
+            pool_cache=pool_cache,
+            space=space,
+            grab_text_features=grab_text_features,
+        )
 
         gathered = prototypes[top_indices]
         selected_prototypes = self._project_prototypes(gathered, space)
-        normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
         context = self._context(normalized_query, selected_prototypes, space)
         return self._fuse(normalized_query, context, space)
 

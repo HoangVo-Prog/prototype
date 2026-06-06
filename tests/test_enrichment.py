@@ -44,6 +44,8 @@ def args(**overrides):
         use_target_retrieval_loss=True,
         use_target_robust_loss=True,
         enrichment_space="global",
+        topm_rank_space="host_global",
+        topm_rank_lambda=0.5,
         extractor_mode="global,horizontal",
         num_parts=6,
     )
@@ -79,6 +81,9 @@ def make_pool_manager(**overrides):
         recompute_interval=2,
         use_freeze_indices=False,
         top_m=3,
+        topm_rank_space="host_global",
+        topm_rank_lambda=0.5,
+        enrichment_space="global",
         seed=1,
     )
     defaults.update(overrides)
@@ -585,6 +590,80 @@ class EnrichmentShapeTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(out_a["top_indices"], out_b["top_indices"]))
 
+    def test_top_m_rank_space_retrieval_uses_retrieval_features(self):
+        enricher = modules.TargetPrototypeEnricher(
+            4,
+            8,
+            args(
+                top_m=1,
+                robust_hard_k=1,
+                use_target_retrieval_loss=False,
+                use_target_robust_loss=False,
+                topm_rank_space="retrieval",
+            ),
+        ).float()
+        cache = {
+            "host_image_features": torch.tensor([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.9, 0.1, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+            ]),
+            "retrieval_features": torch.tensor([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.1, 0.2, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+            ]),
+            "prototypes": torch.randn(3, 7, 4),
+            "pids": torch.tensor([0, 1, 2]),
+        }
+        out = enricher(
+            query_features=torch.tensor([[0.0, 1.0, 0.0, 0.0]]),
+            host_text_features=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            query_pids=torch.tensor([0]),
+            pool_cache=cache,
+            space="global",
+        )
+        self.assertTrue(torch.equal(out["top_indices"].cpu(), torch.tensor([[2]])))
+
+    def test_top_m_rank_space_hybrid_fuses_global_and_grab_scores(self):
+        enricher = modules.TargetPrototypeEnricher(
+            4,
+            8,
+            args(
+                top_m=1,
+                robust_hard_k=1,
+                use_target_retrieval_loss=False,
+                use_target_robust_loss=False,
+                topm_rank_space="hybrid_global_grab",
+                topm_rank_lambda=0.25,
+            ),
+        ).float()
+        cache = {
+            "host_image_features": torch.tensor([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+            ]),
+            "retrieval_features": torch.tensor([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+            ]),
+            "grab_image_features": torch.tensor([
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ]),
+            "prototypes": torch.randn(2, 7, 4),
+            "pids": torch.tensor([0, 1]),
+        }
+        out = enricher(
+            query_features=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            host_text_features=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            grab_text_features=torch.tensor([[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]),
+            query_pids=torch.tensor([0]),
+            pool_cache=cache,
+            space="global",
+        )
+        self.assertTrue(torch.equal(out["top_indices"].cpu(), torch.tensor([[1]])))
+
     def test_forward_uses_supplied_frozen_top_indices(self):
         torch.manual_seed(13)
         enricher = modules.TargetPrototypeEnricher(512, 4096, args()).float()
@@ -773,6 +852,58 @@ class PoolManagerTests(unittest.TestCase):
         ))
         self.assertFalse(hasattr(manager, "frozen_query_features"))
 
+    def test_frozen_index_build_uses_hybrid_rank_space(self):
+        manager = make_pool_manager(
+            use_freeze_indices=True,
+            top_m=1,
+            topm_rank_space="hybrid_global_grab",
+            topm_rank_lambda=0.25,
+        )
+
+        def encode_records(model, records, cache_prototypes=True):
+            host = torch.tensor([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ])
+            return {
+                "host_image_features": host,
+                "retrieval_features": host,
+                "grab_image_features": torch.tensor([
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]),
+                "prototypes": torch.zeros(len(records), 7, 4),
+            }
+
+        manager._encode_records = encode_records
+        manager._encode_text_records = lambda model, records: torch.tensor([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+        manager._encode_grab_text_records = lambda model, records: torch.tensor([
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ])
+
+        manager._build_frozen_index_cache(FakeImageEncoder(embed_dim=4))
+
+        self.assertTrue(torch.equal(
+            manager._frozen_ranked_image_ids(torch.tensor([0]), top_n=1),
+            torch.tensor([[11]]),
+        ))
+        self.assertTrue(torch.equal(
+            manager._frozen_ranked_image_ids(torch.tensor([1]), top_n=1),
+            torch.tensor([[10]]),
+        ))
+
 
 class ReproducibilityTests(unittest.TestCase):
     def test_identity_sampler_is_seeded_per_epoch(self):
@@ -901,6 +1032,8 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertFalse(parsed.use_target_retrieval_loss)
         self.assertFalse(parsed.use_target_robust_loss)
         self.assertFalse(parsed.pnp_text_only)
+        self.assertEqual(parsed.topm_rank_space, "host_global")
+        self.assertEqual(parsed.topm_rank_lambda, 0.5)
         self.assertEqual(parsed.wandb_project, "enrichment")
 
     def test_wandb_project_cli_parses_and_validates_name(self):
@@ -981,6 +1114,37 @@ class SchedulerOptionTests(unittest.TestCase):
                 options.get_args()
 
             sys.argv = ["test", "--num_parts", "0"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+        finally:
+            sys.argv = old_argv
+
+    def test_topm_rank_space_cli_parses_and_validates_lambda(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "test",
+                "--topm_rank_space",
+                "hybrid_global_grab",
+                "--topm_rank_lambda",
+                "0.3",
+            ]
+            parsed = options.get_args()
+            self.assertEqual(parsed.topm_rank_space, "hybrid_global_grab")
+            self.assertEqual(parsed.topm_rank_lambda, 0.3)
+
+            sys.argv = ["test", "--topm_rank_lambda", "1.1"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+
+            sys.argv = [
+                "test",
+                "--target_enrichment",
+                "--only_global",
+                "--topm_rank_space",
+                "hybrid_global_grab",
+            ]
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 options.get_args()
         finally:

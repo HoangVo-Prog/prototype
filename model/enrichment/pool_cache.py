@@ -34,8 +34,42 @@ class TargetPoolCacheMixin:
             device=device,
         )
 
+        rank_space = getattr(self.args, "topm_rank_space", "host_global")
+        rank_lambda = float(getattr(self.args, "topm_rank_lambda", 0.5))
+        if rank_lambda < 0.0 or rank_lambda > 1.0:
+            raise ValueError("--topm_rank_lambda must be in [0, 1]")
+
         host_image_features = F.normalize(cache["host_image_features"].float(), p=2, dim=-1)
-        query_features = self._encode_text_records(model, self.query_records)
+        rank_image_features = host_image_features
+        grab_image_features = None
+        if rank_space == "retrieval":
+            rank_image_features = F.normalize(cache["retrieval_features"].float(), p=2, dim=-1)
+        elif rank_space == "hybrid_global_grab":
+            grab_image_features = cache.get("grab_image_features")
+            if grab_image_features is None:
+                if getattr(self.args, "enrichment_space", "global") == "grab":
+                    grab_image_features = cache["retrieval_features"]
+                else:
+                    raise ValueError(
+                        "--topm_rank_space hybrid_global_grab requires "
+                        "pool cache key 'grab_image_features'"
+                    )
+            grab_image_features = F.normalize(grab_image_features.float(), p=2, dim=-1)
+        elif rank_space != "host_global":
+            raise ValueError(
+                "--topm_rank_space must be one of "
+                "('host_global', 'retrieval', 'hybrid_global_grab')"
+            )
+
+        if rank_space == "retrieval" and getattr(self.args, "enrichment_space", "global") == "grab":
+            query_features = self._encode_grab_text_records(model, self.query_records)
+        else:
+            query_features = self._encode_text_records(model, self.query_records)
+
+        grab_query_features = None
+        if rank_space == "hybrid_global_grab":
+            grab_query_features = self._encode_grab_text_records(model, self.query_records)
+
         requested_depth = int(getattr(self.args, "top_m", 1))
         if requested_depth < 1:
             raise ValueError("Frozen index depth must be positive")
@@ -50,7 +84,14 @@ class TargetPoolCacheMixin:
             for start in range(0, query_features.shape[0], batch_size):
                 query_chunk = query_features[start:start + batch_size].to(device)
                 query_chunk = F.normalize(query_chunk.float(), p=2, dim=-1)
-                scores = query_chunk @ host_image_features.t()
+                if rank_space == "hybrid_global_grab":
+                    grab_query_chunk = grab_query_features[start:start + batch_size].to(device)
+                    grab_query_chunk = F.normalize(grab_query_chunk.float(), p=2, dim=-1)
+                    global_scores = query_chunk @ host_image_features.t()
+                    grab_scores = grab_query_chunk @ grab_image_features.t()
+                    scores = rank_lambda * global_scores + (1.0 - rank_lambda) * grab_scores
+                else:
+                    scores = query_chunk @ rank_image_features.t()
                 rank_chunks.append(
                     scores.topk(k=rank_depth, dim=1, largest=True, sorted=True).indices.cpu()
                 )
@@ -240,6 +281,42 @@ class TargetPoolCacheMixin:
             for _, _, captions in loader:
                 captions = captions.to(device)
                 chunks.append(core_model.encode_text(captions).detach().cpu())
+
+        if was_training:
+            core_model.train()
+
+        return torch.cat(chunks, dim=0)
+
+    def _encode_grab_text_records(self, model, records):
+        core_model = _unwrap_model(model)
+        device = next(core_model.parameters()).device
+        was_training = core_model.training
+        core_model.eval()
+
+        tokenizer = getattr(self.train_dataset, "tokenizer", None)
+        if tokenizer is None:
+            from utils.simple_tokenizer import SimpleTokenizer
+            tokenizer = SimpleTokenizer()
+        dataset = _PoolTextDataset(
+            records,
+            tokenizer=tokenizer,
+            text_length=getattr(self.train_dataset, "text_length", getattr(self.args, "text_length", 77)),
+            truncate=getattr(self.train_dataset, "truncate", True),
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=min(max(1, getattr(self.args, "test_batch_size", 1)), max(1, len(records))),
+            shuffle=False,
+            num_workers=getattr(self.args, "num_workers", 0),
+            worker_init_fn=seed_worker,
+            generator=seeded_generator(self.seed + 902),
+        )
+
+        chunks = []
+        with torch.no_grad():
+            for _, _, captions in loader:
+                captions = captions.to(device)
+                chunks.append(core_model.encode_text_grab(captions).detach().cpu())
 
         if was_training:
             core_model.train()

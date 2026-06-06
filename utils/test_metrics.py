@@ -205,12 +205,21 @@ class Evaluator:
             caption = caption.to(device)
             with torch.no_grad():
                 host_text_feat = model.encode_text(caption)
+                grab_text_feat = None
+                if (
+                    self.args.enrichment_space == "grab"
+                    or getattr(self.args, "topm_rank_space", "host_global") == "hybrid_global_grab"
+                ):
+                    grab_text_feat = model.encode_text_grab(caption)
                 if self.args.enrichment_space == "grab":
-                    query_feat = model.encode_text_grab(caption)
+                    query_feat = grab_text_feat
                 else:
                     query_feat = host_text_feat
                 text_feat = model.enrich_text_features(
-                    query_feat, host_text_feat, target_cache
+                    query_feat,
+                    host_text_feat,
+                    target_cache,
+                    grab_text_features=grab_text_feat,
                 ).cpu()
             qids.append(pid.view(-1))
             qfeats.append(text_feat)

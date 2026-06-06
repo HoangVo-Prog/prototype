@@ -92,6 +92,12 @@ class ITSELF(nn.Module):
         self.args = args
         if getattr(args, "target_enrichment", False) and args.enrichment_space == "grab" and args.only_global:
             raise ValueError("--enrichment_space grab requires GRAB features; remove --only_global")
+        if (
+            getattr(args, "target_enrichment", False)
+            and getattr(args, "topm_rank_space", "host_global") == "hybrid_global_grab"
+            and args.only_global
+        ):
+            raise ValueError("--topm_rank_space hybrid_global_grab requires GRAB features; remove --only_global")
         if 'cid' in args.loss_names:
             self.num_classes = num_classes + 1
             self.classifier_global = nn.Linear(self.embed_dim , self.num_classes)
@@ -163,19 +169,26 @@ class ITSELF(nn.Module):
             grid_size=grid_size,
             mode=getattr(self.args, "extractor_mode", "global,horizontal"),
         )
+        needs_grab_rank = getattr(self.args, "topm_rank_space", "host_global") == "hybrid_global_grab"
+        grab_features = None
+        if getattr(self.args, "enrichment_space", "global") == "grab" or needs_grab_rank:
+            grab_features = self.visul_emb_layer(image_feats, atten_i).float()
         if getattr(self.args, "enrichment_space", "global") == "grab":
-            cache["retrieval_features"] = self.visul_emb_layer(image_feats, atten_i).float()
+            cache["retrieval_features"] = grab_features
         else:
             cache["retrieval_features"] = host_features
+        if needs_grab_rank:
+            cache["grab_image_features"] = grab_features
         return cache
 
-    def enrich_text_features(self, query_features, host_text_features, target_cache):
+    def enrich_text_features(self, query_features, host_text_features, target_cache, grab_text_features=None):
         self.target_enricher = self.target_enricher.float()
         return self.target_enricher.enrich_only(
             query_features=query_features,
             host_text_features=host_text_features,
             pool_cache=target_cache,
             space=getattr(self.args, "enrichment_space", "global"),
+            grab_text_features=grab_text_features,
         )
     
     def rollout(self, attentions: torch.Tensor, 
@@ -318,15 +331,20 @@ class ITSELF(nn.Module):
                 target_ret = self.target_enricher(
                     query_features=t_grab_f,
                     host_text_features=t_feats,
+                    grab_text_features=t_grab_f,
                     query_pids=batch["pids"],
                     pool_cache=target_cache,
                     space="grab",
                 )
                 t_grab_f = target_ret["enriched_features"]
             else:
+                grab_text_features = None
+                if getattr(self.args, "topm_rank_space", "host_global") == "hybrid_global_grab":
+                    grab_text_features = t_grab_f
                 target_ret = self.target_enricher(
                     query_features=t_feats,
                     host_text_features=t_feats,
+                    grab_text_features=grab_text_features,
                     query_pids=batch["pids"],
                     pool_cache=target_cache,
                     space="global",

@@ -169,6 +169,12 @@ def get_args():
                         help="feature space to enrich when target_enrichment is enabled")
     parser.add_argument("--top_m", type=int, default=32,
                         help="number of host-ranked local images used for enrichment")
+    parser.add_argument("--topm_rank_space", type=str, default="host_global",
+                        choices=["host_global", "retrieval", "hybrid_global_grab"],
+                        help="feature space used to select top-M target images for enrichment")
+    parser.add_argument("--topm_rank_lambda", type=float, default=0.5,
+                        help="global score weight for --topm_rank_space hybrid_global_grab: "
+                             "lambda*global + (1-lambda)*grab")
     parser.add_argument("--extractor_mode", type=parse_extractor_mode, default="global,horizontal",
                         help="comma-separated prototype extractors (supported: global,horizontal,vertical,grid)")
     parser.add_argument("--num_parts", type=int, default=6,
@@ -244,6 +250,14 @@ def get_args():
         parser.error("--freeze_host requires --target_enrichment")
     if args.use_freeze_indices and not args.target_enrichment:
         parser.error("--use_freeze_indices requires --target_enrichment")
+    if args.topm_rank_lambda < 0.0 or args.topm_rank_lambda > 1.0:
+        parser.error("--topm_rank_lambda must be in [0, 1]")
+    if (
+        args.target_enrichment
+        and args.topm_rank_space == "hybrid_global_grab"
+        and args.only_global
+    ):
+        parser.error("--topm_rank_space hybrid_global_grab requires GRAB features; remove --only_global")
     if args.pnp_text_only:
         if not args.freeze_host:
             parser.error("--pnp_text_only requires --freeze_host")
