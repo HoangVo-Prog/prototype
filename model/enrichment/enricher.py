@@ -50,9 +50,6 @@ class TargetPrototypeEnricher(nn.Module):
         if args.top_m < 1:
             raise ValueError("--top_m must be a positive integer")
         self.top_m = args.top_m
-        self.robust_hard_k = getattr(args, "robust_hard_k", self.top_m)
-        if self.robust_hard_k < 1:
-            raise ValueError("--robust_hard_k must be a positive integer")
         self.gamma = getattr(args, "enrich_gamma", None)
         self.residual_gate_mode = getattr(args, "residual_gate", "residual")
         if self.residual_gate_mode not in ("static", "residual"):
@@ -63,14 +60,11 @@ class TargetPrototypeEnricher(nn.Module):
             raise ValueError("--enrich_gamma is only valid when --residual_gate is static")
         self.tau = args.tau
         self.lambda_ret = getattr(args, "lambda_ret", 1.0)
-        self.lambda_rob = args.lambda_rob
-        self.lambda_gain = args.lambda_gain
-        self.gain_margin = args.gain_margin
-        self.use_target_retrieval_loss = getattr(args, "use_target_retrieval_loss", False)
+        if self.lambda_ret <= 0:
+            raise ValueError("--lambda_ret must be positive")
         self.context_module = getattr(args, "context_module", "mixer")
         if self.context_module != "mixer":
             raise ValueError("--context_module must be mixer; attention context construction has been removed")
-        self.use_target_robust_loss = getattr(args, "use_target_robust_loss", False)
         self.enrichment_space = getattr(args, "enrichment_space", "global")
         if self.enrichment_space not in ("global", "grab"):
             raise ValueError("--enrichment_space must be either 'global' or 'grab'")
@@ -366,10 +360,8 @@ class TargetPrototypeEnricher(nn.Module):
         enriched, delta, residual_gate = self._fuse_with_delta(normalized_query, context, space)
 
         losses = self.compute_losses(
-            raw_query=normalized_query,
             enriched_query=enriched,
             retrieval_features=retrieval_features,
-            top_indices=top_indices,
             query_pids=query_pids.long(),
             pool_pids=pool_pids,
         )
@@ -379,7 +371,6 @@ class TargetPrototypeEnricher(nn.Module):
             context=context,
             host_text_features=host_text_features,
             host_image_features=host_image_features,
-            retrieval_features=retrieval_features,
             delta=delta,
             residual_gate=residual_gate,
             top_indices=top_indices,
@@ -419,55 +410,27 @@ class TargetPrototypeEnricher(nn.Module):
 
     def compute_losses(
         self,
-        raw_query,
         enriched_query,
         retrieval_features,
-        top_indices,
         query_pids,
         pool_pids,
     ):
-        zero = enriched_query.sum() * 0.0
-        target_retrieval_loss = zero
-        robust_loss = zero
-        guard_loss = zero
-        gain_loss = zero
-
-        positive_mask = None
-        if self.use_target_retrieval_loss or self.use_target_robust_loss:
-            positive_mask = query_pids.view(-1, 1).eq(pool_pids.view(1, -1))
-
-        if self.use_target_retrieval_loss:
-            valid_positive = positive_mask.any(dim=1)
-            if valid_positive.any():
-                retrieval_scores = enriched_query @ retrieval_features.t() / max(self.tau, 1e-6)
-                pos_lse = _masked_logsumexp(retrieval_scores, positive_mask, dim=1)
-                all_lse = torch.logsumexp(retrieval_scores, dim=1)
-                target_retrieval_loss = -(pos_lse[valid_positive] - all_lse[valid_positive]).mean()
-
-        top_positive = None
-        if self.use_target_robust_loss:
-            top_pids = pool_pids[top_indices]
-            top_positive = top_pids.eq(query_pids.view(-1, 1))
-
-        if self.use_target_robust_loss:
-            robust_loss, guard_loss, gain_loss = self._compute_robust_loss(
-                raw_query=raw_query,
-                enriched_query=enriched_query,
-                retrieval_features=retrieval_features,
-                positive_mask=positive_mask,
-                reliable=top_positive.any(dim=1),
-                zero=zero,
+        positive_mask = query_pids.view(-1, 1).eq(pool_pids.view(1, -1))
+        valid_positive = positive_mask.any(dim=1)
+        if not valid_positive.all():
+            missing = int((~valid_positive).sum().item())
+            raise ValueError(
+                "Target retrieval loss requires every query to have at least one "
+                f"positive image in the target pool; missing positives for {missing} query(s)."
             )
-        total = zero
-        if self.use_target_retrieval_loss:
-            total = total + self.lambda_ret * target_retrieval_loss
-        if self.use_target_robust_loss:
-            total = total + self.lambda_rob * robust_loss
+
+        retrieval_scores = enriched_query @ retrieval_features.t() / max(self.tau, 1e-6)
+        pos_lse = _masked_logsumexp(retrieval_scores, positive_mask, dim=1)
+        all_lse = torch.logsumexp(retrieval_scores, dim=1)
+        target_retrieval_loss = -(pos_lse - all_lse).mean()
+        total = self.lambda_ret * target_retrieval_loss
         return {
             "target_retrieval_loss": target_retrieval_loss,
-            "robust_loss": robust_loss,
-            "guard_loss": guard_loss,
-            "gain_loss": gain_loss,
             "total_loss": total,
         }
 
@@ -478,7 +441,6 @@ class TargetPrototypeEnricher(nn.Module):
         context,
         host_text_features,
         host_image_features,
-        retrieval_features,
         delta,
         residual_gate,
         top_indices,
@@ -492,7 +454,6 @@ class TargetPrototypeEnricher(nn.Module):
             top_pids = pool_pids[top_indices]
             top_positive = top_pids.eq(query_pids.view(-1, 1))
             positive_mask = query_pids.view(-1, 1).eq(pool_pids.view(1, -1))
-            negative_mask = ~positive_mask
 
             positive_in_pool = positive_mask.any(dim=1)
             positive_in_topm = top_positive.any(dim=1)
@@ -542,82 +503,4 @@ class TargetPrototypeEnricher(nn.Module):
                 "mixer/output_delta_norm": delta.norm(dim=1).mean(),
             }
             diagnostics.update(mixer_diagnostics)
-
-            valid = positive_mask.any(dim=1) & negative_mask.any(dim=1)
-            if valid.any():
-                raw_scores = raw_query @ retrieval_features.t()
-                enriched_scores = enriched_query @ retrieval_features.t()
-                hard_k = min(self.robust_hard_k, retrieval_features.shape[0])
-                hard_indices = raw_scores.masked_fill(positive_mask, torch.finfo(raw_scores.dtype).min).topk(
-                    k=hard_k, dim=1, largest=True, sorted=True
-                ).indices
-                hard_mask = negative_mask.gather(1, hard_indices)
-
-                raw_pos = _masked_logsumexp(raw_scores, positive_mask, dim=1)
-                enr_pos = _masked_logsumexp(enriched_scores, positive_mask, dim=1)
-                raw_hard = _masked_logsumexp(raw_scores.gather(1, hard_indices), hard_mask, dim=1)
-                enr_hard = _masked_logsumexp(enriched_scores.gather(1, hard_indices), hard_mask, dim=1)
-
-                raw_margin = raw_pos - raw_hard
-                enriched_margin = enr_pos - enr_hard
-                margin_gain = enriched_margin - raw_margin
-                reliable_valid = positive_in_topm & valid
-
-                diagnostics.update({
-                    "target_valid_robust_rate": valid.float().mean(),
-                    "target_raw_margin": raw_margin[valid].mean(),
-                    "target_enriched_margin": enriched_margin[valid].mean(),
-                    "target_margin_gain": margin_gain[valid].mean(),
-                    "target_guard_violation_rate": (raw_margin[valid] > enriched_margin[valid]).float().mean(),
-                    "target_reliable_robust_rate": reliable_valid.float().mean(),
-                    "target_margin_gain_reliable": margin_gain[reliable_valid].mean()
-                    if reliable_valid.any() else zero,
-                    "target_gain_satisfied_rate": (margin_gain[reliable_valid] >= self.gain_margin).float().mean()
-                    if reliable_valid.any() else zero,
-                })
-            else:
-                diagnostics.update({
-                    "target_valid_robust_rate": zero,
-                    "target_raw_margin": zero,
-                    "target_enriched_margin": zero,
-                    "target_margin_gain": zero,
-                    "target_guard_violation_rate": zero,
-                    "target_reliable_robust_rate": zero,
-                    "target_margin_gain_reliable": zero,
-                    "target_gain_satisfied_rate": zero,
-                })
-
             return diagnostics
-
-    def _compute_robust_loss(self, raw_query, enriched_query, retrieval_features, positive_mask, reliable, zero):
-        negative_mask = ~positive_mask
-        valid = positive_mask.any(dim=1) & negative_mask.any(dim=1)
-        if not valid.any():
-            return zero, zero, zero
-
-        raw_scores = raw_query @ retrieval_features.t()
-        enriched_scores = enriched_query @ retrieval_features.t()
-        hard_k = min(self.robust_hard_k, retrieval_features.shape[0])
-        hard_indices = raw_scores.masked_fill(positive_mask, torch.finfo(raw_scores.dtype).min).topk(
-            k=hard_k, dim=1, largest=True, sorted=True
-        ).indices
-        hard_mask = negative_mask.gather(1, hard_indices)
-
-        raw_pos = _masked_logsumexp(raw_scores, positive_mask, dim=1)
-        enr_pos = _masked_logsumexp(enriched_scores, positive_mask, dim=1)
-        raw_hard = _masked_logsumexp(raw_scores.gather(1, hard_indices), hard_mask, dim=1)
-        enr_hard = _masked_logsumexp(enriched_scores.gather(1, hard_indices), hard_mask, dim=1)
-
-        raw_margin = raw_pos - raw_hard
-        enriched_margin = enr_pos - enr_hard
-        guard_loss = F.relu(raw_margin[valid] - enriched_margin[valid]).mean()
-
-        reliable_valid = reliable & valid
-        if reliable_valid.any():
-            gain_loss = F.relu(
-                self.gain_margin - (enriched_margin[reliable_valid] - raw_margin[reliable_valid])
-            ).mean()
-        else:
-            gain_loss = zero
-        robust_loss = guard_loss + self.lambda_gain * gain_loss
-        return robust_loss, guard_loss, gain_loss

@@ -34,7 +34,6 @@ GROUPS = {
         "num_parts",
         "use_freeze_indices",
         "pnp_text_only",
-        "robust_hard_k",
         "enrich_gamma",
         "residual_gate",
         "residual_gate_hidden_dim",
@@ -53,18 +52,12 @@ GROUPS = {
     ],
     "target-aware loss settings": [
         "lambda_ret",
-        "lambda_rob",
-        "lambda_gain",
-        "gain_margin",
-        "use_target_retrieval_loss",
-        "use_target_robust_loss",
     ],
 }
 PARAMS = [param for params in GROUPS.values() for param in params]
 
 ALIASES = {
     "freeze_indices": "use_freeze_indices",
-    "hard_neg_k": "robust_hard_k",
     "gate_mode": "residual_gate",
     "pool_interval": "recompute_interval",
     "mixer_context_pooling": "context_pooling",
@@ -91,7 +84,6 @@ CLI_META = {
         "aliases": "",
         "validation": "requires freeze_host, no_use_host_loss, use_freeze_indices, enrichment_space=global",
     },
-    "robust_hard_k": {"default": 32, "kind": "int", "choices": "", "aliases": "--hard_neg_k", "validation": ""},
     "enrich_gamma": {"default": None, "kind": "optional_float", "choices": "", "aliases": "", "validation": "required only when residual_gate=static; forbidden when residual_gate=residual"},
     "residual_gate": {"default": "residual", "kind": "str", "choices": "static, residual", "aliases": "--gate_mode", "validation": ""},
     "residual_gate_hidden_dim": {"default": 128, "kind": "int", "choices": "", "aliases": "", "validation": ">= 1"},
@@ -105,12 +97,7 @@ CLI_META = {
     "mixer_hidden_channel": {"default": 512, "kind": "int", "choices": "", "aliases": "", "validation": ">= 1"},
     "mixer_hidden_readout": {"default": 128, "kind": "int", "choices": "", "aliases": "", "validation": ">= 1"},
     "context_pooling": {"default": "mlp", "kind": "str", "choices": "mlp, late_attention, hybrid_attention", "aliases": "--mixer_context_pooling", "validation": ""},
-    "lambda_ret": {"default": 1.0, "kind": "float", "choices": "", "aliases": "", "validation": ""},
-    "lambda_rob": {"default": 0.1, "kind": "float", "choices": "", "aliases": "", "validation": ""},
-    "lambda_gain": {"default": 1.0, "kind": "float", "choices": "", "aliases": "", "validation": ""},
-    "gain_margin": {"default": 0.01, "kind": "float", "choices": "", "aliases": "", "validation": ""},
-    "use_target_retrieval_loss": {"default": False, "kind": "flag", "choices": "", "aliases": "", "validation": ""},
-    "use_target_robust_loss": {"default": False, "kind": "flag", "choices": "", "aliases": "", "validation": ""},
+    "lambda_ret": {"default": 1.0, "kind": "float", "choices": "", "aliases": "", "validation": "> 0"},
 }
 
 EXTRACTOR_ALIASES = {
@@ -472,18 +459,6 @@ def capacity_bucket(score: float) -> str:
     return "medium/default-ish"
 
 
-def loss_profile(row: pd.Series) -> str:
-    ret = bool(row["cfg__use_target_retrieval_loss"])
-    rob = bool(row["cfg__use_target_robust_loss"])
-    if ret and rob:
-        return "both"
-    if ret:
-        return "retrieval_only"
-    if rob:
-        return "robust_only"
-    return "neither"
-
-
 def cache_profile(row: pd.Series) -> str:
     return (
         f"top_m={value_key(row['cfg__top_m'])}/"
@@ -514,11 +489,9 @@ def run_analysis() -> str:
 
     data["_capacity_score"] = data.apply(capacity_score, axis=1)
     data["_capacity_bucket"] = data["_capacity_score"].map(capacity_bucket)
-    data["_loss_profile"] = data.apply(loss_profile, axis=1)
     data["_cache_profile"] = data.apply(cache_profile, axis=1)
     valid["_capacity_score"] = valid.apply(capacity_score, axis=1)
     valid["_capacity_bucket"] = valid["_capacity_score"].map(capacity_bucket)
-    valid["_loss_profile"] = valid.apply(loss_profile, axis=1)
     valid["_cache_profile"] = valid.apply(cache_profile, axis=1)
 
     parser_default_values = {param: parser_defaults.get(param, CLI_META[param]["default"]) for param in PARAMS}
@@ -784,7 +757,6 @@ def run_analysis() -> str:
     lines.append("")
     interaction_specs = [
         ("enrichment_space x extractor_mode", ["enrichment_space", "extractor_mode"]),
-        ("top_m x robust_hard_k", ["top_m", "robust_hard_k"]),
         ("residual_gate x enrich_gamma", ["residual_gate", "enrich_gamma"]),
         ("residual_gate x residual_gate_hidden_dim", ["residual_gate", "residual_gate_hidden_dim"]),
         ("recompute_level x recompute_interval", ["recompute_level", "recompute_interval"]),
@@ -793,13 +765,9 @@ def run_analysis() -> str:
         ("mixer_depth x mixer_hidden_readout", ["mixer_depth", "mixer_hidden_readout"]),
         ("mixer_hidden_part x mixer_hidden_rank", ["mixer_hidden_part", "mixer_hidden_rank"]),
         ("context_pooling x mixer_depth", ["context_pooling", "mixer_depth"]),
-        ("use_target_retrieval_loss x lambda_ret", ["use_target_retrieval_loss", "lambda_ret"]),
-        ("use_target_robust_loss x lambda_rob", ["use_target_robust_loss", "lambda_rob"]),
-        ("lambda_rob x lambda_gain", ["lambda_rob", "lambda_gain"]),
-        ("lambda_gain x gain_margin", ["lambda_gain", "gain_margin"]),
         ("extractor_mode/num_parts x mixer_hidden_part", ["extractor_mode", "num_parts", "mixer_hidden_part"]),
         ("top_m x mixer_hidden_rank", ["top_m", "mixer_hidden_rank"]),
-        ("robust_hard_k x lambda_rob/gain_margin", ["robust_hard_k", "lambda_rob", "gain_margin"]),
+        ("target retrieval weight x top_m", ["lambda_ret", "top_m"]),
     ]
     interaction_rows = []
     for label, params in interaction_specs:
@@ -808,9 +776,7 @@ def run_analysis() -> str:
 
     derived_specs = [
         ("small-capacity vs large-capacity mixer profile", ["_capacity_bucket"]),
-        ("retrieval loss only vs robust loss only vs both", ["_loss_profile"]),
         ("target enrichment cache profile x mixer capacity", ["_cache_profile", "_capacity_bucket"]),
-        ("residual gate settings x target-aware loss profile", ["cfg__residual_gate", "_loss_profile"]),
     ]
     for label, cols in derived_specs:
         group = valid.groupby(cols, dropna=False)
@@ -837,7 +803,7 @@ def run_analysis() -> str:
     lines.append("## 7. Capacity And Stability Analysis")
     lines.append("")
     cap_rows = []
-    for param in ["mixer_dim", "mixer_depth", "mixer_hidden_channel", "mixer_hidden_readout", "mixer_hidden_part", "mixer_hidden_rank", "top_m", "num_parts", "robust_hard_k", "residual_gate_hidden_dim"]:
+    for param in ["mixer_dim", "mixer_depth", "mixer_hidden_channel", "mixer_hidden_readout", "mixer_hidden_part", "mixer_hidden_rank", "top_m", "num_parts", "residual_gate_hidden_dim"]:
         rows = marginal_table(valid, param)
         if len(rows) <= 1:
             cap_rows.append([param, "fixed", rows[0][0] if rows else value_key(CLI_META[param]["default"]), "not enough evidence"])
@@ -862,7 +828,7 @@ def run_analysis() -> str:
     lines.append(md_table(["Capacity parameter", "Observed values", "Fixed value", "Direction"], cap_rows))
     lines.append("")
     crash_rows = []
-    for param in ["mixer_dim", "mixer_depth", "mixer_hidden_channel", "mixer_hidden_readout", "mixer_hidden_part", "mixer_hidden_rank", "top_m", "num_parts", "robust_hard_k", "residual_gate_hidden_dim"]:
+    for param in ["mixer_dim", "mixer_depth", "mixer_hidden_channel", "mixer_hidden_readout", "mixer_hidden_part", "mixer_hidden_rank", "top_m", "num_parts", "residual_gate_hidden_dim"]:
         if param in data.columns:
             for value, df in data.groupby(f"cfg__{param}", dropna=False):
                 crashes = int(df["_state"].eq("crashed").sum())
@@ -1000,8 +966,8 @@ def run_analysis() -> str:
         ("probe_static_gamma05", probe_flags({"residual_gate": "static", "enrich_gamma": 0.5})),
         ("probe_late_attention_depth2", probe_flags({"context_pooling": "late_attention", "mixer_depth": 2})),
         ("probe_hybrid_attention_depth2", probe_flags({"context_pooling": "hybrid_attention", "mixer_depth": 2})),
-        ("probe_robust_loss_low", probe_flags({"use_target_robust_loss": True, "lambda_rob": 0.05, "gain_margin": 0.01})),
-        ("probe_ret_robust_balanced", probe_flags({"use_target_robust_loss": True, "lambda_rob": 0.1, "lambda_gain": 1.0, "gain_margin": 0.01})),
+        ("probe_lambda_ret05", probe_flags({"lambda_ret": 0.5})),
+        ("probe_lambda_ret2", probe_flags({"lambda_ret": 2.0})),
     ]
     existing_cmds = {flags for _, flags in command_flags}
     for name, flags in probe_defs:

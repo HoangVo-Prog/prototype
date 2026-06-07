@@ -31,18 +31,12 @@ pool = load_module("enrichment_pool", "model/enrichment/pool.py")
 def args(**overrides):
     defaults = dict(
         top_m=3,
-        robust_hard_k=5,
         enrich_gamma=None,
         residual_gate="residual",
         residual_gate_hidden_dim=128,
         context_pooling="mlp",
         tau=0.015,
         lambda_ret=1.0,
-        lambda_rob=0.1,
-        lambda_gain=1.0,
-        gain_margin=0.01,
-        use_target_retrieval_loss=True,
-        use_target_robust_loss=True,
         enrichment_space="global",
         topm_rank_space="host_global",
         topm_rank_lambda=0.5,
@@ -327,8 +321,11 @@ class EnrichmentShapeTests(unittest.TestCase):
         self.assertIn("mixer/context_delta_cosine", out)
         self.assertIn("mixer/output_delta_norm", out)
         self.assertIn("target_residual_gate_mean", out)
-        self.assertEqual(enricher.robust_hard_k, 5)
         self.assertTrue(torch.isfinite(out["total_loss"]))
+        self.assertTrue(torch.allclose(out["total_loss"], out["target_retrieval_loss"], atol=1e-5))
+        self.assertNotIn("robust_loss", out)
+        self.assertNotIn("guard_loss", out)
+        self.assertNotIn("gain_loss", out)
         out["total_loss"].backward()
 
     def test_enricher_uses_extractor_mode_slot_count(self):
@@ -360,8 +357,6 @@ class EnrichmentShapeTests(unittest.TestCase):
             args(
                 residual_gate="residual",
                 residual_gate_hidden_dim=32,
-                use_target_retrieval_loss=False,
-                use_target_robust_loss=False,
             ),
         ).float()
         cache = {
@@ -506,46 +501,8 @@ class EnrichmentShapeTests(unittest.TestCase):
                 args(enrichment_space="grab", only_global=True),
             )
 
-    def test_disabled_target_losses_return_zero_components(self):
-        enricher = modules.TargetPrototypeEnricher(
-            512,
-            4096,
-            args(
-                use_target_retrieval_loss=False,
-                use_target_robust_loss=False,
-            ),
-        ).float()
-        cache = {
-            "host_image_features": torch.randn(8, 512),
-            "retrieval_features": torch.randn(8, 512),
-            "prototypes": torch.randn(8, 7, 512),
-            "pids": torch.tensor([0, 1, 2, 3, 0, 1, 2, 4]),
-        }
-        out = enricher(
-            query_features=torch.randn(3, 512, requires_grad=True),
-            host_text_features=torch.randn(3, 512, requires_grad=True),
-            query_pids=torch.tensor([0, 1, 2]),
-            pool_cache=cache,
-            space="global",
-        )
-        self.assertTrue(torch.allclose(
-            out["target_retrieval_loss"],
-            torch.zeros_like(out["target_retrieval_loss"]),
-        ))
-        self.assertTrue(torch.allclose(out["robust_loss"], torch.zeros_like(out["robust_loss"])))
-        self.assertTrue(torch.allclose(out["guard_loss"], torch.zeros_like(out["guard_loss"])))
-        self.assertTrue(torch.allclose(out["gain_loss"], torch.zeros_like(out["gain_loss"])))
-        self.assertTrue(torch.allclose(out["total_loss"], torch.zeros_like(out["total_loss"])))
-
-    def test_only_target_retrieval_loss_skips_auxiliary_components(self):
-        enricher = modules.TargetPrototypeEnricher(
-            512,
-            4096,
-            args(
-                use_target_retrieval_loss=True,
-                use_target_robust_loss=False,
-            ),
-        ).float()
+    def test_target_retrieval_loss_is_mandatory(self):
+        enricher = modules.TargetPrototypeEnricher(512, 4096, args()).float()
         cache = {
             "host_image_features": torch.randn(8, 512),
             "retrieval_features": torch.randn(8, 512),
@@ -560,18 +517,24 @@ class EnrichmentShapeTests(unittest.TestCase):
             space="global",
         )
         self.assertTrue(torch.isfinite(out["target_retrieval_loss"]))
-        self.assertTrue(torch.allclose(out["robust_loss"], torch.zeros_like(out["robust_loss"])))
-        self.assertTrue(torch.allclose(out["guard_loss"], torch.zeros_like(out["guard_loss"])))
-        self.assertTrue(torch.allclose(out["gain_loss"], torch.zeros_like(out["gain_loss"])))
         self.assertTrue(torch.allclose(out["total_loss"], out["target_retrieval_loss"], atol=1e-5))
 
-    def test_target_losses_default_to_disabled_in_enricher(self):
-        defaults = args()
-        delattr(defaults, "use_target_retrieval_loss")
-        delattr(defaults, "use_target_robust_loss")
-        enricher = modules.TargetPrototypeEnricher(512, 4096, defaults).float()
-        self.assertFalse(enricher.use_target_retrieval_loss)
-        self.assertFalse(enricher.use_target_robust_loss)
+    def test_target_retrieval_loss_requires_positive_pool_matches(self):
+        enricher = modules.TargetPrototypeEnricher(512, 4096, args()).float()
+        cache = {
+            "host_image_features": torch.randn(8, 512),
+            "retrieval_features": torch.randn(8, 512),
+            "prototypes": torch.randn(8, 7, 512),
+            "pids": torch.tensor([0, 1, 2, 3, 0, 1, 2, 4]),
+        }
+        with self.assertRaisesRegex(ValueError, "positive image in the target pool"):
+            enricher(
+                query_features=torch.randn(3, 512, requires_grad=True),
+                host_text_features=torch.randn(3, 512, requires_grad=True),
+                query_pids=torch.tensor([0, 1, 9]),
+                pool_cache=cache,
+                space="global",
+            )
 
     def test_lambda_ret_scales_target_retrieval_objective(self):
         cache = {
@@ -592,12 +555,12 @@ class EnrichmentShapeTests(unittest.TestCase):
         base = modules.TargetPrototypeEnricher(
             512,
             4096,
-            args(use_target_robust_loss=False, lambda_ret=1.0),
+            args(lambda_ret=1.0),
         ).float()
         scaled = modules.TargetPrototypeEnricher(
             512,
             4096,
-            args(use_target_robust_loss=False, lambda_ret=2.0),
+            args(lambda_ret=2.0),
         ).float()
         scaled.load_state_dict(base.state_dict())
         base_out = base(**common)
@@ -638,7 +601,7 @@ class EnrichmentShapeTests(unittest.TestCase):
         out_b = enricher(
             query_features=query_features,
             host_text_features=host_text_features,
-            query_pids=torch.tensor([9, 8, 7]),
+            query_pids=torch.tensor([7, 6, 5]),
             pool_cache=cache_b,
             space="global",
         )
@@ -650,9 +613,6 @@ class EnrichmentShapeTests(unittest.TestCase):
             8,
             args(
                 top_m=1,
-                robust_hard_k=1,
-                use_target_retrieval_loss=False,
-                use_target_robust_loss=False,
                 topm_rank_space="retrieval",
             ),
         ).float()
@@ -686,9 +646,6 @@ class EnrichmentShapeTests(unittest.TestCase):
             args(
                 extractor_mode="retrieval_backbone",
                 top_m=1,
-                robust_hard_k=1,
-                use_target_retrieval_loss=False,
-                use_target_robust_loss=False,
                 topm_rank_space="host_global",
             ),
         ).float()
@@ -721,9 +678,6 @@ class EnrichmentShapeTests(unittest.TestCase):
             args(
                 extractor_mode="cluster_density",
                 top_m=2,
-                robust_hard_k=1,
-                use_target_retrieval_loss=False,
-                use_target_robust_loss=False,
             ),
         ).float()
         cache = {
@@ -753,9 +707,6 @@ class EnrichmentShapeTests(unittest.TestCase):
             8,
             args(
                 top_m=1,
-                robust_hard_k=1,
-                use_target_retrieval_loss=False,
-                use_target_robust_loss=False,
                 topm_rank_space="hybrid_global_grab",
                 topm_rank_lambda=0.25,
             ),
@@ -1151,8 +1102,8 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertEqual(parsed.seed, 1)
         self.assertTrue(parsed.deterministic)
         self.assertFalse(parsed.deterministic_warn_only)
-        self.assertFalse(parsed.use_target_retrieval_loss)
-        self.assertFalse(parsed.use_target_robust_loss)
+        self.assertFalse(hasattr(parsed, "use_target_retrieval_loss"))
+        self.assertFalse(hasattr(parsed, "use_target_robust_loss"))
         self.assertFalse(parsed.pnp_text_only)
         self.assertEqual(parsed.topm_rank_space, "host_global")
         self.assertEqual(parsed.topm_rank_lambda, 0.5)
@@ -1370,22 +1321,32 @@ class SchedulerOptionTests(unittest.TestCase):
         finally:
             sys.argv = old_argv
 
-    def test_loss_cli_flags_are_store_true_and_host_can_be_disabled(self):
+    def test_host_loss_can_be_disabled_and_removed_target_loss_flags_are_rejected(self):
         options = importlib.import_module("utils.options")
         old_argv = sys.argv
         try:
-            sys.argv = [
-                "test",
-                "--no_use_host_loss",
-                "--use_target_retrieval_loss",
-                "--use_target_robust_loss",
-            ]
+            sys.argv = ["test", "--no_use_host_loss"]
             parsed = options.get_args()
+
+            removed_flags = [
+                ["--use_target_retrieval_loss"],
+                ["--use_target_robust_loss"],
+                ["--hard_neg_k", "1"],
+                ["--lambda_rob", "0.1"],
+                ["--lambda_gain", "1.0"],
+                ["--gain_margin", "0.01"],
+            ]
+            for flag_args in removed_flags:
+                sys.argv = ["test", *flag_args]
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    options.get_args()
+
+            sys.argv = ["test", "--lambda_ret", "0"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
         finally:
             sys.argv = old_argv
         self.assertFalse(parsed.use_host_loss)
-        self.assertTrue(parsed.use_target_retrieval_loss)
-        self.assertTrue(parsed.use_target_robust_loss)
 
     def test_lr_total_epochs_overrides_training_epoch_count(self):
         build = importlib.import_module("solver.build")

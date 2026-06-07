@@ -207,9 +207,6 @@ def get_args():
                         help="precompute frozen host top-M rankings once and reuse them for top-M selection")
     parser.add_argument("--pnp_text_only", action="store_true", default=False,
                         help="for frozen plug-and-play global training, encode only batch text and use frozen target cache for images")
-    parser.add_argument("--robust_hard_k", "--hard_neg_k", dest="robust_hard_k",
-                        type=int, default=32,
-                        help="number of raw-score hard negatives R used by robust margin loss")
     parser.add_argument("--enrich_gamma", type=float, default=None,
                         help="static residual strength; valid only with --residual_gate static")
     parser.add_argument("--residual_gate", "--gate_mode", dest="residual_gate",
@@ -249,17 +246,7 @@ def get_args():
     
     ######################## target-aware loss settings ########################
     parser.add_argument("--lambda_ret", type=float, default=1.0,
-                        help="weight for the target-pool retrieval loss")
-    parser.add_argument("--lambda_rob", type=float, default=0.1,
-                        help="weight for robust no-harm/margin-gain loss")
-    parser.add_argument("--lambda_gain", type=float, default=1.0,
-                        help="weight for the margin-gain term inside the robust loss")
-    parser.add_argument("--gain_margin", type=float, default=0.01,
-                        help="required enriched-vs-raw retrieval margin gain")
-    parser.add_argument("--use_target_retrieval_loss", action="store_true", default=False,
-                        help="enable the primary target-pool retrieval loss")
-    parser.add_argument("--use_target_robust_loss", action="store_true", default=False,
-                        help="enable the robust no-harm and margin-gain loss")
+                        help="weight for the target-pool retrieval loss used by target enrichment")
     
     args = parser.parse_args()
     if args.seed < 0 or args.seed >= 2**32:
@@ -279,6 +266,8 @@ def get_args():
         parser.error("--target_relative_num_clusters must be a positive integer")
     if args.evidence_token_budget < 0:
         parser.error("--evidence_token_budget must be non-negative")
+    if args.lambda_ret <= 0:
+        parser.error("--lambda_ret must be positive")
     if args.evidence_token_budget > 0:
         from model.enrichment.prototypes import prototype_slot_count
         if prototype_slot_count(args.extractor_mode, args.num_parts) > args.evidence_token_budget:

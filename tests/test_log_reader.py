@@ -23,7 +23,6 @@ horizontal'
  top_m=64
  mixer_hidden_rank=128
  lambda_ret=0.5
- use_target_retrieval_loss=True
  num_epoch=30
  use_host_loss=False
  distributed=False)
