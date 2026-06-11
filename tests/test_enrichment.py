@@ -152,48 +152,17 @@ class EnrichmentShapeTests(unittest.TestCase):
             self.assertIn(key, adapter.last_diagnostics)
         c_q.sum().backward()
 
-    def test_rank_part_mixer_attention_pooling_modes(self):
+    def test_rank_part_mixer_rejects_removed_attention_pooling_modes(self):
         for context_pooling in ("late_attention", "hybrid_attention"):
             with self.subTest(context_pooling=context_pooling):
-                adapter = modules.RankPartQueryConditionedMixerAdapter(
-                    embed_dim=16,
-                    num_ranks=3,
-                    num_slots=5,
-                    mixer_dim=8,
-                    depth=1,
-                    hidden_part=6,
-                    hidden_rank=7,
-                    hidden_channel=12,
-                    hidden_readout=4,
-                    context_pooling=context_pooling,
-                ).float()
-                z_q = torch.randn(2, 16, requires_grad=True)
-                B_q_M = torch.randn(2, 3, 5, 16, requires_grad=True)
-
-                c_q = adapter(z_q, B_q_M)
-
-                self.assertEqual(c_q.shape, (2, 16))
-                for key in (
-                    "mixer/attn_entropy",
-                    "mixer/attn_top1_mass",
-                    "mixer/attn_rank1_mass",
-                    "mixer/attn_slot0_mass",
-                    "mixer/attn_non_slot0_mass",
-                    "mixer/attention_pool_output_norm",
-                    "mixer/attention_pool_weight_norm",
-                ):
-                    self.assertIn(key, adapter.last_diagnostics)
-                    self.assertTrue(torch.isfinite(adapter.last_diagnostics[key]))
-                if context_pooling == "hybrid_attention":
-                    for key in (
-                        "mixer/hybrid_pool_gate_mean",
-                        "mixer/hybrid_pool_gate_std",
-                        "mixer/mlp_pool_output_norm",
-                        "mixer/hybrid_pool_gate_weight_norm",
-                    ):
-                        self.assertIn(key, adapter.last_diagnostics)
-                        self.assertTrue(torch.isfinite(adapter.last_diagnostics[key]))
-                c_q.sum().backward()
+                with self.assertRaisesRegex(ValueError, "context_pooling"):
+                    modules.RankPartQueryConditionedMixerAdapter(
+                        embed_dim=16,
+                        num_ranks=3,
+                        num_slots=5,
+                        mixer_dim=8,
+                        context_pooling=context_pooling,
+                    )
 
     def test_rank_part_mixer_rejects_unknown_context_pooling(self):
         with self.assertRaisesRegex(ValueError, "context_pooling"):
@@ -1160,17 +1129,18 @@ class SchedulerOptionTests(unittest.TestCase):
         finally:
             sys.argv = old_argv
 
-    def test_context_pooling_cli_parses_attention_modes(self):
+    def test_context_pooling_cli_rejects_removed_attention_modes(self):
         options = importlib.import_module("utils.options")
         old_argv = sys.argv
         try:
-            sys.argv = ["test", "--context_pooling", "late_attention"]
-            parsed = options.get_args()
-            self.assertEqual(parsed.context_pooling, "late_attention")
-
-            sys.argv = ["test", "--mixer_context_pooling", "hybrid_attention"]
-            parsed = options.get_args()
-            self.assertEqual(parsed.context_pooling, "hybrid_attention")
+            for argv in (
+                ["--context_pooling", "late_attention"],
+                ["--mixer_context_pooling", "hybrid_attention"],
+            ):
+                with self.subTest(argv=argv):
+                    sys.argv = ["test", *argv]
+                    with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        options.get_args()
         finally:
             sys.argv = old_argv
 

@@ -1,5 +1,3 @@
-import math
-
 import torch
 import torch.nn as nn
 
@@ -76,10 +74,8 @@ class RankPartQueryConditionedMixerAdapter(nn.Module):
             raise ValueError("mixer_dim must be a positive integer")
         if depth < 1:
             raise ValueError("mixer_depth must be a positive integer")
-        if context_pooling not in ("mlp", "late_attention", "hybrid_attention"):
-            raise ValueError(
-                "context_pooling must be one of: mlp, late_attention, hybrid_attention"
-            )
+        if context_pooling != "mlp":
+            raise ValueError("context_pooling must be mlp")
 
         self.embed_dim = embed_dim
         self.num_ranks = num_ranks
@@ -106,23 +102,7 @@ class RankPartQueryConditionedMixerAdapter(nn.Module):
             for _ in range(depth)
         ])
         self.final_ln = nn.LayerNorm(mixer_dim)
-        if context_pooling in ("mlp", "hybrid_attention"):
-            self.readout_mlp = _two_layer_mlp(self.num_tokens, hidden_readout, 1)
-        if context_pooling in ("late_attention", "hybrid_attention"):
-            self.attn_query_norm = nn.LayerNorm(mixer_dim)
-            self.attn_token_norm = nn.LayerNorm(mixer_dim)
-            self.attn_q = nn.Linear(mixer_dim, mixer_dim, bias=False)
-            self.attn_k = nn.Linear(mixer_dim, mixer_dim, bias=False)
-            self.attn_v = nn.Linear(mixer_dim, mixer_dim, bias=False)
-            self.attn_rank_bias = nn.Parameter(torch.zeros(1, num_ranks, 1))
-            self.attn_part_bias = nn.Parameter(torch.zeros(1, 1, num_slots))
-        if context_pooling == "hybrid_attention":
-            self.hybrid_gate = nn.Sequential(
-                nn.Linear(mixer_dim * 3, mixer_dim),
-                nn.LayerNorm(mixer_dim),
-                nn.GELU(),
-                nn.Linear(mixer_dim, 1),
-            )
+        self.readout_mlp = _two_layer_mlp(self.num_tokens, hidden_readout, 1)
         self.w_out = nn.Linear(mixer_dim, embed_dim)
         self.last_diagnostics = {}
 
@@ -173,91 +153,16 @@ class RankPartQueryConditionedMixerAdapter(nn.Module):
         return total
 
     def _weight_diagnostics(self):
-        diagnostics = {
+        return {
             "mixer/rank_mixing_weight_norm": self._weight_norm([block.rank_mlp for block in self.blocks]),
             "mixer/part_mixing_weight_norm": self._weight_norm([block.part_mlp for block in self.blocks]),
             "mixer/channel_mixing_weight_norm": self._weight_norm([block.channel_mlp for block in self.blocks]),
+            "mixer/readout_weight_norm": self._weight_norm([self.readout_mlp]),
         }
-        if hasattr(self, "readout_mlp"):
-            diagnostics["mixer/readout_weight_norm"] = self._weight_norm([self.readout_mlp])
-        if hasattr(self, "attn_q"):
-            diagnostics["mixer/attention_pool_weight_norm"] = self._weight_norm([
-                self.attn_q,
-                self.attn_k,
-                self.attn_v,
-            ])
-        if hasattr(self, "hybrid_gate"):
-            diagnostics["mixer/hybrid_pool_gate_weight_norm"] = self._weight_norm([self.hybrid_gate])
-        return diagnostics
-
-    def _rank_token_mask(self, rank_mask):
-        if rank_mask is None:
-            return None
-        rank_valid = rank_mask.squeeze(-1).squeeze(-1).bool()
-        return rank_valid.unsqueeze(-1).expand(-1, -1, self.num_slots).reshape(1, self.num_tokens)
 
     def _mlp_pool(self, h_flat):
         h_t = h_flat.transpose(1, 2)
         return self.readout_mlp(h_t).squeeze(-1)
-
-    def _attention_pool(self, h_flat, q, rank_mask=None):
-        token_features = self.attn_token_norm(h_flat)
-        query = self.attn_q(self.attn_query_norm(q)).unsqueeze(1)
-        keys = self.attn_k(token_features)
-        logits = (query * keys).sum(dim=-1) / math.sqrt(self.mixer_dim)
-        token_bias = (self.attn_rank_bias + self.attn_part_bias).reshape(1, self.num_tokens)
-        logits = logits + token_bias.to(device=logits.device, dtype=logits.dtype)
-
-        token_mask = self._rank_token_mask(rank_mask)
-        if token_mask is not None:
-            token_mask = token_mask.to(device=logits.device)
-            logits = logits.masked_fill(~token_mask, torch.finfo(logits.dtype).min)
-
-        attention = torch.softmax(logits, dim=1)
-        values = self.attn_v(token_features)
-        pooled = (attention.unsqueeze(-1) * values).sum(dim=1)
-        return pooled, attention
-
-    def _attention_diagnostics(self, attention):
-        token_attention = attention.detach().float()
-        entropy = -(token_attention * token_attention.clamp_min(1e-12).log()).sum(dim=1)
-        rank_attention = token_attention.reshape(token_attention.shape[0], self.num_ranks, self.num_slots)
-        diagnostics = {
-            "mixer/attn_entropy": entropy.mean(),
-            "mixer/attn_top1_mass": token_attention.max(dim=1).values.mean(),
-            "mixer/attn_rank1_mass": rank_attention[:, 0, :].sum(dim=1).mean(),
-            "mixer/attn_slot0_mass": rank_attention[:, :, 0].sum(dim=1).mean(),
-        }
-        if self.num_slots > 1:
-            diagnostics["mixer/attn_non_slot0_mass"] = rank_attention[:, :, 1:].sum(dim=(1, 2)).mean()
-        else:
-            diagnostics["mixer/attn_non_slot0_mass"] = token_attention.new_tensor(0.0)
-        return diagnostics
-
-    def _pool_context(self, h_flat, q, rank_mask=None):
-        diagnostics = {}
-        if self.context_pooling == "mlp":
-            return self._mlp_pool(h_flat), diagnostics
-
-        h_attn, attention = self._attention_pool(h_flat, q, rank_mask=rank_mask)
-        diagnostics.update(self._attention_diagnostics(attention))
-        diagnostics["mixer/attention_pool_output_norm"] = h_attn.detach().float().norm(dim=1).mean()
-        if self.context_pooling == "late_attention":
-            return h_attn, diagnostics
-
-        h_mlp = self._mlp_pool(h_flat)
-        gate_input = torch.cat([h_mlp, h_attn, h_mlp * h_attn], dim=-1)
-        gate = torch.sigmoid(self.hybrid_gate(gate_input))
-        h = gate * h_attn + (1.0 - gate) * h_mlp
-        gate_detached = gate.detach().float()
-        diagnostics.update({
-            "mixer/hybrid_pool_gate_mean": gate_detached.mean(),
-            "mixer/hybrid_pool_gate_std": gate_detached.std(unbiased=False),
-            "mixer/hybrid_pool_gate_min": gate_detached.min(),
-            "mixer/hybrid_pool_gate_max": gate_detached.max(),
-            "mixer/mlp_pool_output_norm": h_mlp.detach().float().norm(dim=1).mean(),
-        })
-        return h, diagnostics
 
     def forward(self, z_q, B_q_M):
         if z_q.dim() != 2:
@@ -294,7 +199,7 @@ class RankPartQueryConditionedMixerAdapter(nn.Module):
         if rank_mask is not None:
             h_structured = h_structured * rank_mask
         h_flat = h_structured.flatten(1, 2)
-        h, pooling_diagnostics = self._pool_context(h_flat, q, rank_mask=rank_mask)
+        h = self._mlp_pool(h_flat)
         c_q = self.w_out(h)
 
         with torch.no_grad():
@@ -309,7 +214,6 @@ class RankPartQueryConditionedMixerAdapter(nn.Module):
                 "mixer/H_flat_token_std": h_flat.detach().float().std(dim=1, unbiased=False).mean(),
                 "mixer/readout_output_norm": h.detach().float().norm(dim=1).mean(),
             }
-            diagnostics.update(pooling_diagnostics)
             diagnostics.update(self._weight_diagnostics())
             self.last_diagnostics = diagnostics
 

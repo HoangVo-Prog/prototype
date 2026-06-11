@@ -238,11 +238,11 @@ def get_args():
     parser.add_argument("--mixer_hidden_channel", type=int, default=512,
                         help="hidden dimension for mixer-channel mixing")
     parser.add_argument("--mixer_hidden_readout", type=int, default=128,
-                        help="hidden dimension for MLP or hybrid token readout")
+                        help="hidden dimension for MLP token readout")
     parser.add_argument("--context_pooling", "--mixer_context_pooling",
                         dest="context_pooling", type=str, default="mlp",
-                        choices=["mlp", "late_attention", "hybrid_attention"],
-                        help="context pooling after rank-part mixing")    
+                        choices=["mlp"],
+                        help="MLP context pooling after rank-part mixing")
     
     ######################## target-aware loss settings ########################
     parser.add_argument("--lambda_ret", type=float, default=1.0,

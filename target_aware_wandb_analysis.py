@@ -96,7 +96,7 @@ CLI_META = {
     "mixer_hidden_rank": {"default": 64, "kind": "int", "choices": "", "aliases": "", "validation": ">= 1"},
     "mixer_hidden_channel": {"default": 512, "kind": "int", "choices": "", "aliases": "", "validation": ">= 1"},
     "mixer_hidden_readout": {"default": 128, "kind": "int", "choices": "", "aliases": "", "validation": ">= 1"},
-    "context_pooling": {"default": "mlp", "kind": "str", "choices": "mlp, late_attention, hybrid_attention", "aliases": "--mixer_context_pooling", "validation": ""},
+    "context_pooling": {"default": "mlp", "kind": "str", "choices": "mlp", "aliases": "--mixer_context_pooling", "validation": "fixed to mlp"},
     "lambda_ret": {"default": 1.0, "kind": "float", "choices": "", "aliases": "", "validation": "> 0"},
 }
 
@@ -313,6 +313,9 @@ def read_exports(paths: list[Path], parser_defaults: dict[str, Any]) -> pd.DataF
             row_reasons.append("missing epoch/num_epoch")
         elif row["epoch"] < row["num_epoch"]:
             row_reasons.append(f"unfinished epoch {int(row['epoch'])}/{int(row['num_epoch'])}")
+        current_pooling = parser_defaults.get("context_pooling", CLI_META["context_pooling"]["default"])
+        if not values_equal(row["cfg__context_pooling"], current_pooling):
+            row_reasons.append("unsupported current context_pooling")
         reasons.append("; ".join(row_reasons))
     raw["_exclude_reason"] = reasons
     raw["_valid"] = raw["_exclude_reason"].eq("")
@@ -964,8 +967,8 @@ def run_analysis() -> str:
         ("probe_topm64_repeat", probe_flags({"top_m": 64})),
         ("probe_static_gamma03", probe_flags({"residual_gate": "static", "enrich_gamma": 0.3})),
         ("probe_static_gamma05", probe_flags({"residual_gate": "static", "enrich_gamma": 0.5})),
-        ("probe_late_attention_depth2", probe_flags({"context_pooling": "late_attention", "mixer_depth": 2})),
-        ("probe_hybrid_attention_depth2", probe_flags({"context_pooling": "hybrid_attention", "mixer_depth": 2})),
+        ("probe_mlp_depth1", probe_flags({"context_pooling": "mlp", "mixer_depth": 1})),
+        ("probe_mlp_depth2", probe_flags({"context_pooling": "mlp", "mixer_depth": 2})),
         ("probe_lambda_ret05", probe_flags({"lambda_ret": 0.5})),
         ("probe_lambda_ret2", probe_flags({"lambda_ret": 2.0})),
     ]
@@ -979,7 +982,7 @@ def run_analysis() -> str:
     lines.append("")
 
     report = "\n".join(lines)
-    REPORT_PATH.write_text(report, encoding="utf-8")
+    REPORT_PATH.write_text(report, encoding="utf-8", newline="\n")
     return report
 
 
