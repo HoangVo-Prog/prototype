@@ -59,6 +59,25 @@ def parse_extractor_mode(value):
     return ",".join(normalized_tokens)
 
 
+def _prototype_slot_count(mode, num_parts):
+    slots = 0
+    for extractor in mode.split(","):
+        if extractor in (
+            "global",
+            "retrieval_backbone",
+            "cluster",
+            "cluster_residual",
+            "cluster_density",
+            "cluster_rarity",
+        ):
+            slots += 1
+        elif extractor == "grid":
+            slots += num_parts * num_parts
+        else:
+            slots += num_parts
+    return slots
+
+
 def get_args():
     parser = argparse.ArgumentParser(description="ITSELF Args")
     parser.add_argument("--tau", default=0.015, type=float)
@@ -160,6 +179,9 @@ def get_args():
     parser.set_defaults(use_wandb=True)
     parser.add_argument("--wandb_project", default="enrichment",
                         help="Weights & Biases project name")
+    parser.add_argument("--delete_checkpoints_after_run", action="store_true", default=False,
+                        help="delete checkpoints produced in the run output directory after training finishes; "
+                             "when W&B is enabled, cleanup waits until checkpoint artifact upload succeeds")
 
     ### GRAB
     parser.add_argument("--only_global", action='store_true')
@@ -269,8 +291,7 @@ def get_args():
     if args.lambda_ret <= 0:
         parser.error("--lambda_ret must be positive")
     if args.evidence_token_budget > 0:
-        from model.enrichment.prototypes import prototype_slot_count
-        if prototype_slot_count(args.extractor_mode, args.num_parts) > args.evidence_token_budget:
+        if _prototype_slot_count(args.extractor_mode, args.num_parts) > args.evidence_token_budget:
             parser.error("--extractor_mode exceeds --evidence_token_budget")
     if (
         args.target_enrichment

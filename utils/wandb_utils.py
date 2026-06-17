@@ -238,12 +238,15 @@ def _resolve_config_upload_path(output_dir, config_name):
     return None, None
 
 
-def upload_best_checkpoint_artifact(
+def _upload_checkpoint_artifact(
     run,
     output_dir,
+    checkpoint_name,
     logger=None,
-    checkpoint_name="best.pth",
     config_name="config.yaml",
+    aliases=None,
+    artifact_label=None,
+    summary_prefix=None,
 ):
     if run is None:
         return None
@@ -258,7 +261,9 @@ def upload_best_checkpoint_artifact(
         import wandb
 
         run_name = getattr(run, "name", None) or checkpoint_path.parent.name
-        artifact_name = _wandb_artifact_name("{}-best".format(run_name))
+        artifact_name = _wandb_artifact_name(
+            "{}-{}".format(run_name, artifact_label or checkpoint_path.stem)
+        )
         config_path, artifact_config_name = _resolve_config_upload_path(output_dir, config_name)
         metadata = {
             "checkpoint": checkpoint_name,
@@ -276,14 +281,14 @@ def upload_best_checkpoint_artifact(
         artifact.add_file(str(checkpoint_path), name=checkpoint_name)
         if config_path is not None:
             artifact.add_file(str(config_path), name=artifact_config_name)
-            if hasattr(run, "summary"):
-                run.summary["best_checkpoint_config_path"] = str(config_path)
+            if summary_prefix and hasattr(run, "summary"):
+                run.summary["{}_checkpoint_config_path".format(summary_prefix)] = str(config_path)
         elif logger is not None:
             logger.warning("W&B config upload skipped: {} not found in {}.".format(config_name, output_dir))
-        run.log_artifact(artifact, aliases=["best", "latest"])
-        if hasattr(run, "summary"):
-            run.summary["best_checkpoint_artifact"] = artifact_name
-            run.summary["best_checkpoint_path"] = str(checkpoint_path)
+        run.log_artifact(artifact, aliases=aliases)
+        if summary_prefix and hasattr(run, "summary"):
+            run.summary["{}_checkpoint_artifact".format(summary_prefix)] = artifact_name
+            run.summary["{}_checkpoint_path".format(summary_prefix)] = str(checkpoint_path)
         if logger is not None:
             logger.info("Uploaded W&B checkpoint artifact: {}".format(artifact_name))
         return artifact
@@ -291,6 +296,71 @@ def upload_best_checkpoint_artifact(
         if logger is not None:
             logger.warning("W&B checkpoint upload failed: {}".format(error))
         return None
+
+
+def upload_best_checkpoint_artifact(
+    run,
+    output_dir,
+    logger=None,
+    checkpoint_name="best.pth",
+    config_name="config.yaml",
+):
+    return _upload_checkpoint_artifact(
+        run,
+        output_dir,
+        checkpoint_name=checkpoint_name,
+        logger=logger,
+        config_name=config_name,
+        aliases=["best", "latest"],
+        artifact_label="best",
+        summary_prefix="best",
+    )
+
+
+def upload_checkpoint_artifacts(
+    run,
+    output_dir,
+    logger=None,
+    checkpoint_pattern="*.pth",
+    config_name="config.yaml",
+):
+    if run is None:
+        return None
+
+    output_path = Path(output_dir)
+    checkpoint_paths = sorted(path for path in output_path.glob(checkpoint_pattern) if path.is_file())
+    if not checkpoint_paths:
+        if logger is not None:
+            logger.warning("W&B checkpoint upload skipped: no {} files found in {}.".format(
+                checkpoint_pattern,
+                output_path,
+            ))
+        return []
+
+    artifacts = []
+    artifact_names = []
+    for checkpoint_path in checkpoint_paths:
+        checkpoint_name = checkpoint_path.name
+        is_best = checkpoint_name == "best.pth"
+        artifact = _upload_checkpoint_artifact(
+            run,
+            output_dir,
+            checkpoint_name=checkpoint_name,
+            logger=logger,
+            config_name=config_name,
+            aliases=["best", "latest"] if is_best else [checkpoint_path.stem],
+            artifact_label="best" if is_best else checkpoint_path.stem,
+            summary_prefix="best" if is_best else None,
+        )
+        if artifact is None:
+            return None
+        artifacts.append(artifact)
+        artifact_names.append(artifact.name)
+
+    if hasattr(run, "summary"):
+        run.summary["checkpoint_artifacts"] = artifact_names
+        run.summary["checkpoint_artifact_count"] = len(artifact_names)
+    return artifacts
 
 
 def finish_wandb(run):

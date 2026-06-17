@@ -6,7 +6,13 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
-from utils.wandb_utils import build_wandb_config, get_wandb_project, upload_best_checkpoint_artifact
+from utils.checkpoint import delete_output_checkpoints
+from utils.wandb_utils import (
+    build_wandb_config,
+    get_wandb_project,
+    upload_best_checkpoint_artifact,
+    upload_checkpoint_artifacts,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -126,6 +132,53 @@ class WandbCheckpointArtifactTests(unittest.TestCase):
         self.assertIsNone(artifact)
         self.assertEqual(run.logged_artifacts, [])
         self.assertIn("not found", logger.warnings[0])
+
+    def test_upload_checkpoint_artifacts_logs_all_run_checkpoints(self):
+        run = FakeRun(name="demo-run")
+        tmp_path = self._make_tmp_output_dir()
+        (tmp_path / "best.pth").write_text("best", encoding="utf-8")
+        (tmp_path / "epoch_2.pth").write_text("epoch", encoding="utf-8")
+        (tmp_path / "config.yaml").write_text("foo: bar\n", encoding="utf-8")
+        (tmp_path / "notes.txt").write_text("not a checkpoint", encoding="utf-8")
+
+        artifacts = upload_checkpoint_artifacts(run, tmp_path)
+
+        self.assertIsNotNone(artifacts)
+        self.assertEqual(len(artifacts), 2)
+        uploaded_checkpoints = [artifact.metadata["checkpoint"] for artifact in artifacts]
+        self.assertEqual(uploaded_checkpoints, ["best.pth", "epoch_2.pth"])
+        self.assertEqual(run.logged_artifacts[0][1], ["best", "latest"])
+        self.assertEqual(run.logged_artifacts[1][1], ["epoch_2"])
+        self.assertEqual(run.summary["checkpoint_artifact_count"], 2)
+        self.assertEqual(
+            run.summary["checkpoint_artifacts"],
+            ["demo-run-best", "demo-run-epoch_2"],
+        )
+
+
+class CheckpointCleanupTests(unittest.TestCase):
+    def _make_tmp_output_dir(self):
+        tmp_path = ROOT / "tests_tmp" / f"cleanup_{uuid.uuid4().hex}"
+        tmp_path.mkdir(parents=True, exist_ok=False)
+        self.addCleanup(shutil.rmtree, tmp_path, True)
+        return tmp_path
+
+    def test_delete_output_checkpoints_removes_only_direct_pth_files(self):
+        tmp_path = self._make_tmp_output_dir()
+        nested_path = tmp_path / "nested"
+        nested_path.mkdir()
+        (tmp_path / "best.pth").write_text("best", encoding="utf-8")
+        (tmp_path / "epoch_2.pth").write_text("epoch", encoding="utf-8")
+        (tmp_path / "config.yaml").write_text("foo: bar\n", encoding="utf-8")
+        (nested_path / "nested.pth").write_text("nested", encoding="utf-8")
+
+        deleted = delete_output_checkpoints(tmp_path)
+
+        self.assertEqual([path.name for path in deleted], ["best.pth", "epoch_2.pth"])
+        self.assertFalse((tmp_path / "best.pth").exists())
+        self.assertFalse((tmp_path / "epoch_2.pth").exists())
+        self.assertTrue((tmp_path / "config.yaml").exists())
+        self.assertTrue((nested_path / "nested.pth").exists())
 
 
 if __name__ == "__main__":

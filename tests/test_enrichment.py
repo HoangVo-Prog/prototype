@@ -1082,6 +1082,17 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertEqual(parsed.evidence_token_budget, 0)
         self.assertEqual(parsed.evidence_projection, "auto")
         self.assertEqual(parsed.wandb_project, "enrichment")
+        self.assertFalse(parsed.delete_checkpoints_after_run)
+
+    def test_delete_checkpoints_after_run_cli_parses(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = ["test", "--delete_checkpoints_after_run"]
+            parsed = options.get_args()
+        finally:
+            sys.argv = old_argv
+        self.assertTrue(parsed.delete_checkpoints_after_run)
 
     def test_wandb_project_cli_parses_and_validates_name(self):
         options = importlib.import_module("utils.options")

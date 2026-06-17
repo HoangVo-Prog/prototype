@@ -4,7 +4,7 @@ import torch
 import time
 from datasets import build_dataloader
 from processor.processor import do_train
-from utils.checkpoint import Checkpointer, unwrap_checkpoint_state_dict
+from utils.checkpoint import Checkpointer, delete_output_checkpoints, unwrap_checkpoint_state_dict
 from utils.iotools import save_train_configs
 from utils.logger import setup_logger
 from solver import build_optimizer, build_lr_scheduler
@@ -14,7 +14,12 @@ from utils.metrics import Evaluator
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
 from utils.reproducibility import configure_reproducibility
-from utils.wandb_utils import finish_wandb, init_wandb, upload_best_checkpoint_artifact
+from utils.wandb_utils import (
+    finish_wandb,
+    init_wandb,
+    upload_best_checkpoint_artifact,
+    upload_checkpoint_artifacts,
+)
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -110,6 +115,25 @@ def load_finetune_clip_checkpoint(model, checkpoint_file, logger):
     )
 
 
+def _cleanup_checkpoints_after_run(args, wandb_run, checkpoint_upload_complete, logger):
+    if not getattr(args, "delete_checkpoints_after_run", False):
+        return
+
+    if getattr(args, "use_wandb", True) and not checkpoint_upload_complete:
+        if wandb_run is None:
+            logger.warning(
+                "Checkpoint cleanup skipped: W&B was enabled but no active run was available "
+                "to upload checkpoints."
+            )
+        else:
+            logger.warning(
+                "Checkpoint cleanup skipped: W&B checkpoint upload did not complete successfully."
+            )
+        return
+
+    delete_output_checkpoints(args.output_dir, logger=logger)
+
+
 if __name__ == '__main__':
     args = get_args()
     configure_reproducibility(
@@ -183,6 +207,8 @@ if __name__ == '__main__':
     if get_rank() == 0 and args.training:
         wandb_run = init_wandb(args, run_name=cur_time, output_dir=args.output_dir, logger=logger)
 
+    run_completed = False
+    checkpoint_upload_complete = not getattr(args, "use_wandb", True)
     try:
         do_train(
             start_epoch,
@@ -197,6 +223,23 @@ if __name__ == '__main__':
             wandb_run=wandb_run,
         )
         if get_rank() == 0 and args.training:
-            upload_best_checkpoint_artifact(wandb_run, args.output_dir, logger=logger)
+            if getattr(args, "delete_checkpoints_after_run", False):
+                if wandb_run is not None:
+                    checkpoint_artifacts = upload_checkpoint_artifacts(
+                        wandb_run,
+                        args.output_dir,
+                        logger=logger,
+                    )
+                    checkpoint_upload_complete = checkpoint_artifacts is not None
+            else:
+                upload_best_checkpoint_artifact(wandb_run, args.output_dir, logger=logger)
+        run_completed = True
     finally:
         finish_wandb(wandb_run)
+        if run_completed and get_rank() == 0 and args.training:
+            _cleanup_checkpoints_after_run(
+                args,
+                wandb_run,
+                checkpoint_upload_complete,
+                logger,
+            )
