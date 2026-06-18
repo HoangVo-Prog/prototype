@@ -1,0 +1,16 @@
+[
+  {
+    "case_id": "black_jacket_bag",
+    "cue_a": "black jacket",
+    "cue_b": "bag",
+    "query_include_all": ["black", "jacket", "bag"],
+    "max_queries": 50
+  },
+  {
+    "case_id": "red_shirt_backpack",
+    "cue_a": "red shirt",
+    "cue_b": "backpack",
+    "query_include_all": ["red", "shirt", "backpack"],
+    "max_queries": 50
+  }
+]
