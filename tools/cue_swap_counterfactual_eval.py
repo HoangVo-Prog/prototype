@@ -112,10 +112,16 @@ def parse_args() -> argparse.Namespace:
         help="Feature branch for label-free cue-image affinity.",
     )
     parser.add_argument(
+        "--lambda_global",
         "--alpha_global",
+        dest="lambda_global",
         type=float,
         default=0.68,
-        help="Global-branch weight for fusion scores.",
+        help=(
+            "Global-branch weight for fusion scores: "
+            "lambda_global * s_global + (1 - lambda_global) * s_grab. "
+            "--alpha_global is kept as a backward-compatible alias."
+        ),
     )
     parser.add_argument("--test_batch_size", type=int)
     parser.add_argument("--num_workers", type=int)
@@ -169,8 +175,8 @@ def validate_cli_args(args: argparse.Namespace) -> None:
         raise ValueError("--tau_density must be positive")
     if args.tau_crowding <= 0:
         raise ValueError("--tau_crowding must be positive")
-    if not 0.0 <= args.alpha_global <= 1.0:
-        raise ValueError("--alpha_global must be in [0, 1]")
+    if not 0.0 <= args.lambda_global <= 1.0:
+        raise ValueError("--lambda_global must be in [0, 1]")
     if args.max_queries_per_case is not None and args.max_queries_per_case <= 0:
         raise ValueError("--max_queries_per_case must be positive when provided")
     if args.neutral_pool_factor <= 0:
@@ -598,15 +604,15 @@ def model_has_grab(model: torch.nn.Module, repo_args: SimpleNamespace) -> bool:
     )
 
 
-def resolve_mode(mode: str, has_grab: bool, alpha_global: float, kind: str) -> str:
+def resolve_mode(mode: str, has_grab: bool, lambda_global: float, kind: str) -> str:
     if mode == "auto":
         return "fusion" if has_grab else "global"
     if mode == "score":
         raise ValueError("Internal error: resolve 'score' before calling resolve_mode")
     if mode in {"grab", "fusion"} and not has_grab:
         raise ValueError(f"{kind} mode '{mode}' requires GRAB features, but the model has no GRAB branch")
-    if mode == "fusion" and alpha_global in (0.0, 1.0):
-        return "global" if alpha_global == 1.0 else "grab"
+    if mode == "fusion" and lambda_global in (0.0, 1.0):
+        return "global" if lambda_global == 1.0 else "grab"
     return mode
 
 
@@ -715,7 +721,7 @@ def query_gallery_scores(
     query_id: int,
     gallery_indices: Sequence[int],
     mode: str,
-    alpha_global: float,
+    lambda_global: float,
 ) -> np.ndarray:
     idx = torch.as_tensor(gallery_indices, dtype=torch.long)
     global_scores = (cache.query_global[query_id] @ cache.gallery_global[idx].T).cpu()
@@ -727,7 +733,7 @@ def query_gallery_scores(
     if mode == "grab":
         return grab_scores.numpy()
     if mode == "fusion":
-        return (alpha_global * global_scores + (1.0 - alpha_global) * grab_scores).numpy()
+        return (lambda_global * global_scores + (1.0 - lambda_global) * grab_scores).numpy()
     raise ValueError(f"Unsupported score mode: {mode}")
 
 
@@ -736,7 +742,7 @@ def cue_gallery_affinity(
     cue_features: CueFeatures,
     cue: str,
     mode: str,
-    alpha_global: float,
+    lambda_global: float,
 ) -> np.ndarray:
     global_scores = (cache.gallery_global @ cue_features.global_features[cue]).cpu()
     if mode == "global":
@@ -747,8 +753,116 @@ def cue_gallery_affinity(
     if mode == "grab":
         return grab_scores.numpy()
     if mode == "fusion":
-        return (alpha_global * global_scores + (1.0 - alpha_global) * grab_scores).numpy()
+        return (lambda_global * global_scores + (1.0 - lambda_global) * grab_scores).numpy()
     raise ValueError(f"Unsupported cue mode: {mode}")
+
+
+def full_test_similarity_chunk(
+    cache: EmbeddingCache,
+    start: int,
+    end: int,
+    mode: str,
+    lambda_global: float,
+) -> torch.Tensor:
+    global_scores = cache.query_global[start:end] @ cache.gallery_global.T
+    if mode == "global":
+        return global_scores
+    if cache.query_grab is None or cache.gallery_grab is None:
+        raise RuntimeError("GRAB full-test scores requested without cached GRAB features")
+    grab_scores = cache.query_grab[start:end] @ cache.gallery_grab.T
+    if mode == "grab":
+        return grab_scores
+    if mode == "fusion":
+        return lambda_global * global_scores + (1.0 - lambda_global) * grab_scores
+    raise ValueError(f"Unsupported full-test score mode: {mode}")
+
+
+def compute_full_test_metrics(
+    cache: EmbeddingCache,
+    query_pids: np.ndarray,
+    gallery_pids: np.ndarray,
+    mode: str,
+    lambda_global: float,
+    chunk_size: int = 128,
+) -> Dict[str, float]:
+    g_pids = torch.as_tensor(gallery_pids, dtype=torch.long)
+    q_pids = torch.as_tensor(query_pids, dtype=torch.long)
+    num_queries = int(len(query_pids))
+    num_gallery = int(len(gallery_pids))
+    if num_queries == 0 or num_gallery == 0:
+        raise ValueError("Full-test metrics require at least one query and one gallery image")
+
+    ranks = torch.arange(1, num_gallery + 1, dtype=torch.float32).view(1, -1)
+    total_valid = 0
+    r1_total = 0.0
+    r5_total = 0.0
+    r10_total = 0.0
+    ap_total = 0.0
+    min_rank_total = 0.0
+    skipped_no_positive = 0
+
+    for start in range(0, num_queries, chunk_size):
+        end = min(start + chunk_size, num_queries)
+        scores = full_test_similarity_chunk(cache, start, end, mode, lambda_global)
+        indices = torch.argsort(scores, dim=1, descending=True)
+        pred_pids = g_pids[indices]
+        matches = pred_pids.eq(q_pids[start:end].view(-1, 1))
+        num_rel = matches.sum(dim=1)
+        valid = num_rel > 0
+        skipped_no_positive += int((~valid).sum().item())
+        if not bool(valid.any()):
+            continue
+
+        matches = matches[valid]
+        num_rel = num_rel[valid].float()
+        total_valid += int(matches.shape[0])
+
+        r1_total += float(matches[:, :1].any(dim=1).float().sum().item())
+        r5_total += float(matches[:, : min(5, num_gallery)].any(dim=1).float().sum().item())
+        r10_total += float(matches[:, : min(10, num_gallery)].any(dim=1).float().sum().item())
+
+        cumulative = matches.cumsum(dim=1).float()
+        precision = cumulative / ranks[:, : matches.shape[1]]
+        ap = (precision * matches.float()).sum(dim=1) / num_rel
+        ap_total += float(ap.sum().item())
+        min_ranks = matches.float().argmax(dim=1).float() + 1.0
+        min_rank_total += float(min_ranks.sum().item())
+
+    if total_valid == 0:
+        raise ValueError("No full-test queries have positive gallery images")
+
+    return {
+        "num_queries": int(num_queries),
+        "num_gallery": int(num_gallery),
+        "num_valid_queries": int(total_valid),
+        "num_queries_without_positive": int(skipped_no_positive),
+        "R1": 100.0 * r1_total / total_valid,
+        "R5": 100.0 * r5_total / total_valid,
+        "R10": 100.0 * r10_total / total_valid,
+        "mAP": 100.0 * ap_total / total_valid,
+        "mean_min_positive_rank": min_rank_total / total_valid,
+    }
+
+
+def full_test_sanity_modes(score_mode: str, use_grab: bool) -> List[str]:
+    modes = [score_mode]
+    if use_grab:
+        for mode in ("global", "grab", "fusion"):
+            if mode not in modes:
+                modes.append(mode)
+    return modes
+
+
+def write_full_test_metrics(
+    output_dir: Path,
+    rows: Sequence[Mapping[str, Any]],
+) -> Any:
+    pd = import_pandas()
+    df = pd.DataFrame(rows)
+    df.to_csv(output_dir / "whole_test_metrics.csv", index=False)
+    with (output_dir / "whole_test_metrics.json").open("w", encoding="utf-8") as handle:
+        json.dump(to_jsonable(list(rows)), handle, indent=2, sort_keys=True)
+    return df
 
 
 def stable_topk(indices: np.ndarray, scores: np.ndarray, k: int, largest: bool) -> np.ndarray:
@@ -1124,18 +1238,6 @@ def run_evaluation(args: argparse.Namespace, logger: logging.Logger) -> None:
     repo_args = load_repo_args(args)
 
     dataset, img_loader, txt_loader, split_data = build_split_data(repo_args, args.split)
-    selected_queries, skipped_rows = select_queries_for_cases(
-        cases=cases,
-        query_records=split_data.query_records,
-        gallery_pids=split_data.gallery_pids,
-        args=args,
-        logger=logger,
-    )
-
-    if not selected_queries:
-        write_config_used(args.output_dir, args, cases, repo_args)
-        write_outputs(args.output_dir, selected_queries, [], [], [], skipped_rows)
-        raise RuntimeError("No eligible queries were selected; see skipped_queries.jsonl")
 
     device = resolve_device(args.device)
     num_classes = len(dataset.train_id_container)
@@ -1147,13 +1249,66 @@ def run_evaluation(args: argparse.Namespace, logger: logging.Logger) -> None:
     model.eval()
 
     use_grab = model_has_grab(model, repo_args)
-    score_mode = resolve_mode(args.score_mode, use_grab, args.alpha_global, "score")
+    score_mode = resolve_mode(args.score_mode, use_grab, args.lambda_global, "score")
     cue_mode_arg = score_mode if args.cue_mode == "score" else args.cue_mode
-    cue_mode = resolve_mode(cue_mode_arg, use_grab, args.alpha_global, "cue")
+    cue_mode = resolve_mode(cue_mode_arg, use_grab, args.lambda_global, "cue")
     write_config_used(args.output_dir, args, cases, repo_args, score_mode, cue_mode)
-    logger.info("Resolved score_mode=%s cue_mode=%s use_grab=%s", score_mode, cue_mode, use_grab)
+    logger.info(
+        "Resolved score_mode=%s cue_mode=%s use_grab=%s lambda_global=%.4f",
+        score_mode,
+        cue_mode,
+        use_grab,
+        args.lambda_global,
+    )
 
     cache = build_embedding_cache(model, img_loader, txt_loader, device, use_grab, logger)
+    query_pids = np.asarray([record.pid for record in split_data.query_records], dtype=np.int64)
+    full_metric_rows: List[Dict[str, Any]] = []
+    full_metric_chunk = max(1, min(256, int(getattr(repo_args, "test_batch_size", 128))))
+    for mode in full_test_sanity_modes(score_mode, use_grab):
+        metrics = compute_full_test_metrics(
+            cache=cache,
+            query_pids=query_pids,
+            gallery_pids=split_data.gallery_pids,
+            mode=mode,
+            lambda_global=args.lambda_global,
+            chunk_size=full_metric_chunk,
+        )
+        full_metric_rows.append(
+            {
+                "score_mode": mode,
+                "selected_for_protocol": mode == score_mode,
+                "lambda_global": args.lambda_global,
+                "formula": (
+                    "lambda_global*s_global + (1-lambda_global)*s_grab"
+                    if mode == "fusion"
+                    else mode
+                ),
+                **metrics,
+            }
+        )
+    full_metric_df = write_full_test_metrics(args.output_dir, full_metric_rows)
+    selected_full_metric = next(row for row in full_metric_rows if row["selected_for_protocol"])
+    logger.info(
+        "Whole-test sanity R1 for %s: %.2f",
+        selected_full_metric["score_mode"],
+        selected_full_metric["R1"],
+    )
+    print("\nWhole-test sanity metrics:")
+    print(full_metric_df.to_string(index=False))
+
+    selected_queries, skipped_rows = select_queries_for_cases(
+        cases=cases,
+        query_records=split_data.query_records,
+        gallery_pids=split_data.gallery_pids,
+        args=args,
+        logger=logger,
+    )
+
+    if not selected_queries:
+        write_outputs(args.output_dir, selected_queries, [], [], [], skipped_rows)
+        raise RuntimeError("No eligible queries were selected; see skipped_queries.jsonl")
+
     unique_cues = sorted({str(case["cue_a"]) for case in cases} | {str(case["cue_b"]) for case in cases})
     cue_features = encode_cue_features(
         model=model,
@@ -1164,7 +1319,7 @@ def run_evaluation(args: argparse.Namespace, logger: logging.Logger) -> None:
         logger=logger,
     )
     cue_affinities = {
-        cue: cue_gallery_affinity(cache, cue_features, cue, cue_mode, args.alpha_global)
+        cue: cue_gallery_affinity(cache, cue_features, cue, cue_mode, args.lambda_global)
         for cue in unique_cues
     }
     cue_thresholds = {
@@ -1232,7 +1387,7 @@ def run_evaluation(args: argparse.Namespace, logger: logging.Logger) -> None:
                         query_id=query_id,
                         gallery_indices=gallery_indices,
                         mode=score_mode,
-                        alpha_global=args.alpha_global,
+                        lambda_global=args.lambda_global,
                     )
                     metrics_by_gallery[gallery_type] = compute_retrieval_metrics(scores, is_positive)
                     hard_a, soft_a = compute_density(psi_a, gallery_indices, threshold_a, args.tau_density)
