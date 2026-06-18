@@ -1292,6 +1292,26 @@ class SchedulerOptionTests(unittest.TestCase):
             sys.argv = old_argv
         self.assertEqual(parsed.enrichment_start, 5)
 
+    def test_eval_after_epoch_cli_parses_start_epoch(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = ["test", "--eval_after_epoch", "5"]
+            parsed = options.get_args()
+        finally:
+            sys.argv = old_argv
+        self.assertEqual(parsed.eval_after_epoch, 5)
+
+    def test_eval_after_epoch_cli_requires_non_negative_epoch(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            sys.argv = ["test", "--eval_after_epoch", "-1"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+        finally:
+            sys.argv = old_argv
+
     def test_enrichment_start_cli_requires_positive_epoch(self):
         options = importlib.import_module("utils.options")
         old_argv = sys.argv

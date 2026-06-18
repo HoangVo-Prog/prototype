@@ -58,6 +58,13 @@ def _target_enrichment_active(args, epoch):
     return getattr(args, "target_enrichment", False) and epoch >= enrichment_start
 
 
+def _should_run_eval(args, epoch):
+    eval_after_epoch = getattr(args, "eval_after_epoch", 0)
+    if eval_after_epoch < 0:
+        raise ValueError("--eval_after_epoch must be a non-negative integer")
+    return epoch >= eval_after_epoch
+
+
 def _loss_grad_norm(loss, parameters):
     if not _is_trainable_loss(loss):
         return 0.0
@@ -229,6 +236,12 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 args.enrichment_start
             )
         )
+    if getattr(args, "eval_after_epoch", 0) > 0:
+        logger.info(
+            "Evaluation delayed until epoch {}; earlier epochs skip validation".format(
+                args.eval_after_epoch
+            )
+        )
 
     meters = {
         "loss": AverageMeter(),
@@ -249,16 +262,17 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     tb_writer = SummaryWriter(log_dir=args.output_dir)
 
     best_top1 = 0.0
-    initial_top1 = evaluator.eval(
-        model.eval(),
-        use_target_enrichment=_target_enrichment_active(args, start_epoch),
-    )
-    if get_rank() == 0:
-        initial_metrics = dict(getattr(evaluator, "last_metrics", {}))
-        initial_metrics["eval/top_R1"] = initial_top1
-        if "eval/ablation_best_R1" in initial_metrics:
-            initial_metrics["eval/best_ablation_R1"] = initial_top1
-        log_wandb(wandb_run, initial_metrics, step=0, epoch=start_epoch - 1)
+    if _should_run_eval(args, 0):
+        initial_top1 = evaluator.eval(
+            model.eval(),
+            use_target_enrichment=_target_enrichment_active(args, start_epoch),
+        )
+        if get_rank() == 0:
+            initial_metrics = dict(getattr(evaluator, "last_metrics", {}))
+            initial_metrics["eval/top_R1"] = initial_top1
+            if "eval/ablation_best_R1" in initial_metrics:
+                initial_metrics["eval/best_ablation_R1"] = initial_top1
+            log_wandb(wandb_run, initial_metrics, step=0, epoch=start_epoch - 1)
     # train
     now_top1 = 0
     current_epoch = 0
@@ -369,7 +383,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 "Epoch {} done. Time per batch: {:.3f}[s] Speed: {:.1f}[samples/s]"
                 .format(epoch, time_per_batch,
                         train_loader.batch_size / time_per_batch))
-        if epoch % eval_period == 0: 
+        if epoch % eval_period == 0 and _should_run_eval(args, epoch):
         # if epoch % eval_period == 0 and epoch >= 61:
             if get_rank() == 0:
                 logger.info("Validation Results - Epoch: {}".format(epoch))

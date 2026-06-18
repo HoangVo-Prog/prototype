@@ -102,6 +102,8 @@ def get_args():
                         help="warn instead of raising when PyTorch encounters a nondeterministic operation")
     parser.add_argument("--log_period", default=20)
     parser.add_argument("--eval_period", default=1)
+    parser.add_argument("--eval_after_epoch", type=int, default=0,
+                        help="delay evaluation until this epoch finishes; 0 keeps the current behavior")
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
@@ -276,6 +278,8 @@ def get_args():
     args.wandb_project = args.wandb_project.strip()
     if not args.wandb_project:
         parser.error("--wandb_project must not be empty")
+    if args.eval_after_epoch < 0:
+        parser.error("--eval_after_epoch must be a non-negative integer")
     if args.enrichment_start < 1:
         parser.error("--enrichment_start must be a positive integer")
     if args.freeze_host and not args.target_enrichment:
