@@ -1869,6 +1869,285 @@ def write_config_used(
         json.dump(payload, handle, indent=2, sort_keys=True)
 
 
+def _ensure_positive_ratio_columns(df: Any) -> Any:
+    if df.empty:
+        for column in ("num_distractors", "positive_ratio", "positive_pct"):
+            if column not in df.columns:
+                df[column] = []
+        return df
+    if "num_distractors" not in df.columns:
+        df["num_distractors"] = df["gallery_size"] - df["num_positives"]
+    if "positive_ratio" not in df.columns:
+        df["positive_ratio"] = df["num_positives"] / df["gallery_size"]
+    if "positive_pct" not in df.columns:
+        df["positive_pct"] = 100.0 * df["positive_ratio"]
+    return df
+
+
+def _positive_ratio_summary(prefix: Mapping[str, Any], df: Any) -> Dict[str, Any]:
+    if df.empty:
+        return {
+            **dict(prefix),
+            "gallery_size": float("nan"),
+            "mean_num_positives": float("nan"),
+            "median_num_positives": float("nan"),
+            "min_num_positives": float("nan"),
+            "max_num_positives": float("nan"),
+            "mean_positive_pct": float("nan"),
+            "median_positive_pct": float("nan"),
+            "std_positive_pct": float("nan"),
+            "min_positive_pct": float("nan"),
+            "max_positive_pct": float("nan"),
+            "p90_positive_pct": float("nan"),
+            "p95_positive_pct": float("nan"),
+        }
+    return {
+        **dict(prefix),
+        "gallery_size": float(df["gallery_size"].mean()),
+        "mean_num_positives": float(df["num_positives"].mean()),
+        "median_num_positives": float(df["num_positives"].median()),
+        "min_num_positives": int(df["num_positives"].min()),
+        "max_num_positives": int(df["num_positives"].max()),
+        "mean_positive_pct": float(df["positive_pct"].mean()),
+        "median_positive_pct": float(df["positive_pct"].median()),
+        "std_positive_pct": float(df["positive_pct"].std(ddof=0)),
+        "min_positive_pct": float(df["positive_pct"].min()),
+        "max_positive_pct": float(df["positive_pct"].max()),
+        "p90_positive_pct": float(df["positive_pct"].quantile(0.90)),
+        "p95_positive_pct": float(df["positive_pct"].quantile(0.95)),
+    }
+
+
+def _pearson_corr(x: Any, y: Any) -> float:
+    valid = ~(x.isna() | y.isna())
+    x = x[valid]
+    y = y[valid]
+    if len(x) < 2:
+        return float("nan")
+    if float(x.std(ddof=0)) == 0.0 or float(y.std(ddof=0)) == 0.0:
+        return float("nan")
+    return float(x.corr(y))
+
+
+def _plot_positive_ratio_audit(output_dir: Path, trial_df: Any, by_case_df: Any) -> None:
+    if trial_df.empty:
+        return
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    mean_pct = float(trial_df["positive_pct"].mean())
+    median_pct = float(trial_df["positive_pct"].median())
+
+    plt.figure(figsize=(8, 5))
+    plt.hist(trial_df["positive_pct"], bins=30, color="#4C78A8", alpha=0.85)
+    plt.axvline(mean_pct, color="#E45756", linestyle="--", linewidth=1.5, label=f"mean={mean_pct:.2f}%")
+    plt.axvline(median_pct, color="#54A24B", linestyle=":", linewidth=1.8, label=f"median={median_pct:.2f}%")
+    plt.xlabel("Positive images in gallery (%)")
+    plt.ylabel("Number of query-trials")
+    plt.title("Positive fraction in constructed galleries")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "positive_pct_hist.png", dpi=200)
+    plt.close()
+
+    if not by_case_df.empty:
+        sorted_cases = by_case_df.sort_values(
+            ["mean_positive_pct", "case_id"], ascending=[False, True]
+        )
+        title = "Mean positive fraction by case"
+        if len(sorted_cases) > 60:
+            sorted_cases = sorted_cases.head(60)
+            title = "Top 60 cases by positive fraction"
+        height = max(6, 0.22 * len(sorted_cases))
+        plt.figure(figsize=(9, height))
+        plt.barh(sorted_cases["case_id"], sorted_cases["mean_positive_pct"], color="#72B7B2")
+        plt.gca().invert_yaxis()
+        plt.xlabel("Mean positive images in gallery (%)")
+        plt.ylabel("Case")
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig(output_dir / "positive_pct_by_case.png", dpi=200)
+        plt.close()
+
+        if "r1_flip_rate" in by_case_df.columns:
+            plot_df = by_case_df.dropna(subset=["mean_positive_pct", "r1_flip_rate"])
+            if not plot_df.empty:
+                corr = _pearson_corr(plot_df["mean_positive_pct"], plot_df["r1_flip_rate"])
+                plt.figure(figsize=(7, 5))
+                plt.scatter(plot_df["mean_positive_pct"], 100.0 * plot_df["r1_flip_rate"], alpha=0.8)
+                plt.xlabel("Mean positive images in gallery (%)")
+                plt.ylabel("R@1 flip rate (%)")
+                title = "Positive fraction vs R@1 flip rate"
+                if not math.isnan(corr):
+                    title += f" (Pearson r={corr:.3f})"
+                plt.title(title)
+                plt.tight_layout()
+                plt.savefig(output_dir / "positive_pct_vs_flip.png", dpi=200)
+                plt.close()
+
+        if "mean_rank_volatility" in by_case_df.columns:
+            plot_df = by_case_df.dropna(subset=["mean_positive_pct", "mean_rank_volatility"])
+            if not plot_df.empty:
+                corr = _pearson_corr(plot_df["mean_positive_pct"], plot_df["mean_rank_volatility"])
+                plt.figure(figsize=(7, 5))
+                plt.scatter(plot_df["mean_positive_pct"], plot_df["mean_rank_volatility"], alpha=0.8)
+                plt.xlabel("Mean positive images in gallery (%)")
+                plt.ylabel("Mean positive-rank volatility")
+                title = "Positive fraction vs rank volatility"
+                if not math.isnan(corr):
+                    title += f" (Pearson r={corr:.3f})"
+                plt.title(title)
+                plt.tight_layout()
+                plt.savefig(output_dir / "positive_pct_vs_rank_volatility.png", dpi=200)
+                plt.close()
+
+
+def write_positive_ratio_audit(output_dir: Path, per_query_df: Any, paired_df: Any) -> None:
+    pd = import_pandas()
+    per_query_df = _ensure_positive_ratio_columns(per_query_df.copy())
+
+    overall_columns = [
+        "num_cases",
+        "num_queries_total",
+        "num_query_trials",
+        "num_gallery_rows",
+        "gallery_size",
+        "mean_num_positives",
+        "median_num_positives",
+        "min_num_positives",
+        "max_num_positives",
+        "mean_positive_pct",
+        "median_positive_pct",
+        "std_positive_pct",
+        "min_positive_pct",
+        "max_positive_pct",
+        "p90_positive_pct",
+        "p95_positive_pct",
+    ]
+    by_case_columns = [
+        "case_id",
+        "num_queries",
+        "num_query_trials",
+        "gallery_size",
+        "mean_num_positives",
+        "median_num_positives",
+        "min_num_positives",
+        "max_num_positives",
+        "mean_positive_pct",
+        "median_positive_pct",
+        "std_positive_pct",
+        "min_positive_pct",
+        "max_positive_pct",
+        "p90_positive_pct",
+        "p95_positive_pct",
+        "r1_flip_rate",
+        "mean_rank_volatility",
+        "mean_swap_strength",
+        "mean_swap_strength_normalized",
+    ]
+    by_query_columns = [
+        "case_id",
+        "query_id",
+        "pid",
+        "query_text",
+        "num_trials",
+        "gallery_size",
+        "num_positives",
+        "positive_pct",
+    ]
+
+    if per_query_df.empty:
+        pd.DataFrame(columns=overall_columns).to_csv(
+            output_dir / "positive_ratio_overall.csv", index=False
+        )
+        pd.DataFrame(columns=by_case_columns).to_csv(
+            output_dir / "positive_ratio_by_case.csv", index=False
+        )
+        pd.DataFrame(columns=by_query_columns).to_csv(
+            output_dir / "positive_ratio_by_query.csv", index=False
+        )
+        return
+
+    trial_df = per_query_df.sort_values(
+        ["case_id", "query_id", "trial_id", "gallery_type"]
+    ).drop_duplicates(["case_id", "query_id", "trial_id"])
+
+    overall_row = _positive_ratio_summary(
+        {
+            "num_cases": int(trial_df["case_id"].nunique()),
+            "num_queries_total": int(trial_df[["case_id", "query_id"]].drop_duplicates().shape[0]),
+            "num_query_trials": int(len(trial_df)),
+            "num_gallery_rows": int(len(per_query_df)),
+        },
+        trial_df,
+    )
+    pd.DataFrame([overall_row], columns=overall_columns).to_csv(
+        output_dir / "positive_ratio_overall.csv", index=False
+    )
+
+    case_rows = []
+    paired_metrics = {}
+    if not paired_df.empty:
+        for case_id, group in paired_df.groupby("case_id"):
+            paired_metrics[case_id] = {
+                "r1_flip_rate": float(group["r1_flip"].mean()) if "r1_flip" in group else float("nan"),
+                "mean_rank_volatility": float(group["rank_volatility"].mean()) if "rank_volatility" in group else float("nan"),
+                "mean_swap_strength": float(group["swap_strength"].mean()) if "swap_strength" in group else float("nan"),
+                "mean_swap_strength_normalized": (
+                    float(group["swap_strength_normalized"].mean())
+                    if "swap_strength_normalized" in group
+                    else float("nan")
+                ),
+            }
+
+    for case_id, group in trial_df.groupby("case_id"):
+        row = _positive_ratio_summary(
+            {
+                "case_id": case_id,
+                "num_queries": int(group["query_id"].nunique()),
+                "num_query_trials": int(len(group)),
+            },
+            group,
+        )
+        row.update(
+            paired_metrics.get(
+                case_id,
+                {
+                    "r1_flip_rate": float("nan"),
+                    "mean_rank_volatility": float("nan"),
+                    "mean_swap_strength": float("nan"),
+                    "mean_swap_strength_normalized": float("nan"),
+                },
+            )
+        )
+        case_rows.append(row)
+    by_case_df = pd.DataFrame(case_rows, columns=by_case_columns)
+    by_case_df.to_csv(output_dir / "positive_ratio_by_case.csv", index=False)
+
+    query_rows = []
+    for (case_id, query_id), group in trial_df.groupby(["case_id", "query_id"]):
+        first = group.sort_values("trial_id").iloc[0]
+        query_rows.append(
+            {
+                "case_id": case_id,
+                "query_id": int(query_id),
+                "pid": int(first["pid"]),
+                "query_text": first["query_text"],
+                "num_trials": int(group["trial_id"].nunique()),
+                "gallery_size": float(group["gallery_size"].mean()),
+                "num_positives": float(group["num_positives"].mean()),
+                "positive_pct": float(group["positive_pct"].mean()),
+            }
+        )
+    pd.DataFrame(query_rows, columns=by_query_columns).to_csv(
+        output_dir / "positive_ratio_by_query.csv", index=False
+    )
+
+    _plot_positive_ratio_audit(output_dir, trial_df, by_case_df)
+
+
 def write_outputs(
     output_dir: Path,
     selected_queries: List[Dict[str, Any]],
@@ -1898,6 +2177,9 @@ def write_outputs(
         "gallery_type",
         "gallery_size",
         "num_positives",
+        "num_distractors",
+        "positive_ratio",
+        "positive_pct",
         "R1",
         "R5",
         "R10",
@@ -1923,8 +2205,19 @@ def write_outputs(
 
     selected_df = pd.DataFrame(selected_queries, columns=selected_columns)
     per_query_df = pd.DataFrame(per_query_rows, columns=per_query_columns)
+    if not per_query_df.empty:
+        per_query_df["num_distractors"] = (
+            per_query_df["gallery_size"] - per_query_df["num_positives"]
+        )
+        per_query_df["positive_ratio"] = (
+            per_query_df["num_positives"] / per_query_df["gallery_size"]
+        )
+        per_query_df["positive_pct"] = 100.0 * per_query_df["positive_ratio"]
     selected_df.to_csv(output_dir / "selected_queries.csv", index=False)
     per_query_df.to_csv(output_dir / "per_query_results.csv", index=False)
+
+    paired_df = pd.DataFrame(paired_rows)
+    write_positive_ratio_audit(output_dir, per_query_df, paired_df)
 
     if per_query_df.empty:
         summary_by_case = pd.DataFrame(
@@ -1972,7 +2265,6 @@ def write_outputs(
 
     summary_by_case.to_csv(output_dir / "summary_by_case.csv", index=False)
 
-    paired_df = pd.DataFrame(paired_rows)
     if per_query_df.empty:
         summary_overall = pd.DataFrame(
             [
