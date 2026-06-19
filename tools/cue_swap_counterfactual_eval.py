@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from collections import Counter
+from itertools import combinations
 import json
 import logging
 import math
@@ -32,6 +34,210 @@ if str(REPO_ROOT) not in sys.path:
 DATASET_NAMES = ("CUHK-PEDES", "ICFG-PEDES", "RSTPReid")
 
 GALLERY_TYPES = ("a_dense", "b_dense")
+
+
+def _color_aliases(color: str) -> List[str]:
+    if color == "black":
+        return ["black", "dark"]
+    if color == "gray":
+        return ["gray", "grey"]
+    return [color]
+
+
+def _garment_aliases(garment: str) -> List[str]:
+    if garment == "t-shirt":
+        return ["t-shirt", "tshirt", "t shirt"]
+    if garment == "pants":
+        return ["pants", "trousers"]
+    if garment == "sneakers":
+        return ["sneakers", "trainers"]
+    return [garment]
+
+
+def _build_colored_cues(
+    colors: Sequence[str],
+    garments: Sequence[str],
+    category: str,
+    region: str,
+) -> List[Dict[str, Any]]:
+    cues: List[Dict[str, Any]] = []
+    seen = set()
+    for color in colors:
+        canonical_color = "gray" if color == "grey" else color
+        for garment in garments:
+            canonical_garment = "t-shirt" if garment in {"tshirt", "t-shirt"} else garment
+            canonical = f"{canonical_color} {canonical_garment}"
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            aliases = sorted(
+                {
+                    f"{color_alias} {garment_alias}"
+                    for color_alias in _color_aliases(canonical_color)
+                    for garment_alias in _garment_aliases(canonical_garment)
+                }
+            )
+            cues.append(
+                {
+                    "name": canonical,
+                    "category": category,
+                    "region": region,
+                    "aliases": aliases,
+                    "exclude_aliases": [],
+                }
+            )
+    return cues
+
+
+def _build_pre_registered_cue_ontology() -> List[Dict[str, Any]]:
+    colors = [
+        "black",
+        "white",
+        "red",
+        "blue",
+        "green",
+        "yellow",
+        "gray",
+        "grey",
+        "brown",
+        "pink",
+        "purple",
+        "orange",
+    ]
+    ontology: List[Dict[str, Any]] = []
+    ontology.extend(
+        _build_colored_cues(
+            colors=colors,
+            garments=[
+                "jacket",
+                "coat",
+                "hoodie",
+                "shirt",
+                "t-shirt",
+                "sweater",
+                "vest",
+                "uniform",
+                "top",
+            ],
+            category="upper_color_garment",
+            region="upper_body",
+        )
+    )
+    ontology.extend(
+        _build_colored_cues(
+            colors=colors,
+            garments=["pants", "trousers", "jeans", "shorts", "skirt", "dress"],
+            category="lower_color_garment",
+            region="lower_body",
+        )
+    )
+    ontology.extend(
+        _build_colored_cues(
+            colors=colors,
+            garments=["shoes", "sneakers", "boots", "sandals"],
+            category="footwear_color",
+            region="feet",
+        )
+    )
+    ontology.extend(
+        [
+            {
+                "name": "bag",
+                "category": "accessory_object",
+                "region": "carried",
+                "aliases": ["bag", "bags", "carrying a bag", "with a bag"],
+                "exclude_aliases": [],
+            },
+            {
+                "name": "backpack",
+                "category": "accessory_object",
+                "region": "carried",
+                "aliases": ["backpack", "back pack", "rucksack"],
+                "exclude_aliases": [],
+            },
+            {
+                "name": "handbag",
+                "category": "accessory_object",
+                "region": "carried",
+                "aliases": ["handbag", "hand bag", "purse"],
+                "exclude_aliases": [],
+            },
+            {
+                "name": "shoulder bag",
+                "category": "accessory_object",
+                "region": "carried",
+                "aliases": ["shoulder bag"],
+                "exclude_aliases": [],
+            },
+            {
+                "name": "hat",
+                "category": "accessory_object",
+                "region": "head",
+                "aliases": ["hat", "wearing a hat"],
+                "exclude_aliases": [],
+            },
+            {
+                "name": "cap",
+                "category": "accessory_object",
+                "region": "head",
+                "aliases": ["cap", "baseball cap"],
+                "exclude_aliases": [],
+            },
+            {
+                "name": "glasses",
+                "category": "accessory_object",
+                "region": "head",
+                "aliases": ["glasses", "sunglasses", "wearing glasses"],
+                "exclude_aliases": [],
+            },
+            {
+                "name": "umbrella",
+                "category": "accessory_object",
+                "region": "carried",
+                "aliases": ["umbrella"],
+                "exclude_aliases": [],
+            },
+            {
+                "name": "striped",
+                "category": "pattern",
+                "region": "clothing",
+                "aliases": ["striped", "stripe", "stripes"],
+                "exclude_aliases": [],
+            },
+            {
+                "name": "plaid",
+                "category": "pattern",
+                "region": "clothing",
+                "aliases": ["plaid"],
+                "exclude_aliases": [],
+            },
+            {
+                "name": "checked",
+                "category": "pattern",
+                "region": "clothing",
+                "aliases": ["checked", "checkered"],
+                "exclude_aliases": [],
+            },
+            {
+                "name": "printed",
+                "category": "pattern",
+                "region": "clothing",
+                "aliases": ["printed", "print"],
+                "exclude_aliases": [],
+            },
+            {
+                "name": "logo",
+                "category": "pattern",
+                "region": "clothing",
+                "aliases": ["logo"],
+                "exclude_aliases": [],
+            },
+        ]
+    )
+    return ontology
+
+
+PRE_REGISTERED_CUE_ONTOLOGY = _build_pre_registered_cue_ontology()
 
 
 @dataclass(frozen=True)
@@ -62,6 +268,15 @@ class CueFeatures:
     grab_features: Dict[str, torch.Tensor]
 
 
+@dataclass(frozen=True)
+class CueSpec:
+    name: str
+    aliases: Tuple[str, ...]
+    category: str = ""
+    region: str = ""
+    exclude_aliases: Tuple[str, ...] = ()
+
+
 class CaseValidationError(ValueError):
     """Raised when a cue-case file is malformed."""
 
@@ -80,7 +295,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Training config YAML used to build the checkpoint model",
     )
-    parser.add_argument("--cases_file", type=Path, required=True)
+    parser.add_argument(
+        "--cases_file",
+        type=Path,
+        default=None,
+        help="Manual cue case JSON file. If omitted, automatic cue case generation is used.",
+    )
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument(
         "--root_dir",
@@ -99,6 +319,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tau_crowding", type=float, default=0.07)
     parser.add_argument("--max_queries_per_case", type=int)
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument(
+        "--auto_cases",
+        action="store_true",
+        help=(
+            "Force automatic pre-registered cue case generation. If --cases_file is omitted, "
+            "this is enabled automatically."
+        ),
+    )
+    parser.add_argument(
+        "--cue_vocab_file",
+        type=Path,
+        default=None,
+        help="Optional JSON cue vocabulary file. If omitted, use the built-in pre-registered TBPS cue ontology.",
+    )
+    parser.add_argument(
+        "--min_queries_per_auto_case",
+        type=int,
+        default=40,
+        help="Minimum number of eligible queries required for an automatically generated cue pair.",
+    )
+    parser.add_argument(
+        "--max_auto_cases",
+        type=int,
+        default=None,
+        help="Optional cap on number of auto-generated cases after sorting by support. Do not sort by retrieval outcomes.",
+    )
+    parser.add_argument(
+        "--min_constructible_query_trials",
+        type=int,
+        default=1,
+        help="Minimum number of constructible query-trials required to keep an auto-generated cue case.",
+    )
+    parser.add_argument(
+        "--min_case_swap_strength",
+        type=float,
+        default=0.4,
+        help=(
+            "Optional manipulation-validity threshold. If set, keep an auto-generated case only when "
+            "its mean swap strength over constructible dry construction trials is at least this value. "
+            "This filter must not use retrieval metrics."
+        ),
+    )
+    parser.add_argument(
+        "--auto_case_max_queries_for_constructibility",
+        type=int,
+        default=50,
+        help="Maximum queries per case used for the constructibility/manipulation-validity check.",
+    )
+    parser.add_argument(
+        "--write_auto_cases_file",
+        type=Path,
+        default=None,
+        help="Optional path to save the generated auto cases JSON. If omitted, save to output_dir/auto_cases_generated.json.",
+    )
     parser.add_argument(
         "--score_mode",
         default="auto",
@@ -162,7 +436,15 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     return logger
 
 
+def is_auto_case_mode(args: argparse.Namespace) -> bool:
+    return bool(args.auto_cases)
+
+
 def validate_cli_args(args: argparse.Namespace) -> None:
+    if args.cases_file is not None and args.auto_cases:
+        raise ValueError("Provide either --cases_file or --auto_cases, not both.")
+    if args.cases_file is None:
+        args.auto_cases = True
     if args.gallery_size <= 0:
         raise ValueError("--gallery_size must be positive")
     if not 0.0 <= args.dense_ratio <= 1.0:
@@ -181,12 +463,26 @@ def validate_cli_args(args: argparse.Namespace) -> None:
         raise ValueError("--max_queries_per_case must be positive when provided")
     if args.neutral_pool_factor <= 0:
         raise ValueError("--neutral_pool_factor must be positive")
+    if args.min_queries_per_auto_case <= 0:
+        raise ValueError("--min_queries_per_auto_case must be positive")
+    if args.max_auto_cases is not None and args.max_auto_cases <= 0:
+        raise ValueError("--max_auto_cases must be positive when provided")
+    if args.min_constructible_query_trials <= 0:
+        raise ValueError("--min_constructible_query_trials must be positive")
+    if args.auto_case_max_queries_for_constructibility <= 0:
+        raise ValueError("--auto_case_max_queries_for_constructibility must be positive")
+    if args.min_case_swap_strength is not None and args.min_case_swap_strength < 0:
+        raise ValueError("--min_case_swap_strength must be >= 0 when provided")
     if not args.dry_run and args.checkpoint is None:
         raise ValueError("--checkpoint is required unless --dry_run is set")
     if args.checkpoint is not None and not args.checkpoint.exists() and not args.dry_run:
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     if args.config is not None and not args.config.exists():
         raise FileNotFoundError(f"Config file not found: {args.config}")
+    if args.cases_file is not None and not args.cases_file.exists():
+        raise FileNotFoundError(f"Cue case file not found: {args.cases_file}")
+    if args.cue_vocab_file is not None and not args.cue_vocab_file.exists():
+        raise FileNotFoundError(f"Cue vocabulary file not found: {args.cue_vocab_file}")
 
 
 def set_deterministic(seed: int) -> None:
@@ -220,6 +516,223 @@ def contains_normalized_phrase(haystack: str, needle: str) -> bool:
     if not needle:
         return True
     return f" {needle} " in f" {haystack} "
+
+
+def _normalized_unique(values: Iterable[str]) -> Tuple[str, ...]:
+    normalized = {normalize_text(value) for value in values if isinstance(value, str)}
+    normalized.discard("")
+    return tuple(sorted(normalized, key=lambda value: (-len(value.split()), -len(value), value)))
+
+
+def _cue_spec_from_raw(raw: Mapping[str, Any], index: int, source: str) -> CueSpec:
+    prefix = f"Cue spec at index {index} in {source}"
+    name = raw.get("name")
+    aliases = raw.get("aliases")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{prefix} must have a non-empty string 'name'")
+    if not isinstance(aliases, list) or not aliases:
+        raise ValueError(f"{prefix} must have a non-empty list 'aliases'")
+    if not all(isinstance(alias, str) and alias.strip() for alias in aliases):
+        raise ValueError(f"{prefix} aliases must be non-empty strings")
+    exclude_aliases = raw.get("exclude_aliases", [])
+    if not isinstance(exclude_aliases, list):
+        raise ValueError(f"{prefix} optional 'exclude_aliases' must be a list")
+    if not all(isinstance(alias, str) and alias.strip() for alias in exclude_aliases):
+        raise ValueError(f"{prefix} exclude_aliases must be non-empty strings")
+    category = raw.get("category", "")
+    region = raw.get("region", "")
+    if not isinstance(category, str) or not isinstance(region, str):
+        raise ValueError(f"{prefix} optional 'category' and 'region' must be strings")
+
+    alias_values = list(aliases)
+    if name not in alias_values:
+        alias_values.append(name)
+    return CueSpec(
+        name=name.strip(),
+        aliases=tuple(alias.strip() for alias in alias_values),
+        category=category.strip(),
+        region=region.strip(),
+        exclude_aliases=tuple(alias.strip() for alias in exclude_aliases),
+    )
+
+
+def load_cue_specs(cue_vocab_file: Optional[Path]) -> List[CueSpec]:
+    if cue_vocab_file is None:
+        raw_specs = PRE_REGISTERED_CUE_ONTOLOGY
+        source = "builtin"
+    else:
+        with cue_vocab_file.open("r", encoding="utf-8") as handle:
+            raw_specs = json.load(handle)
+        source = str(cue_vocab_file)
+
+    if not isinstance(raw_specs, list) or not raw_specs:
+        raise ValueError(f"Cue vocabulary {source} must contain a non-empty JSON list")
+
+    cue_specs: List[CueSpec] = []
+    seen_names = set()
+    for index, raw in enumerate(raw_specs):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"Cue spec at index {index} in {source} must be an object")
+        spec = _cue_spec_from_raw(raw, index, source)
+        if spec.name in seen_names:
+            raise ValueError(f"Duplicate cue name '{spec.name}' in {source}")
+        seen_names.add(spec.name)
+        cue_specs.append(spec)
+    return sorted(cue_specs, key=lambda spec: spec.name)
+
+
+def detect_cues_in_query(query_text: str, cue_specs: Sequence[CueSpec]) -> List[str]:
+    """
+    Return sorted canonical cue names detected in query_text.
+    Use aliases. Apply exclude_aliases to avoid obvious false positives.
+    Deterministic output.
+    """
+    normalized_query = normalize_text(query_text)
+    detected = set()
+    for spec in cue_specs:
+        exclude_aliases = _normalized_unique(spec.exclude_aliases)
+        if any(contains_normalized_phrase(normalized_query, alias) for alias in exclude_aliases):
+            continue
+        aliases = _normalized_unique(spec.aliases)
+        if any(contains_normalized_phrase(normalized_query, alias) for alias in aliases):
+            detected.add(spec.name)
+    return sorted(detected)
+
+
+def detect_cues_for_queries(
+    query_records: Sequence[QueryRecord],
+    cue_specs: Sequence[CueSpec],
+) -> Dict[int, List[str]]:
+    return {
+        record.query_id: detect_cues_in_query(record.query_text, cue_specs)
+        for record in query_records
+    }
+
+
+def cue_vocab_source(args: argparse.Namespace) -> str:
+    return str(args.cue_vocab_file) if args.cue_vocab_file is not None else "builtin"
+
+
+def auto_cases_output_path(args: argparse.Namespace) -> Path:
+    return args.write_auto_cases_file or (args.output_dir / "auto_cases_generated.json")
+
+
+def write_auto_query_cues(
+    output_dir: Path,
+    query_records: Sequence[QueryRecord],
+    detected_by_query: Mapping[int, Sequence[str]],
+) -> None:
+    pd = import_pandas()
+    rows = []
+    for record in query_records:
+        detected = sorted(set(detected_by_query.get(record.query_id, [])))
+        rows.append(
+            {
+                "query_id": record.query_id,
+                "pid": record.pid,
+                "query_text": record.query_text,
+                "detected_cues": json.dumps(detected),
+                "num_detected_cues": len(detected),
+            }
+        )
+    pd.DataFrame(rows).to_csv(output_dir / "auto_query_cues.csv", index=False)
+
+
+def slugify_case_part(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", normalize_text(value))
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    return slug or "cue"
+
+
+def auto_case_id(cue_a: str, cue_b: str) -> str:
+    left, right = sorted([cue_a, cue_b])
+    return f"{slugify_case_part(left)}__{slugify_case_part(right)}"
+
+
+def generate_candidate_cases_from_cooccurrence(
+    query_records: Sequence[QueryRecord],
+    detected_by_query: Mapping[int, Sequence[str]],
+    gallery_pids: np.ndarray,
+    min_queries: int,
+    max_cases: Optional[int],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Generate candidate cue cases from all unordered cue pairs that co-occur
+    in at least min_queries eligible queries.
+
+    Eligibility at this stage:
+    - query has at least two detected cues
+    - query contains both cues
+    - query pid has at least one positive image in the gallery
+
+    Do not use retrieval metrics.
+    """
+    pids_with_gallery = set(int(pid) for pid in gallery_pids.tolist())
+    pair_to_query_ids: Dict[Tuple[str, str], List[int]] = {}
+    for record in query_records:
+        if int(record.pid) not in pids_with_gallery:
+            continue
+        cues = sorted(set(detected_by_query.get(record.query_id, [])))
+        if len(cues) < 2:
+            continue
+        for cue_a, cue_b in combinations(cues, 2):
+            pair = tuple(sorted((cue_a, cue_b)))
+            pair_to_query_ids.setdefault(pair, []).append(record.query_id)
+
+    all_rows: List[Dict[str, Any]] = []
+    supported_cases: List[Dict[str, Any]] = []
+    for (cue_a, cue_b), query_ids in pair_to_query_ids.items():
+        query_ids = sorted(set(int(query_id) for query_id in query_ids))
+        case_id = auto_case_id(cue_a, cue_b)
+        supported = len(query_ids) >= min_queries
+        row = {
+            "case_id": case_id,
+            "cue_a": cue_a,
+            "cue_b": cue_b,
+            "num_queries": len(query_ids),
+            "query_ids": json.dumps(query_ids),
+            "meets_min_queries": supported,
+            "kept_after_support": supported,
+            "reason": "" if supported else "below_min_queries_per_auto_case",
+        }
+        all_rows.append(row)
+        if supported:
+            supported_cases.append(
+                {
+                    "case_id": case_id,
+                    "cue_a": cue_a,
+                    "cue_b": cue_b,
+                    "query_ids": query_ids,
+                    "min_queries": min_queries,
+                    "selection_method": "pre_registered_auto",
+                    "auto_case_support": len(query_ids),
+                }
+            )
+
+    supported_cases.sort(key=lambda case: (-int(case["auto_case_support"]), str(case["case_id"])))
+    if max_cases is not None:
+        kept_ids = {str(case["case_id"]) for case in supported_cases[:max_cases]}
+        supported_cases = supported_cases[:max_cases]
+        for row in all_rows:
+            if row["kept_after_support"] and row["case_id"] not in kept_ids:
+                row["kept_after_support"] = False
+                row["reason"] = "capped_by_max_auto_cases"
+
+    all_rows.sort(key=lambda row: (-int(row["num_queries"]), str(row["case_id"])))
+    return supported_cases, all_rows
+
+
+def write_auto_case_candidates(
+    output_dir: Path,
+    candidate_cases: Sequence[Mapping[str, Any]],
+    auto_case_generation_rows: Sequence[Mapping[str, Any]],
+) -> None:
+    pd = import_pandas()
+    pd.DataFrame(auto_case_generation_rows).to_csv(
+        output_dir / "auto_case_candidates.csv", index=False
+    )
+    with (output_dir / "auto_case_candidates.json").open("w", encoding="utf-8") as handle:
+        json.dump(to_jsonable(list(candidate_cases)), handle, indent=2, sort_keys=True)
 
 
 def stable_seed(base_seed: int, *parts: Any) -> int:
@@ -386,10 +899,10 @@ def default_repo_args() -> Dict[str, Any]:
 
 
 def load_repo_args(args: argparse.Namespace) -> SimpleNamespace:
-    from utils.iotools import load_train_configs
-
     cfg = default_repo_args()
     if args.config is not None:
+        from utils.iotools import load_train_configs
+
         loaded = load_train_configs(str(args.config))
         cfg.update(dict(loaded))
 
@@ -417,6 +930,50 @@ def load_repo_args(args: argparse.Namespace) -> SimpleNamespace:
     cfg["img_size"] = tuple(img_size)
     cfg["milestones"] = tuple(cfg.get("milestones", (45, 50)))
     return SimpleNamespace(**cfg)
+
+
+def build_split_metadata(repo_args: SimpleNamespace, split: str) -> SplitData:
+    dataset_name = repo_args.dataset_name
+    root_dir = Path(repo_args.root_dir)
+    if dataset_name == "RSTPReid":
+        dataset_dir = root_dir / "RSTPReid"
+        anno_path = dataset_dir / "data_captions.json"
+        image_key = "img_path"
+    elif dataset_name == "CUHK-PEDES":
+        dataset_dir = root_dir / "CUHK-PEDES"
+        anno_path = dataset_dir / "reid_raw.json"
+        image_key = "file_path"
+    elif dataset_name == "ICFG-PEDES":
+        dataset_dir = root_dir / "ICFG-PEDES"
+        anno_path = dataset_dir / "ICFG-PEDES.json"
+        image_key = "file_path"
+    else:
+        raise ValueError(f"Unsupported dataset for metadata loading: {dataset_name}")
+    if not anno_path.exists():
+        raise FileNotFoundError(f"Dataset annotation file not found: {anno_path}")
+
+    with anno_path.open("r", encoding="utf-8") as handle:
+        annos = json.load(handle)
+    query_records: List[QueryRecord] = []
+    gallery_pids: List[int] = []
+    gallery_paths: List[str] = []
+    query_id = 0
+    for anno in annos:
+        if anno.get("split") != split:
+            continue
+        pid = int(anno["id"])
+        gallery_pids.append(pid)
+        gallery_paths.append(str(dataset_dir / "imgs" / anno[image_key]))
+        for caption in anno.get("captions", []):
+            query_records.append(QueryRecord(query_id=query_id, query_text=str(caption), pid=pid))
+            query_id += 1
+    if not query_records or not gallery_pids:
+        raise RuntimeError(f"No {split} records found in {anno_path}")
+    return SplitData(
+        query_records=query_records,
+        gallery_pids=np.asarray(gallery_pids, dtype=np.int64),
+        gallery_paths=gallery_paths,
+    )
 
 
 def build_split_data(
@@ -505,7 +1062,7 @@ def select_queries_for_cases(
                     )
                     continue
                 candidates.append(record)
-            selection_method = "query_ids"
+            selection_method = str(case.get("selection_method", "query_ids"))
         else:
             needles = case_needles(case)
             candidates = []
@@ -1035,6 +1592,195 @@ def compute_density(
     return hard, soft
 
 
+def estimate_swap_strength_for_galleries(
+    gallery_a: np.ndarray,
+    gallery_b: np.ndarray,
+    psi_a: np.ndarray,
+    psi_b: np.ndarray,
+    threshold_a: float,
+    threshold_b: float,
+    tau_density: float,
+) -> float:
+    _, soft_a_in_a = compute_density(psi_a, gallery_a, threshold_a, tau_density)
+    _, soft_a_in_b = compute_density(psi_a, gallery_b, threshold_a, tau_density)
+    _, soft_b_in_a = compute_density(psi_b, gallery_a, threshold_b, tau_density)
+    _, soft_b_in_b = compute_density(psi_b, gallery_b, threshold_b, tau_density)
+    return float((soft_a_in_a - soft_a_in_b) + (soft_b_in_b - soft_b_in_a))
+
+
+def filter_visually_constructible_cases(
+    candidate_cases: Sequence[Mapping[str, Any]],
+    query_records: Sequence[QueryRecord],
+    gallery_pids: np.ndarray,
+    cue_affinities: Mapping[str, np.ndarray],
+    cue_thresholds: Mapping[str, float],
+    args: argparse.Namespace,
+    logger: logging.Logger,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Keep only auto-generated cases for which paired cue-swap galleries can be
+    constructed for at least args.min_constructible_query_trials query-trials.
+
+    This is a manipulation/constructibility filter only. It must not compute
+    or use retrieval scores, R1, AP, ranks, or any retrieval outcome.
+    """
+    query_by_id = {record.query_id: record for record in query_records}
+    kept_cases: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
+
+    for raw_case in candidate_cases:
+        case = dict(raw_case)
+        case_id = str(case["case_id"])
+        cue_a = str(case["cue_a"])
+        cue_b = str(case["cue_b"])
+        checked_trials = 0
+        constructible_trials = 0
+        swap_strengths: List[float] = []
+        skip_reasons: Counter[str] = Counter()
+
+        if cue_a not in cue_affinities or cue_b not in cue_affinities:
+            rows.append(
+                {
+                    "case_id": case_id,
+                    "cue_a": cue_a,
+                    "cue_b": cue_b,
+                    "auto_case_support": int(case.get("auto_case_support", 0)),
+                    "checked_query_trials": 0,
+                    "constructible_query_trials": 0,
+                    "mean_constructibility_swap_strength": float("nan"),
+                    "kept": False,
+                    "reason": "missing_cue_affinity",
+                    "construction_skip_reasons": "{}",
+                }
+            )
+            continue
+
+        query_ids = [int(query_id) for query_id in case.get("query_ids", [])]
+        query_ids = query_ids[: args.auto_case_max_queries_for_constructibility]
+        psi_a = cue_affinities[cue_a]
+        psi_b = cue_affinities[cue_b]
+        threshold_a = cue_thresholds[cue_a]
+        threshold_b = cue_thresholds[cue_b]
+
+        for query_id in query_ids:
+            record = query_by_id.get(query_id)
+            if record is None:
+                skip_reasons["query_id_not_in_split"] += args.num_random_trials
+                checked_trials += args.num_random_trials
+                continue
+            for trial_id in range(args.num_random_trials):
+                checked_trials += 1
+                galleries, skip_reason = construct_counterfactual_galleries(
+                    pid=record.pid,
+                    gallery_pids=gallery_pids,
+                    psi_a=psi_a,
+                    psi_b=psi_b,
+                    args=args,
+                    case_id=case_id,
+                    query_id=query_id,
+                    trial_id=trial_id,
+                )
+                if skip_reason is not None:
+                    skip_reasons[skip_reason] += 1
+                    continue
+                constructible_trials += 1
+                swap_strengths.append(
+                    estimate_swap_strength_for_galleries(
+                        gallery_a=galleries["a_dense"],
+                        gallery_b=galleries["b_dense"],
+                        psi_a=psi_a,
+                        psi_b=psi_b,
+                        threshold_a=threshold_a,
+                        threshold_b=threshold_b,
+                        tau_density=args.tau_density,
+                    )
+                )
+
+        mean_swap_strength = (
+            float(np.mean(swap_strengths)) if swap_strengths else float("nan")
+        )
+        if constructible_trials == 0:
+            kept = False
+            reason = "no_constructible_trials"
+        elif constructible_trials < args.min_constructible_query_trials:
+            kept = False
+            reason = "below_min_constructible_query_trials"
+        elif (
+            args.min_case_swap_strength is not None
+            and mean_swap_strength < args.min_case_swap_strength
+        ):
+            kept = False
+            reason = "below_min_case_swap_strength"
+        else:
+            kept = True
+            reason = ""
+
+        if kept:
+            kept_case = dict(case)
+            kept_case["constructible_query_trials"] = constructible_trials
+            kept_case["mean_constructibility_swap_strength"] = mean_swap_strength
+            kept_case["case_source"] = "pre_registered_auto"
+            kept_cases.append(kept_case)
+
+        rows.append(
+            {
+                "case_id": case_id,
+                "cue_a": cue_a,
+                "cue_b": cue_b,
+                "auto_case_support": int(case.get("auto_case_support", 0)),
+                "checked_query_trials": checked_trials,
+                "constructible_query_trials": constructible_trials,
+                "mean_constructibility_swap_strength": mean_swap_strength,
+                "kept": kept,
+                "reason": reason,
+                "construction_skip_reasons": json.dumps(dict(sorted(skip_reasons.items()))),
+            }
+        )
+
+    kept_cases.sort(
+        key=lambda case: (
+            -int(case.get("auto_case_support", 0)),
+            str(case.get("case_id", "")),
+        )
+    )
+    reason_counts = Counter(row["reason"] or "kept" for row in rows)
+    logger.info(
+        "Auto constructibility kept %d/%d cases; top reasons: %s",
+        len(kept_cases),
+        len(candidate_cases),
+        dict(reason_counts.most_common(5)),
+    )
+    return kept_cases, rows
+
+
+def write_auto_case_constructibility(
+    output_dir: Path,
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    pd = import_pandas()
+    columns = [
+        "case_id",
+        "cue_a",
+        "cue_b",
+        "auto_case_support",
+        "checked_query_trials",
+        "constructible_query_trials",
+        "mean_constructibility_swap_strength",
+        "kept",
+        "reason",
+        "construction_skip_reasons",
+    ]
+    pd.DataFrame(rows, columns=columns).to_csv(
+        output_dir / "auto_case_constructibility.csv", index=False
+    )
+
+
+def write_auto_cases_json(path: Path, cases: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(to_jsonable(list(cases)), handle, indent=2, sort_keys=True)
+
+
 def compute_crowding(scores: np.ndarray, is_positive: np.ndarray, tau_crowding: float) -> float:
     non_positive_scores = scores[~is_positive]
     if len(non_positive_scores) == 0:
@@ -1057,6 +1803,8 @@ def write_config_used(
     repo_args: Optional[SimpleNamespace] = None,
     score_mode: Optional[str] = None,
     cue_mode: Optional[str] = None,
+    case_source: Optional[str] = None,
+    cue_vocab_source_value: Optional[str] = None,
 ) -> None:
     payload = {
         "script_args": to_jsonable(vars(args)),
@@ -1064,6 +1812,15 @@ def write_config_used(
         "repo_args": to_jsonable(repo_args) if repo_args is not None else None,
         "resolved_score_mode": score_mode,
         "resolved_cue_mode": cue_mode,
+        "case_source": case_source,
+        "cue_vocab_source": cue_vocab_source_value,
+        "auto_case_parameters": {
+            "min_queries_per_auto_case": args.min_queries_per_auto_case,
+            "max_auto_cases": args.max_auto_cases,
+            "min_constructible_query_trials": args.min_constructible_query_trials,
+            "min_case_swap_strength": args.min_case_swap_strength,
+            "auto_case_max_queries_for_constructibility": args.auto_case_max_queries_for_constructibility,
+        },
     }
     with (output_dir / "config_used.json").open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
@@ -1219,22 +1976,137 @@ def write_outputs(
     return per_query_df, summary_by_case, summary_overall
 
 
-def run_dry_run(
-    args: argparse.Namespace,
+def unique_cues_from_cases(cases: Sequence[Mapping[str, Any]]) -> List[str]:
+    return sorted({str(case["cue_a"]) for case in cases} | {str(case["cue_b"]) for case in cases})
+
+
+def build_case_cue_affinities(
     cases: Sequence[Mapping[str, Any]],
+    model: torch.nn.Module,
+    cache: EmbeddingCache,
+    repo_args: SimpleNamespace,
+    device: torch.device,
+    use_grab: bool,
+    cue_mode: str,
+    lambda_global: float,
+    cue_threshold_quantile: float,
     logger: logging.Logger,
+) -> Tuple[List[str], CueFeatures, Dict[str, np.ndarray], Dict[str, float]]:
+    unique_cues = unique_cues_from_cases(cases)
+    cue_features = encode_cue_features(
+        model=model,
+        cues=unique_cues,
+        text_length=repo_args.text_length,
+        device=device,
+        use_grab=use_grab,
+        logger=logger,
+    )
+    cue_affinities = {
+        cue: cue_gallery_affinity(cache, cue_features, cue, cue_mode, lambda_global)
+        for cue in unique_cues
+    }
+    cue_thresholds = {
+        cue: float(np.quantile(scores, cue_threshold_quantile))
+        for cue, scores in cue_affinities.items()
+    }
+    return unique_cues, cue_features, cue_affinities, cue_thresholds
+
+
+def run_auto_text_case_generation(
+    args: argparse.Namespace,
+    split_data: SplitData,
+    logger: logging.Logger,
+) -> Tuple[List[CueSpec], Dict[int, List[str]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    cue_specs = load_cue_specs(args.cue_vocab_file)
+    logger.info("Loaded %d cue specs from %s", len(cue_specs), cue_vocab_source(args))
+    detected_by_query = detect_cues_for_queries(split_data.query_records, cue_specs)
+    write_auto_query_cues(args.output_dir, split_data.query_records, detected_by_query)
+    queries_with_two_cues = sum(1 for cues in detected_by_query.values() if len(cues) >= 2)
+    logger.info("Detected >=2 cues in %d queries", queries_with_two_cues)
+    candidate_cases, generation_rows = generate_candidate_cases_from_cooccurrence(
+        query_records=split_data.query_records,
+        detected_by_query=detected_by_query,
+        gallery_pids=split_data.gallery_pids,
+        min_queries=args.min_queries_per_auto_case,
+        max_cases=args.max_auto_cases,
+    )
+    write_auto_case_candidates(args.output_dir, candidate_cases, generation_rows)
+    supported_before_cap = sum(1 for row in generation_rows if row.get("meets_min_queries"))
+    logger.info("Candidate cue pairs before support filter: %d", len(generation_rows))
+    logger.info("Candidate cases after support/cap filter: %d", len(candidate_cases))
+    logger.info("Candidate cases meeting support before cap: %d", supported_before_cap)
+    return cue_specs, detected_by_query, candidate_cases, generation_rows
+
+
+def print_auto_case_generation_block(
+    cue_specs_count: int,
+    detected_by_query: Mapping[int, Sequence[str]],
+    candidate_rows: Sequence[Mapping[str, Any]],
+    kept_cases_count: Optional[int],
+    auto_cases_file: Optional[Path],
 ) -> None:
-    write_config_used(args.output_dir, args, cases)
-    logger.info("Dry run complete: validated %d cue cases", len(cases))
+    queries_with_two_cues = sum(1 for cues in detected_by_query.values() if len(cues) >= 2)
+    supported_after_filter = sum(1 for row in candidate_rows if row.get("kept_after_support"))
+    print("\nAuto case generation:")
+    print(f"  cue specs: {cue_specs_count}")
+    print(f"  queries with >=2 cues: {queries_with_two_cues}")
+    print(f"  candidate pairs after support filter: {supported_after_filter}")
+    if kept_cases_count is not None:
+        print(f"  constructible cases kept: {kept_cases_count}")
+    if auto_cases_file is not None:
+        print(f"  auto cases file: {auto_cases_file}")
+
+
+def run_dry_run(args: argparse.Namespace, logger: logging.Logger) -> None:
+    if not is_auto_case_mode(args):
+        cases = load_cases(args.cases_file)
+        write_config_used(
+            args.output_dir,
+            args,
+            cases,
+            repo_args=None,
+            case_source="manual",
+            cue_vocab_source_value=None,
+        )
+        logger.info("Manual dry run complete: validated %d cue cases", len(cases))
+        print("Dry run complete")
+        print(f"Mode: manual")
+        print(f"Validated cases: {len(cases)}")
+        print(f"Output directory: {args.output_dir}")
+        return
+
+    logger.info("Auto dry run: loading dataset split and running cue co-occurrence only")
+    repo_args = load_repo_args(args)
+    split_data = build_split_metadata(repo_args, args.split)
+    cue_specs, detected_by_query, candidate_cases, generation_rows = run_auto_text_case_generation(
+        args=args,
+        split_data=split_data,
+        logger=logger,
+    )
+    write_config_used(
+        args.output_dir,
+        args,
+        candidate_cases,
+        repo_args=repo_args,
+        case_source="pre_registered_auto",
+        cue_vocab_source_value=cue_vocab_source(args),
+    )
+    print_auto_case_generation_block(
+        cue_specs_count=len(cue_specs),
+        detected_by_query=detected_by_query,
+        candidate_rows=generation_rows,
+        kept_cases_count=None,
+        auto_cases_file=None,
+    )
     print("Dry run complete")
-    print(f"Validated cases: {len(cases)}")
+    print(f"Mode: pre_registered_auto")
+    print(f"Candidate cases: {len(candidate_cases)}")
     print(f"Output directory: {args.output_dir}")
 
 
 def run_evaluation(args: argparse.Namespace, logger: logging.Logger) -> None:
     from model import build_model
 
-    cases = load_cases(args.cases_file)
     repo_args = load_repo_args(args)
 
     dataset, img_loader, txt_loader, split_data = build_split_data(repo_args, args.split)
@@ -1252,7 +2124,6 @@ def run_evaluation(args: argparse.Namespace, logger: logging.Logger) -> None:
     score_mode = resolve_mode(args.score_mode, use_grab, args.lambda_global, "score")
     cue_mode_arg = score_mode if args.cue_mode == "score" else args.cue_mode
     cue_mode = resolve_mode(cue_mode_arg, use_grab, args.lambda_global, "cue")
-    write_config_used(args.output_dir, args, cases, repo_args, score_mode, cue_mode)
     logger.info(
         "Resolved score_mode=%s cue_mode=%s use_grab=%s lambda_global=%.4f",
         score_mode,
@@ -1297,6 +2168,114 @@ def run_evaluation(args: argparse.Namespace, logger: logging.Logger) -> None:
     print("\nWhole-test sanity metrics:")
     print(full_metric_df.to_string(index=False))
 
+    if is_auto_case_mode(args):
+        logger.info("Using pre-registered automatic cue cases")
+        cue_specs, detected_by_query, candidate_cases, generation_rows = run_auto_text_case_generation(
+            args=args,
+            split_data=split_data,
+            logger=logger,
+        )
+        auto_cases_file = auto_cases_output_path(args)
+        if not candidate_cases:
+            write_auto_case_constructibility(args.output_dir, [])
+            write_auto_cases_json(auto_cases_file, [])
+            write_config_used(
+                args.output_dir,
+                args,
+                [],
+                repo_args=repo_args,
+                score_mode=score_mode,
+                cue_mode=cue_mode,
+                case_source="pre_registered_auto",
+                cue_vocab_source_value=cue_vocab_source(args),
+            )
+            print_auto_case_generation_block(
+                cue_specs_count=len(cue_specs),
+                detected_by_query=detected_by_query,
+                candidate_rows=generation_rows,
+                kept_cases_count=0,
+                auto_cases_file=auto_cases_file,
+            )
+            raise RuntimeError(
+                "No auto-generated cue cases met the query-support threshold. "
+                "See auto_case_candidates.csv."
+            )
+
+        _, cue_features, cue_affinities, cue_thresholds = build_case_cue_affinities(
+            cases=candidate_cases,
+            model=model,
+            cache=cache,
+            repo_args=repo_args,
+            device=device,
+            use_grab=use_grab,
+            cue_mode=cue_mode,
+            lambda_global=args.lambda_global,
+            cue_threshold_quantile=args.cue_threshold_quantile,
+            logger=logger,
+        )
+        cases, constructibility_rows = filter_visually_constructible_cases(
+            candidate_cases=candidate_cases,
+            query_records=split_data.query_records,
+            gallery_pids=split_data.gallery_pids,
+            cue_affinities=cue_affinities,
+            cue_thresholds=cue_thresholds,
+            args=args,
+            logger=logger,
+        )
+        write_auto_case_constructibility(args.output_dir, constructibility_rows)
+        write_auto_cases_json(auto_cases_file, cases)
+        write_config_used(
+            args.output_dir,
+            args,
+            cases,
+            repo_args=repo_args,
+            score_mode=score_mode,
+            cue_mode=cue_mode,
+            case_source="pre_registered_auto",
+            cue_vocab_source_value=cue_vocab_source(args),
+        )
+        removed = len(candidate_cases) - len(cases)
+        reason_counts = Counter(row["reason"] or "kept" for row in constructibility_rows)
+        logger.info("Auto constructibility removed %d cases", removed)
+        logger.info("Auto constructibility top reasons: %s", dict(reason_counts.most_common(5)))
+        print_auto_case_generation_block(
+            cue_specs_count=len(cue_specs),
+            detected_by_query=detected_by_query,
+            candidate_rows=generation_rows,
+            kept_cases_count=len(cases),
+            auto_cases_file=auto_cases_file,
+        )
+        if not cases:
+            raise RuntimeError(
+                "No auto-generated cue cases remained after constructibility filtering. "
+                "See auto_case_candidates.csv and auto_case_constructibility.csv."
+            )
+    else:
+        logger.info("Using manual cue cases from %s", args.cases_file)
+        cases = load_cases(args.cases_file)
+        _, cue_features, cue_affinities, cue_thresholds = build_case_cue_affinities(
+            cases=cases,
+            model=model,
+            cache=cache,
+            repo_args=repo_args,
+            device=device,
+            use_grab=use_grab,
+            cue_mode=cue_mode,
+            lambda_global=args.lambda_global,
+            cue_threshold_quantile=args.cue_threshold_quantile,
+            logger=logger,
+        )
+        write_config_used(
+            args.output_dir,
+            args,
+            cases,
+            repo_args=repo_args,
+            score_mode=score_mode,
+            cue_mode=cue_mode,
+            case_source="manual",
+            cue_vocab_source_value=None,
+        )
+
     selected_queries, skipped_rows = select_queries_for_cases(
         cases=cases,
         query_records=split_data.query_records,
@@ -1308,24 +2287,6 @@ def run_evaluation(args: argparse.Namespace, logger: logging.Logger) -> None:
     if not selected_queries:
         write_outputs(args.output_dir, selected_queries, [], [], [], skipped_rows)
         raise RuntimeError("No eligible queries were selected; see skipped_queries.jsonl")
-
-    unique_cues = sorted({str(case["cue_a"]) for case in cases} | {str(case["cue_b"]) for case in cases})
-    cue_features = encode_cue_features(
-        model=model,
-        cues=unique_cues,
-        text_length=repo_args.text_length,
-        device=device,
-        use_grab=use_grab,
-        logger=logger,
-    )
-    cue_affinities = {
-        cue: cue_gallery_affinity(cache, cue_features, cue, cue_mode, args.lambda_global)
-        for cue in unique_cues
-    }
-    cue_thresholds = {
-        cue: float(np.quantile(scores, args.cue_threshold_quantile))
-        for cue, scores in cue_affinities.items()
-    }
 
     selected_by_case: Dict[str, List[Dict[str, Any]]] = {}
     for row in selected_queries:
@@ -1495,9 +2456,8 @@ def main() -> None:
     logger = setup_logging(args.output_dir)
     validate_cli_args(args)
     set_deterministic(args.seed)
-    cases = load_cases(args.cases_file)
     if args.dry_run:
-        run_dry_run(args, cases, logger)
+        run_dry_run(args, logger)
         return
     run_evaluation(args, logger)
 
