@@ -320,6 +320,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_queries_per_case", type=int)
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument(
+        "--debug_swap_strength",
+        action="store_true",
+        help="Save swap_strength_debug.csv with per-case cue-density intervention diagnostics.",
+    )
+    parser.add_argument(
         "--auto_cases",
         action="store_true",
         help=(
@@ -336,7 +341,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min_queries_per_auto_case",
         type=int,
-        default=40,
+        default=10,
         help="Minimum number of eligible queries required for an automatically generated cue pair.",
     )
     parser.add_argument(
@@ -354,7 +359,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min_case_swap_strength",
         type=float,
-        default=0.4,
+        default=None,
         help=(
             "Optional manipulation-validity threshold. If set, keep an auto-generated case only when "
             "its mean swap strength over constructible dry construction trials is at least this value. "
@@ -1592,6 +1597,39 @@ def compute_density(
     return hard, soft
 
 
+def compute_swap_strength_variants(
+    d_soft_a_in_a_dense: float,
+    d_soft_a_in_b_dense: float,
+    d_soft_b_in_a_dense: float,
+    d_soft_b_in_b_dense: float,
+) -> Dict[str, float]:
+    """Return raw and bounded comparison forms of cue-distribution shift.
+
+    The raw protocol value is:
+
+        (D_a(G_a_dense) - D_a(G_b_dense))
+        + (D_b(G_b_dense) - D_b(G_a_dense))
+
+    Each soft density D is in [0, 1], so the raw sum is in [-2, 2].
+    It is a cue-density intervention strength, not a probability or ratio.
+    For comparison, normalized divides the raw value by 2, and clamped clips
+    that normalized value into [0, 1].
+    """
+    raw = (
+        d_soft_a_in_a_dense
+        - d_soft_a_in_b_dense
+        + d_soft_b_in_b_dense
+        - d_soft_b_in_a_dense
+    )
+    normalized = raw / 2.0
+    clamped = float(np.clip(normalized, 0.0, 1.0))
+    return {
+        "swap_strength_raw": float(raw),
+        "swap_strength_normalized": float(normalized),
+        "swap_strength_clamped": clamped,
+    }
+
+
 def estimate_swap_strength_for_galleries(
     gallery_a: np.ndarray,
     gallery_b: np.ndarray,
@@ -1605,7 +1643,12 @@ def estimate_swap_strength_for_galleries(
     _, soft_a_in_b = compute_density(psi_a, gallery_b, threshold_a, tau_density)
     _, soft_b_in_a = compute_density(psi_b, gallery_a, threshold_b, tau_density)
     _, soft_b_in_b = compute_density(psi_b, gallery_b, threshold_b, tau_density)
-    return float((soft_a_in_a - soft_a_in_b) + (soft_b_in_b - soft_b_in_a))
+    return compute_swap_strength_variants(
+        d_soft_a_in_a_dense=soft_a_in_a,
+        d_soft_a_in_b_dense=soft_a_in_b,
+        d_soft_b_in_a_dense=soft_b_in_a,
+        d_soft_b_in_b_dense=soft_b_in_b,
+    )["swap_strength_raw"]
 
 
 def filter_visually_constructible_cases(
@@ -1866,6 +1909,9 @@ def write_outputs(
         "D_hard_b",
         "crowding",
         "swap_strength",
+        "swap_strength_raw",
+        "swap_strength_normalized",
+        "swap_strength_clamped",
         "rank_volatility",
         "ap_delta",
         "r1_flip",
@@ -1896,6 +1942,8 @@ def write_outputs(
                 "mean_D_soft_a",
                 "mean_D_soft_b",
                 "mean_swap_strength",
+                "mean_swap_strength_normalized",
+                "mean_swap_strength_clamped",
             ]
         )
     else:
@@ -1916,6 +1964,8 @@ def write_outputs(
                     "mean_D_soft_a": float(group["D_soft_a"].mean()),
                     "mean_D_soft_b": float(group["D_soft_b"].mean()),
                     "mean_swap_strength": float(group["swap_strength"].mean()),
+                    "mean_swap_strength_normalized": float(group["swap_strength_normalized"].mean()),
+                    "mean_swap_strength_clamped": float(group["swap_strength_clamped"].mean()),
                 }
             )
         summary_by_case = pd.DataFrame(rows)
@@ -1941,6 +1991,8 @@ def write_outputs(
                     "mean_rank_volatility": float("nan"),
                     "r1_flip_rate": float("nan"),
                     "mean_swap_strength": float("nan"),
+                    "mean_swap_strength_normalized": float("nan"),
+                    "mean_swap_strength_clamped": float("nan"),
                 }
             ]
         )
@@ -1966,6 +2018,8 @@ def write_outputs(
                     "mean_rank_volatility": float(paired_df["rank_volatility"].mean()),
                     "r1_flip_rate": float(paired_df["r1_flip"].mean()),
                     "mean_swap_strength": float(paired_df["swap_strength"].mean()),
+                    "mean_swap_strength_normalized": float(paired_df["swap_strength_normalized"].mean()),
+                    "mean_swap_strength_clamped": float(paired_df["swap_strength_clamped"].mean()),
                 }
             ]
         )
@@ -1974,6 +2028,97 @@ def write_outputs(
     write_jsonl(output_dir / "galleries.jsonl", gallery_rows)
     write_jsonl(output_dir / "skipped_queries.jsonl", skipped_rows)
     return per_query_df, summary_by_case, summary_overall
+
+
+def write_swap_strength_debug(
+    output_dir: Path,
+    per_query_rows: Sequence[Mapping[str, Any]],
+    paired_rows: Sequence[Mapping[str, Any]],
+) -> None:
+    pd = import_pandas()
+    per_query_df = pd.DataFrame(per_query_rows)
+    paired_df = pd.DataFrame(paired_rows)
+    columns = [
+        "case_id",
+        "num_queries",
+        "num_query_trials",
+        "mean_D_soft_a",
+        "mean_D_soft_b",
+        "mean_D_soft_a_a_dense",
+        "mean_D_soft_a_b_dense",
+        "mean_D_soft_b_a_dense",
+        "mean_D_soft_b_b_dense",
+        "swap_strength",
+        "swap_strength_raw",
+        "swap_strength_normalized",
+        "swap_strength_clamped",
+        "min_swap_strength",
+        "max_swap_strength",
+        "std_swap_strength",
+        "num_galleries_where_swap_strength_gt_1",
+        "case_rank_by_swap_strength",
+        "is_top10_case_by_swap_strength",
+        "top_trials_json",
+    ]
+    if paired_df.empty:
+        pd.DataFrame(columns=columns).to_csv(output_dir / "swap_strength_debug.csv", index=False)
+        return
+
+    rows = []
+    for case_id, paired_group in paired_df.groupby("case_id"):
+        per_case = per_query_df[per_query_df["case_id"] == case_id]
+        top_trials = paired_group.sort_values(
+            ["swap_strength_raw", "query_id", "trial_id"],
+            ascending=[False, True, True],
+        ).head(10)
+        top_trial_columns = [
+            "query_id",
+            "trial_id",
+            "pid",
+            "swap_strength_raw",
+            "swap_strength_normalized",
+            "swap_strength_clamped",
+            "D_soft_a_a_dense",
+            "D_soft_a_b_dense",
+            "D_soft_b_a_dense",
+            "D_soft_b_b_dense",
+        ]
+        rows.append(
+            {
+                "case_id": case_id,
+                "num_queries": int(paired_group["query_id"].nunique()),
+                "num_query_trials": int(len(paired_group)),
+                "mean_D_soft_a": float(per_case["D_soft_a"].mean()) if not per_case.empty else float("nan"),
+                "mean_D_soft_b": float(per_case["D_soft_b"].mean()) if not per_case.empty else float("nan"),
+                "mean_D_soft_a_a_dense": float(paired_group["D_soft_a_a_dense"].mean()),
+                "mean_D_soft_a_b_dense": float(paired_group["D_soft_a_b_dense"].mean()),
+                "mean_D_soft_b_a_dense": float(paired_group["D_soft_b_a_dense"].mean()),
+                "mean_D_soft_b_b_dense": float(paired_group["D_soft_b_b_dense"].mean()),
+                "swap_strength": float(paired_group["swap_strength_raw"].mean()),
+                "swap_strength_raw": float(paired_group["swap_strength_raw"].mean()),
+                "swap_strength_normalized": float(paired_group["swap_strength_normalized"].mean()),
+                "swap_strength_clamped": float(paired_group["swap_strength_clamped"].mean()),
+                "min_swap_strength": float(paired_group["swap_strength_raw"].min()),
+                "max_swap_strength": float(paired_group["swap_strength_raw"].max()),
+                "std_swap_strength": float(paired_group["swap_strength_raw"].std(ddof=0)),
+                "num_galleries_where_swap_strength_gt_1": int(
+                    (paired_group["swap_strength_raw"] > 1.0).sum()
+                ),
+                "top_trials_json": json.dumps(
+                    top_trials[top_trial_columns].to_dict(orient="records"),
+                    sort_keys=True,
+                ),
+            }
+        )
+
+    debug_df = pd.DataFrame(rows)
+    debug_df = debug_df.sort_values(
+        ["swap_strength_raw", "case_id"], ascending=[False, True]
+    ).reset_index(drop=True)
+    debug_df["case_rank_by_swap_strength"] = debug_df.index + 1
+    debug_df["is_top10_case_by_swap_strength"] = debug_df["case_rank_by_swap_strength"] <= 10
+    debug_df = debug_df[columns]
+    debug_df.to_csv(output_dir / "swap_strength_debug.csv", index=False)
 
 
 def unique_cues_from_cases(cases: Sequence[Mapping[str, Any]]) -> List[str]:
@@ -2379,12 +2524,13 @@ def run_evaluation(args: argparse.Namespace, logger: logging.Logger) -> None:
                         }
                     )
 
-                swap_strength = (
-                    density_by_gallery["a_dense"]["D_soft_a"]
-                    - density_by_gallery["b_dense"]["D_soft_a"]
-                    + density_by_gallery["b_dense"]["D_soft_b"]
-                    - density_by_gallery["a_dense"]["D_soft_b"]
+                swap_variants = compute_swap_strength_variants(
+                    d_soft_a_in_a_dense=density_by_gallery["a_dense"]["D_soft_a"],
+                    d_soft_a_in_b_dense=density_by_gallery["b_dense"]["D_soft_a"],
+                    d_soft_b_in_a_dense=density_by_gallery["a_dense"]["D_soft_b"],
+                    d_soft_b_in_b_dense=density_by_gallery["b_dense"]["D_soft_b"],
                 )
+                swap_strength = swap_variants["swap_strength_raw"]
                 rank_volatility = abs(
                     metrics_by_gallery["a_dense"]["min_positive_rank"]
                     - metrics_by_gallery["b_dense"]["min_positive_rank"]
@@ -2404,6 +2550,11 @@ def run_evaluation(args: argparse.Namespace, logger: logging.Logger) -> None:
                         "ap_delta": ap_delta,
                         "r1_flip": r1_flip,
                         "swap_strength": swap_strength,
+                        **swap_variants,
+                        "D_soft_a_a_dense": density_by_gallery["a_dense"]["D_soft_a"],
+                        "D_soft_a_b_dense": density_by_gallery["b_dense"]["D_soft_a"],
+                        "D_soft_b_a_dense": density_by_gallery["a_dense"]["D_soft_b"],
+                        "D_soft_b_b_dense": density_by_gallery["b_dense"]["D_soft_b"],
                     }
                 )
 
@@ -2422,6 +2573,7 @@ def run_evaluation(args: argparse.Namespace, logger: logging.Logger) -> None:
                         **density_by_gallery[gallery_type],
                         "crowding": crowding_by_gallery[gallery_type],
                         "swap_strength": swap_strength,
+                        **swap_variants,
                         "rank_volatility": rank_volatility,
                         "ap_delta": ap_delta,
                         "r1_flip": r1_flip,
@@ -2440,6 +2592,9 @@ def run_evaluation(args: argparse.Namespace, logger: logging.Logger) -> None:
         gallery_rows=gallery_rows,
         skipped_rows=skipped_rows,
     )
+    if args.debug_swap_strength:
+        write_swap_strength_debug(args.output_dir, per_query_rows, paired_rows)
+        logger.info("Wrote swap strength debug CSV to %s", args.output_dir / "swap_strength_debug.csv")
 
     if per_query_df.empty:
         raise RuntimeError("All selected queries were skipped; see skipped_queries.jsonl")
