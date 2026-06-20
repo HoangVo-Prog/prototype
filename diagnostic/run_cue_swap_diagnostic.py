@@ -1,0 +1,581 @@
+"""Run the generalized cue-swap diagnostic.
+
+This is a matched empirical probe, not a universal theorem about all TBPS
+retrievers. Cue-biased galleries are constructed with an off-the-shelf CLIP
+cue-affinity scorer, while retrieval and hardness matching use the evaluated
+frozen TBPS retriever.
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Mapping
+
+import numpy as np
+import pandas as pd
+
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from diagnostic.audit import log_validity_warnings
+from diagnostic.bootstrap import cluster_bootstrap_ci
+from diagnostic.clip_cue_scorer import OffTheShelfCLIPCueScorer
+from diagnostic.config import (
+    jsonable,
+    load_repo_args,
+    parse_args,
+    resolve_device,
+    set_deterministic,
+    validate_args,
+)
+from diagnostic.constants import OUTPUT_FILES, PAIRED_DELTA_COLUMNS, SUMMARY_CI_METRICS
+from diagnostic.controls import construct_hardness_matched_controls
+from diagnostic.cue_cases import generate_auto_cases, load_cases, select_queries_for_cases
+from diagnostic.cue_ontology import load_cue_specs
+from diagnostic.data_loading import QueryRecord, load_split, load_split_metadata
+from diagnostic.embeddings import extract_retriever_embeddings
+from diagnostic.gallery_construction import construct_cue_swap_galleries
+from diagnostic.metrics import (
+    cue_shift,
+    density_over_indices,
+    gallery_distractor_indices,
+    paired_metrics,
+    retrieval_metrics,
+)
+from diagnostic.outputs import (
+    write_case_candidates,
+    write_config_used,
+    write_run_outputs,
+    write_thresholds,
+    write_whole_test,
+    summarize_outputs,
+)
+from diagnostic.retriever_loading import load_retriever
+from diagnostic.scoring import (
+    compute_full_test_metrics,
+    full_query_scores,
+    query_gallery_scores,
+    resolve_score_mode,
+)
+
+
+def setup_logging(output_dir: Path) -> logging.Logger:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("cue_swap_diagnostic")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(formatter)
+    logger.addHandler(stream)
+    file_handler = logging.FileHandler(output_dir / "cue_swap_diagnostic.log", mode="w")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    return logger
+
+
+def unique_cues(cases: list[Mapping[str, Any]]) -> list[str]:
+    cues = sorted({str(case["cue_a"]) for case in cases} | {str(case["cue_b"]) for case in cases})
+    if not cues:
+        raise RuntimeError("No cues found in cue cases")
+    return cues
+
+
+def gallery_result_row(
+    *,
+    args: Any,
+    score_mode: str,
+    query: QueryRecord,
+    query_text: str,
+    case_id: str,
+    cue_a: str,
+    cue_b: str,
+    trial_id: int,
+    construction_type: str,
+    gallery_type: str,
+    gallery_indices: np.ndarray,
+    scores: np.ndarray,
+    gallery_pids: np.ndarray,
+    psi_a: np.ndarray,
+    psi_b: np.ndarray,
+    threshold_a: float,
+    threshold_b: float,
+) -> tuple[dict[str, Any], dict[str, float], np.ndarray]:
+    is_positive = gallery_pids[gallery_indices] == int(query.pid)
+    metrics = retrieval_metrics(scores, is_positive)
+    distractors = gallery_distractor_indices(gallery_indices, gallery_pids, query.pid)
+    hard_a, soft_a = density_over_indices(psi_a, distractors, threshold_a, args.tau_density)
+    hard_b, soft_b = density_over_indices(psi_b, distractors, threshold_b, args.tau_density)
+    distractor_scores = scores[~is_positive]
+    row = {
+        "dataset": args.dataset,
+        "retriever_name": args.retriever_name,
+        "cue_scorer": args.cue_scorer,
+        "case_id": case_id,
+        "query_id": query.query_id,
+        "query_text": query_text,
+        "pid": query.pid,
+        "cue_a": cue_a,
+        "cue_b": cue_b,
+        "trial_id": trial_id,
+        "construction_type": construction_type,
+        "gallery_type": gallery_type,
+        "gallery_size": int(len(gallery_indices)),
+        "num_positives": int(is_positive.sum()),
+        "num_distractors": int((~is_positive).sum()),
+        "positive_ratio": float(is_positive.mean()),
+        **metrics,
+        "D_soft_a": soft_a,
+        "D_soft_b": soft_b,
+        "D_hard_a": hard_a,
+        "D_hard_b": hard_b,
+        "mean_retriever_score_distractors": float(np.mean(distractor_scores)) if len(distractor_scores) else np.nan,
+        "score_mode": score_mode,
+        "lambda_global": args.lambda_global,
+        "seed": args.seed,
+    }
+    return row, metrics, is_positive
+
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_logging(args.output_dir)
+    set_deterministic(args.seed)
+
+    repo_args = load_repo_args(args)
+    split = load_split_metadata(repo_args, args.split) if args.dry_run else load_split(repo_args, args.split)
+    logger.info(
+        "Loaded dataset=%s split=%s queries=%d gallery=%d",
+        args.dataset,
+        args.split,
+        len(split.query_records),
+        len(split.gallery_records),
+    )
+
+    cue_specs = load_cue_specs(args.cue_vocab_file)
+    if args.auto_cases:
+        cases, case_candidate_rows, _ = generate_auto_cases(
+            split.query_records,
+            split.gallery_pids,
+            cue_specs,
+            args.min_queries_per_auto_case,
+            args.max_auto_cases,
+        )
+    else:
+        cases = load_cases(args.cases_file)
+        case_candidate_rows = [
+            {
+                "case_id": case["case_id"],
+                "cue_a": case["cue_a"],
+                "cue_b": case["cue_b"],
+                "num_queries": len(case.get("query_ids", [])),
+                "query_ids": case.get("query_ids", ""),
+                "meets_min_queries": True,
+                "kept_after_support": True,
+                "reason": "",
+            }
+            for case in cases
+        ]
+    write_case_candidates(args.output_dir, case_candidate_rows)
+    if not cases:
+        raise RuntimeError("No cue cases are available. See cue_case_candidates.csv.")
+
+    selected_queries, skipped_rows = select_queries_for_cases(
+        args.dataset,
+        cases,
+        split.query_records,
+        split.gallery_pids,
+        args.max_queries_per_case,
+    )
+    if not selected_queries:
+        raise RuntimeError("No eligible queries were selected for the retained cue cases.")
+    query_lookup = {record.query_id: record for record in split.query_records}
+
+    if args.dry_run:
+        write_config_used(
+            args.output_dir,
+            {
+                "args": vars(args),
+                "repo_args": repo_args,
+                "dry_run": True,
+                "cases": cases,
+            },
+        )
+        logger.info("Dry run complete: cases=%d selected_queries=%d", len(cases), len(selected_queries))
+        print(f"Dry run complete: cases={len(cases)} selected_queries={len(selected_queries)}")
+        return
+
+    device = resolve_device(args.device)
+    retriever = load_retriever(
+        args.retriever_name,
+        repo_args,
+        args.retriever_checkpoint,
+        split.num_classes,
+        device,
+        logger,
+    )
+    score_mode = resolve_score_mode(args.score_mode, retriever.has_grab, args.lambda_global)
+    logger.info("Resolved score_mode=%s lambda_global=%.4f", score_mode, args.lambda_global)
+    retriever_cache = extract_retriever_embeddings(
+        retriever,
+        split.img_loader,
+        split.txt_loader,
+        use_grab=retriever.has_grab,
+        logger=logger,
+    )
+
+    whole_metrics = compute_full_test_metrics(
+        retriever_cache,
+        split.query_pids,
+        split.gallery_pids,
+        score_mode,
+        args.lambda_global,
+        chunk_size=max(1, min(256, int(repo_args.test_batch_size))),
+    )
+    whole_metrics.update(
+        {
+            "dataset": args.dataset,
+            "retriever_name": args.retriever_name,
+            "score_mode": score_mode,
+            "lambda_global": args.lambda_global,
+        }
+    )
+    whole_df = write_whole_test(args.output_dir, [whole_metrics])
+    ref_r1 = float(whole_metrics["R1"])
+
+    cues = unique_cues(cases)
+    cue_scorer = OffTheShelfCLIPCueScorer(args.clip_model_name, repo_args, device, logger)
+    cue_output = cue_scorer.score(cues, split.img_loader, repo_args.text_length, logger)
+    thresholds = {
+        cue: float(np.quantile(cue_output.affinities[cue], args.cue_threshold_quantile))
+        for cue in cues
+    }
+    write_thresholds(
+        args.output_dir,
+        [
+            {
+                "cue": cue,
+                "threshold": thresholds[cue],
+                "quantile": args.cue_threshold_quantile,
+                "cue_scorer": args.cue_scorer,
+            }
+            for cue in cues
+        ],
+    )
+
+    write_config_used(
+        args.output_dir,
+        {
+            "args": vars(args),
+            "repo_args": repo_args,
+            "resolved_score_mode": score_mode,
+            "cue_scorer": {
+                "name": args.cue_scorer,
+                "clip_model_name": args.clip_model_name,
+                "prompt_templates": cue_scorer.prompt_templates,
+                "prompts_by_cue": cue_output.prompts_by_cue,
+            },
+            "claim_scope": (
+                "This diagnostic is a matched empirical probe of representative frozen "
+                "gallery-agnostic TBPS retrievers under cue-biased gallery perturbations."
+            ),
+        },
+    )
+
+    per_gallery_rows: list[dict[str, Any]] = []
+    paired_cue_rows: list[dict[str, Any]] = []
+    paired_hm_rows: list[dict[str, Any]] = []
+    paired_delta_rows: list[dict[str, Any]] = []
+    gallery_rows: list[dict[str, Any]] = []
+    constructibility = defaultdict(lambda: {"attempted_pairs": 0, "valid_pairs": 0, "cue_shifts": [], "skip_reasons": defaultdict(int)})
+
+    for selected in selected_queries:
+        case_id = str(selected["case_id"])
+        cue_a = str(selected["cue_a"])
+        cue_b = str(selected["cue_b"])
+        query_id = int(selected["query_id"])
+        query = query_lookup[query_id]
+        psi_a = cue_output.affinities[cue_a]
+        psi_b = cue_output.affinities[cue_b]
+        threshold_a = thresholds[cue_a]
+        threshold_b = thresholds[cue_b]
+        case_stats = constructibility[case_id]
+
+        for trial_id in range(args.num_trials):
+            case_stats["attempted_pairs"] += 1
+            build, skip_reason = construct_cue_swap_galleries(
+                pid=query.pid,
+                gallery_pids=split.gallery_pids,
+                psi_a=psi_a,
+                psi_b=psi_b,
+                gallery_size=args.gallery_size,
+                dense_ratio=args.dense_ratio,
+                lambda_contrast=args.lambda_contrast,
+                seed=args.seed,
+                case_id=case_id,
+                query_id=query_id,
+                trial_id=trial_id,
+                neutral_strategy=args.neutral_strategy,
+                neutral_pool_factor=args.neutral_pool_factor,
+            )
+            if build is None:
+                case_stats["skip_reasons"][skip_reason] += 1
+                skipped_rows.append({"dataset": args.dataset, "case_id": case_id, "query_id": query_id, "trial_id": trial_id, "reason": skip_reason})
+                continue
+
+            shift_info = cue_shift(
+                build.galleries["a_dense"],
+                build.galleries["b_dense"],
+                split.gallery_pids,
+                query.pid,
+                psi_a,
+                psi_b,
+                threshold_a,
+                threshold_b,
+                args.tau_density,
+            )
+            if float(shift_info["cue_shift"]) < args.min_pair_cue_shift:
+                reason = "below_min_pair_cue_shift"
+                case_stats["skip_reasons"][reason] += 1
+                skipped_rows.append({"dataset": args.dataset, "case_id": case_id, "query_id": query_id, "trial_id": trial_id, "reason": reason, "cue_shift": shift_info["cue_shift"]})
+                continue
+
+            full_scores = full_query_scores(retriever_cache, query_id, score_mode, args.lambda_global)
+            hm_build, hm_skip = construct_hardness_matched_controls(
+                query.pid,
+                build.galleries,
+                split.gallery_pids,
+                full_scores,
+            )
+            if hm_build is None:
+                case_stats["skip_reasons"][hm_skip] += 1
+                skipped_rows.append({"dataset": args.dataset, "case_id": case_id, "query_id": query_id, "trial_id": trial_id, "reason": hm_skip})
+                continue
+
+            case_stats["valid_pairs"] += 1
+            case_stats["cue_shifts"].append(float(shift_info["cue_shift"]))
+
+            cue_metrics: dict[str, dict[str, float]] = {}
+            hm_metrics: dict[str, dict[str, float]] = {}
+            for gallery_type in ("a_dense", "b_dense"):
+                gallery_indices = build.galleries[gallery_type]
+                scores = query_gallery_scores(retriever_cache, query_id, gallery_indices, score_mode, args.lambda_global)
+                row, metrics, _ = gallery_result_row(
+                    args=args,
+                    score_mode=score_mode,
+                    query=query,
+                    query_text=str(selected["query_text"]),
+                    case_id=case_id,
+                    cue_a=cue_a,
+                    cue_b=cue_b,
+                    trial_id=trial_id,
+                    construction_type="cue_swap",
+                    gallery_type=gallery_type,
+                    gallery_indices=gallery_indices,
+                    scores=scores,
+                    gallery_pids=split.gallery_pids,
+                    psi_a=psi_a,
+                    psi_b=psi_b,
+                    threshold_a=threshold_a,
+                    threshold_b=threshold_b,
+                )
+                per_gallery_rows.append(row)
+                cue_metrics[gallery_type] = metrics
+
+            for gallery_type in ("hm_a", "hm_b"):
+                gallery_indices = hm_build.galleries[gallery_type]
+                scores = query_gallery_scores(retriever_cache, query_id, gallery_indices, score_mode, args.lambda_global)
+                row, metrics, _ = gallery_result_row(
+                    args=args,
+                    score_mode=score_mode,
+                    query=query,
+                    query_text=str(selected["query_text"]),
+                    case_id=case_id,
+                    cue_a=cue_a,
+                    cue_b=cue_b,
+                    trial_id=trial_id,
+                    construction_type="hardness_control",
+                    gallery_type=gallery_type,
+                    gallery_indices=gallery_indices,
+                    scores=scores,
+                    gallery_pids=split.gallery_pids,
+                    psi_a=psi_a,
+                    psi_b=psi_b,
+                    threshold_a=threshold_a,
+                    threshold_b=threshold_b,
+                )
+                per_gallery_rows.append(row)
+                hm_metrics[gallery_type] = metrics
+
+            cue_pair = paired_metrics(cue_metrics["a_dense"], cue_metrics["b_dense"])
+            hm_pair = paired_metrics(hm_metrics["hm_a"], hm_metrics["hm_b"])
+            paired_cue_rows.append(
+                {
+                    "dataset": args.dataset,
+                    "retriever_name": args.retriever_name,
+                    "cue_scorer": args.cue_scorer,
+                    "case_id": case_id,
+                    "query_id": query_id,
+                    "pid": query.pid,
+                    "trial_id": trial_id,
+                    "cue_a": cue_a,
+                    "cue_b": cue_b,
+                    **cue_pair,
+                    "cue_shift": shift_info["cue_shift"],
+                    "D_soft_a_a_dense": shift_info["D_soft_a_a_dense"],
+                    "D_soft_a_b_dense": shift_info["D_soft_a_b_dense"],
+                    "D_soft_b_a_dense": shift_info["D_soft_b_a_dense"],
+                    "D_soft_b_b_dense": shift_info["D_soft_b_b_dense"],
+                    "score_mode": score_mode,
+                    "lambda_global": args.lambda_global,
+                    "seed": args.seed,
+                }
+            )
+            paired_hm_rows.append(
+                {
+                    "dataset": args.dataset,
+                    "retriever_name": args.retriever_name,
+                    "cue_scorer": args.cue_scorer,
+                    "case_id": case_id,
+                    "query_id": query_id,
+                    "pid": query.pid,
+                    "trial_id": trial_id,
+                    "cue_a": cue_a,
+                    "cue_b": cue_b,
+                    "hm_r1_flip": hm_pair["r1_flip"],
+                    "hm_rank_shift": hm_pair["rank_shift"],
+                    "hm_ap_delta": hm_pair["ap_delta"],
+                    **hm_build.diagnostics,
+                    "score_mode": score_mode,
+                    "lambda_global": args.lambda_global,
+                    "seed": args.seed,
+                }
+            )
+            paired_delta_rows.append(
+                {
+                    "dataset": args.dataset,
+                    "retriever_name": args.retriever_name,
+                    "cue_scorer": args.cue_scorer,
+                    "case_id": case_id,
+                    "query_id": query_id,
+                    "pid": query.pid,
+                    "trial_id": trial_id,
+                    "cue_a": cue_a,
+                    "cue_b": cue_b,
+                    "r1_flip": cue_pair["r1_flip"],
+                    "hm_r1_flip": hm_pair["r1_flip"],
+                    "delta_r1_flip": cue_pair["r1_flip"] - hm_pair["r1_flip"],
+                    "rank_shift": cue_pair["rank_shift"],
+                    "hm_rank_shift": hm_pair["rank_shift"],
+                    "delta_rank_shift": cue_pair["rank_shift"] - hm_pair["rank_shift"],
+                    "ap_delta": cue_pair["ap_delta"],
+                    "hm_ap_delta": hm_pair["ap_delta"],
+                    "delta_ap_delta": cue_pair["ap_delta"] - hm_pair["ap_delta"],
+                    "cue_shift": shift_info["cue_shift"],
+                    "score_mode": score_mode,
+                    "lambda_global": args.lambda_global,
+                    "seed": args.seed,
+                }
+            )
+            if args.save_galleries:
+                for gallery_type, gallery_indices in {**build.galleries, **hm_build.galleries}.items():
+                    gallery_row = {
+                        "dataset": args.dataset,
+                        "retriever_name": args.retriever_name,
+                        "case_id": case_id,
+                        "query_id": query_id,
+                        "pid": query.pid,
+                        "trial_id": trial_id,
+                        "gallery_type": gallery_type,
+                        "image_ids": gallery_indices.astype(int).tolist(),
+                    }
+                    if args.save_image_paths:
+                        gallery_row["image_paths"] = [split.gallery_paths[int(index)] for index in gallery_indices]
+                    gallery_rows.append(gallery_row)
+
+    constructibility_rows = []
+    for case in cases:
+        case_id = str(case["case_id"])
+        stats = constructibility[case_id]
+        attempted = int(stats["attempted_pairs"])
+        valid = int(stats["valid_pairs"])
+        constructibility_rows.append(
+            {
+                "dataset": args.dataset,
+                "retriever_name": args.retriever_name,
+                "case_id": case_id,
+                "cue_a": case["cue_a"],
+                "cue_b": case["cue_b"],
+                "attempted_pairs": attempted,
+                "valid_pairs": valid,
+                "valid_pair_rate": float(valid / attempted) if attempted else 0.0,
+                "mean_cue_shift": float(np.mean(stats["cue_shifts"])) if stats["cue_shifts"] else np.nan,
+                "skip_reasons_json": jsonable(dict(stats["skip_reasons"])),
+            }
+        )
+
+    paired_cue_df = pd.DataFrame(paired_cue_rows)
+    paired_hm_df = pd.DataFrame(paired_hm_rows)
+    paired_delta_df = pd.DataFrame(paired_delta_rows, columns=PAIRED_DELTA_COLUMNS)
+    summary_by_case, summary_overall, validity_counts = summarize_outputs(
+        args.dataset,
+        args.retriever_name,
+        args.cue_scorer,
+        ref_r1,
+        len(case_candidate_rows),
+        selected_queries,
+        paired_cue_df,
+        paired_hm_df,
+        paired_delta_df,
+    )
+    if validity_counts:
+        validity_counts[0]["expected_pairs"] = int(len(selected_queries) * args.num_trials)
+        validity_counts[0]["valid_pair_rate"] = (
+            float(validity_counts[0]["valid_pairs"] / validity_counts[0]["expected_pairs"])
+            if validity_counts[0]["expected_pairs"]
+            else 0.0
+        )
+        if not summary_overall.empty:
+            summary_overall.loc[0, "valid_pair_rate"] = validity_counts[0]["valid_pair_rate"]
+
+    summary_ci = cluster_bootstrap_ci(
+        paired_delta_df,
+        SUMMARY_CI_METRICS,
+        cluster_cols=("dataset", "retriever_name", "case_id", "query_id"),
+        iters=args.bootstrap_iters,
+        seed=args.bootstrap_seed,
+    )
+    write_run_outputs(
+        args.output_dir,
+        selected_queries,
+        constructibility_rows,
+        validity_counts,
+        per_gallery_rows,
+        paired_cue_rows,
+        paired_hm_rows,
+        paired_delta_rows,
+        summary_by_case,
+        summary_overall,
+        summary_ci,
+        skipped_rows,
+        gallery_rows,
+        args.save_galleries,
+    )
+    log_validity_warnings(summary_overall, logger)
+
+    print("\nWhole-test sanity metrics:")
+    print(whole_df.to_string(index=False))
+    print("\nSummary overall:")
+    print(summary_overall.to_string(index=False))
+    print("\nBootstrap CIs:")
+    print(summary_ci.to_string(index=False))
+    logger.info("Wrote diagnostic outputs to %s", args.output_dir)
+
+
+if __name__ == "__main__":
+    main()
