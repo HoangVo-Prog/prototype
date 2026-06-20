@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -31,16 +31,17 @@ def cluster_bootstrap_ci(
     if missing:
         raise ValueError(f"Cluster bootstrap missing cluster columns: {sorted(missing)}")
 
-    clusters = df[list(cluster_cols)].drop_duplicates().reset_index(drop=True)
-    cluster_keys = [tuple(row) for row in clusters.to_numpy()]
-    grouped = {key: group for key, group in df.groupby(list(cluster_cols), dropna=False)}
+    cluster_codes = df.groupby(list(cluster_cols), dropna=False).ngroup().to_numpy()
+    cluster_count = int(cluster_codes.max()) + 1 if len(cluster_codes) else 0
     rng = np.random.default_rng(seed)
     rows = []
     for metric in metrics:
         if metric not in df.columns:
             continue
-        values = pd.to_numeric(df[metric], errors="coerce").dropna()
-        if values.empty:
+        metric_values = pd.to_numeric(df[metric], errors="coerce").to_numpy(dtype=float)
+        valid_mask = np.isfinite(metric_values)
+        values = metric_values[valid_mask]
+        if values.size == 0:
             rows.append(
                 {
                     "metric": metric,
@@ -48,31 +49,29 @@ def cluster_bootstrap_ci(
                     "ci_low": np.nan,
                     "ci_high": np.nan,
                     "bootstrap_iters": iters,
-                    "cluster_count": int(len(cluster_keys)),
+                    "cluster_count": cluster_count,
                     "trial_count": int(len(df)),
                 }
             )
             continue
 
-        boot_means = []
-        for _ in range(iters):
-            sampled = rng.integers(0, len(cluster_keys), size=len(cluster_keys))
-            sample_values = []
-            for sampled_index in sampled:
-                group = grouped[cluster_keys[int(sampled_index)]]
-                sample_values.extend(pd.to_numeric(group[metric], errors="coerce").dropna().tolist())
-            boot_means.append(float(np.mean(sample_values)) if sample_values else np.nan)
-        boot = np.asarray(boot_means, dtype=float)
+        valid_codes = cluster_codes[valid_mask]
+        cluster_sums = np.bincount(valid_codes, weights=values, minlength=cluster_count).astype(float)
+        cluster_counts = np.bincount(valid_codes, minlength=cluster_count).astype(float)
+        sampled = rng.integers(0, cluster_count, size=(iters, cluster_count))
+        sampled_sums = cluster_sums[sampled].sum(axis=1)
+        sampled_counts = cluster_counts[sampled].sum(axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            boot = sampled_sums / sampled_counts
         rows.append(
             {
                 "metric": metric,
-                "mean": float(values.mean()),
+                "mean": float(np.mean(values)),
                 "ci_low": float(np.nanpercentile(boot, 2.5)),
                 "ci_high": float(np.nanpercentile(boot, 97.5)),
                 "bootstrap_iters": iters,
-                "cluster_count": int(len(cluster_keys)),
+                "cluster_count": cluster_count,
                 "trial_count": int(len(df)),
             }
         )
     return pd.DataFrame(rows, columns=columns)
-

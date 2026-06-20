@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Mapping
@@ -202,6 +203,17 @@ def main() -> None:
         args.split,
         len(split.query_records),
         len(split.gallery_records),
+    )
+    logger.info(
+        "Run parameters retriever=%s gallery_size=%d dense_ratio=%.3f num_trials=%d "
+        "lambda_contrast=%.3f min_pair_cue_shift=%.4f bootstrap_iters=%d",
+        args.retriever_name,
+        args.gallery_size,
+        args.dense_ratio,
+        args.num_trials,
+        args.lambda_contrast,
+        args.min_pair_cue_shift,
+        args.bootstrap_iters,
     )
 
     cue_specs = load_cue_specs(args.cue_vocab_file)
@@ -677,6 +689,13 @@ def main() -> None:
     paired_cue_df = pd.DataFrame(paired_cue_rows)
     paired_hm_df = pd.DataFrame(paired_hm_rows)
     paired_delta_df = pd.DataFrame(paired_delta_rows, columns=PAIRED_DELTA_COLUMNS)
+    logger.info(
+        "Building summary tables from paired rows cue=%d hardness=%d delta=%d",
+        len(paired_cue_df),
+        len(paired_hm_df),
+        len(paired_delta_df),
+    )
+    summary_started = time.perf_counter()
     summary_by_case, summary_overall, validity_counts = summarize_outputs(
         args.dataset,
         args.retriever_name,
@@ -688,6 +707,7 @@ def main() -> None:
         paired_hm_df,
         paired_delta_df,
     )
+    logger.info("Summary tables built in %.2fs", time.perf_counter() - summary_started)
     if validity_counts:
         validity_counts[0]["expected_pairs"] = int(len(selected_queries) * args.num_trials)
         validity_counts[0]["valid_pair_rate"] = (
@@ -698,6 +718,21 @@ def main() -> None:
         if not summary_overall.empty:
             summary_overall.loc[0, "valid_pair_rate"] = validity_counts[0]["valid_pair_rate"]
 
+    bootstrap_clusters = (
+        paired_delta_df[["dataset", "retriever_name", "case_id", "query_id"]]
+        .drop_duplicates()
+        .shape[0]
+        if not paired_delta_df.empty
+        else 0
+    )
+    logger.info(
+        "Starting cluster bootstrap metrics=%d iters=%d clusters=%d trials=%d",
+        len(SUMMARY_CI_METRICS),
+        args.bootstrap_iters,
+        bootstrap_clusters,
+        len(paired_delta_df),
+    )
+    bootstrap_started = time.perf_counter()
     summary_ci = cluster_bootstrap_ci(
         paired_delta_df,
         SUMMARY_CI_METRICS,
@@ -705,6 +740,12 @@ def main() -> None:
         iters=args.bootstrap_iters,
         seed=args.bootstrap_seed,
     )
+    logger.info(
+        "Cluster bootstrap finished in %.2fs rows=%d",
+        time.perf_counter() - bootstrap_started,
+        len(summary_ci),
+    )
+    write_started = time.perf_counter()
     write_run_outputs(
         args.output_dir,
         selected_queries,
@@ -721,6 +762,7 @@ def main() -> None:
         gallery_rows,
         args.save_galleries,
     )
+    logger.info("Output writing finished in %.2fs", time.perf_counter() - write_started)
     logger.info(
         "Output rows selected=%d constructibility=%d per_gallery=%d paired_cue=%d paired_hardness=%d paired_delta=%d skipped=%d galleries=%d",
         len(selected_queries),
