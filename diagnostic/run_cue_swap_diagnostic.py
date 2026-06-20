@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -82,6 +82,53 @@ def unique_cues(cases: list[Mapping[str, Any]]) -> list[str]:
     if not cues:
         raise RuntimeError("No cues found in cue cases")
     return cues
+
+
+def format_counts(counts: Mapping[str, int], limit: int = 8) -> str:
+    items = Counter({str(key): int(value) for key, value in counts.items()})
+    if not items:
+        return "none"
+    shown = [f"{key}={value}" for key, value in items.most_common(limit)]
+    hidden = len(items) - len(shown)
+    if hidden > 0:
+        shown.append(f"... {hidden} more")
+    return ", ".join(shown)
+
+
+def describe_values(values: list[float]) -> dict[str, float | int]:
+    if not values:
+        return {
+            "count": 0,
+            "mean": np.nan,
+            "min": np.nan,
+            "p25": np.nan,
+            "p50": np.nan,
+            "p75": np.nan,
+            "p90": np.nan,
+            "max": np.nan,
+        }
+    arr = np.asarray(values, dtype=float)
+    return {
+        "count": int(arr.size),
+        "mean": float(np.mean(arr)),
+        "min": float(np.min(arr)),
+        "p25": float(np.quantile(arr, 0.25)),
+        "p50": float(np.quantile(arr, 0.50)),
+        "p75": float(np.quantile(arr, 0.75)),
+        "p90": float(np.quantile(arr, 0.90)),
+        "max": float(np.max(arr)),
+    }
+
+
+def format_description(stats: Mapping[str, float | int]) -> str:
+    if int(stats.get("count", 0)) == 0:
+        return "count=0"
+    return (
+        f"count={int(stats['count'])} mean={float(stats['mean']):.4f} "
+        f"min={float(stats['min']):.4f} p25={float(stats['p25']):.4f} "
+        f"p50={float(stats['p50']):.4f} p75={float(stats['p75']):.4f} "
+        f"p90={float(stats['p90']):.4f} max={float(stats['max']):.4f}"
+    )
 
 
 def gallery_result_row(
@@ -182,6 +229,24 @@ def main() -> None:
             for case in cases
         ]
     write_case_candidates(args.output_dir, case_candidate_rows)
+    candidate_reason_counts = Counter(str(row.get("reason", "") or "kept") for row in case_candidate_rows)
+    logger.info(
+        "Cue case generation mode=%s candidates=%d retained=%d reason_counts=[%s]",
+        "auto" if args.auto_cases else "manual",
+        len(case_candidate_rows),
+        len(cases),
+        format_counts(candidate_reason_counts),
+    )
+    for case in cases[:10]:
+        logger.info(
+            "Retained case case_id=%s cue_a=%s cue_b=%s support=%s",
+            case.get("case_id"),
+            case.get("cue_a"),
+            case.get("cue_b"),
+            case.get("auto_case_support", case.get("num_queries", "manual")),
+        )
+    if len(cases) > 10:
+        logger.info("Retained case log truncated after 10 of %d cases", len(cases))
     if not cases:
         raise RuntimeError("No cue cases are available. See cue_case_candidates.csv.")
 
@@ -192,6 +257,15 @@ def main() -> None:
         split.gallery_pids,
         args.max_queries_per_case,
     )
+    selected_by_case = Counter(str(row["case_id"]) for row in selected_queries)
+    logger.info(
+        "Selected queries=%d unique_cases=%d expected_query_trials=%d skipped_selection_rows=%d",
+        len(selected_queries),
+        len(selected_by_case),
+        len(selected_queries) * args.num_trials,
+        len(skipped_rows),
+    )
+    logger.info("Top selected-query cases: %s", format_counts(selected_by_case, limit=12))
     if not selected_queries:
         raise RuntimeError("No eligible queries were selected for the retained cue cases.")
     query_lookup = {record.query_id: record for record in split.query_records}
@@ -247,14 +321,35 @@ def main() -> None:
     )
     whole_df = write_whole_test(args.output_dir, [whole_metrics])
     ref_r1 = float(whole_metrics["R1"])
+    logger.info(
+        "Whole-test sanity metrics mode=%s R1=%.2f R5=%.2f R10=%.2f mAP=%.2f queries=%d",
+        score_mode,
+        float(whole_metrics["R1"]),
+        float(whole_metrics["R5"]),
+        float(whole_metrics["R10"]),
+        float(whole_metrics["mAP"]),
+        int(whole_metrics["num_queries"]),
+    )
 
     cues = unique_cues(cases)
+    logger.info("Unique cues for external scorer=%d", len(cues))
     cue_scorer = OffTheShelfCLIPCueScorer(args.clip_model_name, repo_args, device, logger)
     cue_output = cue_scorer.score(cues, split.img_loader, repo_args.text_length, logger)
     thresholds = {
         cue: float(np.quantile(cue_output.affinities[cue], args.cue_threshold_quantile))
         for cue in cues
     }
+    for cue in cues[:12]:
+        psi = cue_output.affinities[cue]
+        logger.info(
+            "Cue threshold cue=%s threshold=%.4f quantile=%.2f affinity_stats=[%s]",
+            cue,
+            thresholds[cue],
+            args.cue_threshold_quantile,
+            format_description(describe_values([float(value) for value in psi.tolist()])),
+        )
+    if len(cues) > 12:
+        logger.info("Cue threshold log truncated after 12 of %d cues", len(cues))
     write_thresholds(
         args.output_dir,
         [
@@ -292,9 +387,17 @@ def main() -> None:
     paired_hm_rows: list[dict[str, Any]] = []
     paired_delta_rows: list[dict[str, Any]] = []
     gallery_rows: list[dict[str, Any]] = []
-    constructibility = defaultdict(lambda: {"attempted_pairs": 0, "valid_pairs": 0, "cue_shifts": [], "skip_reasons": defaultdict(int)})
+    constructibility = defaultdict(
+        lambda: {
+            "attempted_pairs": 0,
+            "valid_pairs": 0,
+            "candidate_cue_shifts": [],
+            "valid_cue_shifts": [],
+            "skip_reasons": defaultdict(int),
+        }
+    )
 
-    for selected in selected_queries:
+    for selected_index, selected in enumerate(selected_queries, start=1):
         case_id = str(selected["case_id"])
         cue_a = str(selected["cue_a"])
         cue_b = str(selected["cue_b"])
@@ -339,6 +442,7 @@ def main() -> None:
                 threshold_b,
                 args.tau_density,
             )
+            case_stats["candidate_cue_shifts"].append(float(shift_info["cue_shift"]))
             if float(shift_info["cue_shift"]) < args.min_pair_cue_shift:
                 reason = "below_min_pair_cue_shift"
                 case_stats["skip_reasons"][reason] += 1
@@ -358,7 +462,7 @@ def main() -> None:
                 continue
 
             case_stats["valid_pairs"] += 1
-            case_stats["cue_shifts"].append(float(shift_info["cue_shift"]))
+            case_stats["valid_cue_shifts"].append(float(shift_info["cue_shift"]))
 
             cue_metrics: dict[str, dict[str, float]] = {}
             hm_metrics: dict[str, dict[str, float]] = {}
@@ -498,12 +602,32 @@ def main() -> None:
                         gallery_row["image_paths"] = [split.gallery_paths[int(index)] for index in gallery_indices]
                     gallery_rows.append(gallery_row)
 
+        if selected_index == 1 or selected_index % 50 == 0 or selected_index == len(selected_queries):
+            attempted_so_far = sum(int(stats["attempted_pairs"]) for stats in constructibility.values())
+            valid_so_far = sum(int(stats["valid_pairs"]) for stats in constructibility.values())
+            skip_counts_so_far = Counter()
+            all_candidate_shifts: list[float] = []
+            for stats in constructibility.values():
+                skip_counts_so_far.update({str(key): int(value) for key, value in stats["skip_reasons"].items()})
+                all_candidate_shifts.extend(float(value) for value in stats["candidate_cue_shifts"])
+            logger.info(
+                "Progress selected_queries=%d/%d attempted_pairs=%d valid_pairs=%d skip_counts=[%s] candidate_cue_shift=[%s]",
+                selected_index,
+                len(selected_queries),
+                attempted_so_far,
+                valid_so_far,
+                format_counts(skip_counts_so_far),
+                format_description(describe_values(all_candidate_shifts)),
+            )
+
     constructibility_rows = []
     for case in cases:
         case_id = str(case["case_id"])
         stats = constructibility[case_id]
         attempted = int(stats["attempted_pairs"])
         valid = int(stats["valid_pairs"])
+        candidate_shift_stats = describe_values([float(value) for value in stats["candidate_cue_shifts"]])
+        valid_shift_stats = describe_values([float(value) for value in stats["valid_cue_shifts"]])
         constructibility_rows.append(
             {
                 "dataset": args.dataset,
@@ -514,9 +638,40 @@ def main() -> None:
                 "attempted_pairs": attempted,
                 "valid_pairs": valid,
                 "valid_pair_rate": float(valid / attempted) if attempted else 0.0,
-                "mean_cue_shift": float(np.mean(stats["cue_shifts"])) if stats["cue_shifts"] else np.nan,
+                "candidate_cue_shift_count": candidate_shift_stats["count"],
+                "candidate_cue_shift_mean": candidate_shift_stats["mean"],
+                "candidate_cue_shift_min": candidate_shift_stats["min"],
+                "candidate_cue_shift_p50": candidate_shift_stats["p50"],
+                "candidate_cue_shift_p75": candidate_shift_stats["p75"],
+                "candidate_cue_shift_p90": candidate_shift_stats["p90"],
+                "candidate_cue_shift_max": candidate_shift_stats["max"],
+                "valid_cue_shift_count": valid_shift_stats["count"],
+                "mean_cue_shift": valid_shift_stats["mean"],
+                "valid_cue_shift_min": valid_shift_stats["min"],
+                "valid_cue_shift_p50": valid_shift_stats["p50"],
+                "valid_cue_shift_p75": valid_shift_stats["p75"],
+                "valid_cue_shift_p90": valid_shift_stats["p90"],
+                "valid_cue_shift_max": valid_shift_stats["max"],
                 "skip_reasons_json": jsonable(dict(stats["skip_reasons"])),
             }
+        )
+
+    global_skip_counts = Counter()
+    global_candidate_shifts: list[float] = []
+    global_valid_shifts: list[float] = []
+    for stats in constructibility.values():
+        global_skip_counts.update({str(key): int(value) for key, value in stats["skip_reasons"].items()})
+        global_candidate_shifts.extend(float(value) for value in stats["candidate_cue_shifts"])
+        global_valid_shifts.extend(float(value) for value in stats["valid_cue_shifts"])
+    logger.info("Final construction skip_counts=[%s]", format_counts(global_skip_counts, limit=12))
+    logger.info("Final candidate Cue Shift stats=[%s]", format_description(describe_values(global_candidate_shifts)))
+    logger.info("Final valid Cue Shift stats=[%s]", format_description(describe_values(global_valid_shifts)))
+    if not paired_delta_rows:
+        logger.warning(
+            "No valid paired results were produced. Most common skips=[%s]. "
+            "If below_min_pair_cue_shift dominates, reduce --min_pair_cue_shift or inspect "
+            "cue_case_constructibility.csv candidate_cue_shift_* columns.",
+            format_counts(global_skip_counts, limit=5),
         )
 
     paired_cue_df = pd.DataFrame(paired_cue_rows)
@@ -565,6 +720,24 @@ def main() -> None:
         skipped_rows,
         gallery_rows,
         args.save_galleries,
+    )
+    logger.info(
+        "Output rows selected=%d constructibility=%d per_gallery=%d paired_cue=%d paired_hardness=%d paired_delta=%d skipped=%d galleries=%d",
+        len(selected_queries),
+        len(constructibility_rows),
+        len(per_gallery_rows),
+        len(paired_cue_rows),
+        len(paired_hm_rows),
+        len(paired_delta_rows),
+        len(skipped_rows),
+        len(gallery_rows),
+    )
+    logger.info(
+        "Key output files: %s, %s, %s, %s",
+        args.output_dir / OUTPUT_FILES["constructibility"],
+        args.output_dir / OUTPUT_FILES["paired_delta"],
+        args.output_dir / OUTPUT_FILES["validity_counts"],
+        args.output_dir / OUTPUT_FILES["skipped"],
     )
     log_validity_warnings(summary_overall, logger)
 
