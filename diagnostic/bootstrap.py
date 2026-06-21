@@ -7,6 +7,41 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
+from diagnostic.constants import SUMMARY_CI_COLUMNS
+
+
+def bootstrap_count_summary(df: pd.DataFrame, cluster_cols: Sequence[str]) -> dict[str, int]:
+    if df.empty:
+        return {
+            "cluster_count": 0,
+            "unique_query_count": 0,
+            "case_query_count": 0,
+            "trial_count": 0,
+        }
+    required_for_counts = {"dataset", "retriever_name", "query_id", "case_id"}
+    missing = required_for_counts - set(df.columns)
+    if missing:
+        raise ValueError(f"Bootstrap count summary missing columns: {sorted(missing)}")
+    missing_cluster = set(cluster_cols) - set(df.columns)
+    if missing_cluster:
+        raise ValueError(f"Bootstrap count summary missing cluster columns: {sorted(missing_cluster)}")
+    return {
+        "cluster_count": int(df[list(cluster_cols)].drop_duplicates().shape[0]),
+        "unique_query_count": int(
+            df[["dataset", "retriever_name", "query_id"]].drop_duplicates().shape[0]
+        ),
+        "case_query_count": int(
+            df[["dataset", "retriever_name", "case_id", "query_id"]].drop_duplicates().shape[0]
+        ),
+        "trial_count": int(len(df)),
+    }
+
+
+def cluster_row_counts(df: pd.DataFrame, cluster_cols: Sequence[str]) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=list(cluster_cols) + ["row_count"])
+    return df.groupby(list(cluster_cols), dropna=False).size().reset_index(name="row_count")
+
 
 def cluster_bootstrap_ci(
     df: pd.DataFrame,
@@ -14,16 +49,9 @@ def cluster_bootstrap_ci(
     cluster_cols: Sequence[str],
     iters: int,
     seed: int,
+    bootstrap_unit: str,
 ) -> pd.DataFrame:
-    columns = [
-        "metric",
-        "mean",
-        "ci_low",
-        "ci_high",
-        "bootstrap_iters",
-        "cluster_count",
-        "trial_count",
-    ]
+    columns = SUMMARY_CI_COLUMNS
     if df.empty:
         return pd.DataFrame(columns=columns)
 
@@ -31,6 +59,7 @@ def cluster_bootstrap_ci(
     if missing:
         raise ValueError(f"Cluster bootstrap missing cluster columns: {sorted(missing)}")
 
+    count_summary = bootstrap_count_summary(df, cluster_cols)
     cluster_codes = df.groupby(list(cluster_cols), dropna=False).ngroup().to_numpy()
     cluster_count = int(cluster_codes.max()) + 1 if len(cluster_codes) else 0
     rng = np.random.default_rng(seed)
@@ -49,7 +78,10 @@ def cluster_bootstrap_ci(
                     "ci_low": np.nan,
                     "ci_high": np.nan,
                     "bootstrap_iters": iters,
+                    "bootstrap_unit": bootstrap_unit,
                     "cluster_count": cluster_count,
+                    "unique_query_count": count_summary["unique_query_count"],
+                    "case_query_count": count_summary["case_query_count"],
                     "trial_count": int(len(df)),
                 }
             )
@@ -70,7 +102,10 @@ def cluster_bootstrap_ci(
                 "ci_low": float(np.nanpercentile(boot, 2.5)),
                 "ci_high": float(np.nanpercentile(boot, 97.5)),
                 "bootstrap_iters": iters,
+                "bootstrap_unit": bootstrap_unit,
                 "cluster_count": cluster_count,
+                "unique_query_count": count_summary["unique_query_count"],
+                "case_query_count": count_summary["case_query_count"],
                 "trial_count": int(len(df)),
             }
         )

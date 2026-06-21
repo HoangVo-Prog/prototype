@@ -17,6 +17,7 @@ from diagnostic.constants import (
     PAIRED_HM_COLUMNS,
     PER_GALLERY_COLUMNS,
     SELECTED_QUERY_COLUMNS,
+    SUMMARY_CI_COLUMNS,
 )
 
 
@@ -63,6 +64,7 @@ def write_run_outputs(
     summary_by_case: pd.DataFrame,
     summary_overall: pd.DataFrame,
     summary_ci: pd.DataFrame,
+    summary_ci_by_unit: Mapping[str, pd.DataFrame],
     skipped_rows: Sequence[Mapping[str, Any]],
     gallery_rows: Sequence[Mapping[str, Any]],
     save_galleries: bool,
@@ -85,7 +87,17 @@ def write_run_outputs(
     delta_df.to_csv(output_dir / OUTPUT_FILES["paired_delta"], index=False)
     summary_by_case.to_csv(output_dir / OUTPUT_FILES["summary_by_case"], index=False)
     summary_overall.to_csv(output_dir / OUTPUT_FILES["summary_overall"], index=False)
-    summary_ci.to_csv(output_dir / OUTPUT_FILES["summary_ci"], index=False)
+    summary_ci.reindex(columns=SUMMARY_CI_COLUMNS).to_csv(
+        output_dir / OUTPUT_FILES["summary_ci"], index=False
+    )
+    if "unique_query" in summary_ci_by_unit:
+        summary_ci_by_unit["unique_query"].reindex(columns=SUMMARY_CI_COLUMNS).to_csv(
+            output_dir / OUTPUT_FILES["summary_ci_unique_query"], index=False
+        )
+    if "case_query" in summary_ci_by_unit:
+        summary_ci_by_unit["case_query"].reindex(columns=SUMMARY_CI_COLUMNS).to_csv(
+            output_dir / OUTPUT_FILES["summary_ci_case_query"], index=False
+        )
     write_jsonl(output_dir / OUTPUT_FILES["skipped"], skipped_rows)
     if save_galleries:
         write_jsonl(output_dir / OUTPUT_FILES["galleries"], gallery_rows)
@@ -213,4 +225,3 @@ def summarize_outputs(
         ]
     )
     return summary_by_case, summary_overall, validity_counts
-

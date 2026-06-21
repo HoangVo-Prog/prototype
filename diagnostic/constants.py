@@ -30,9 +30,16 @@ OUTPUT_FILES = {
     "summary_overall": "summary_overall.csv",
     "summary_by_case": "summary_by_case.csv",
     "summary_ci": "summary_with_ci.csv",
+    "summary_ci_unique_query": "summary_with_ci_unique_query.csv",
+    "summary_ci_case_query": "summary_with_ci_case_query.csv",
     "skipped": "skipped_queries.jsonl",
     "galleries": "galleries.jsonl",
 }
+
+CASE_QUERY_CLUSTER_COLS = ["dataset", "retriever_name", "case_id", "query_id"]
+UNIQUE_QUERY_CLUSTER_COLS = ["dataset", "retriever_name", "query_id"]
+BOOTSTRAP_UNITS = ("case_query", "unique_query", "both")
+PRIMARY_BOOTSTRAP_UNIT_FOR_BOTH = "unique_query"
 
 SELECTED_QUERY_COLUMNS = [
     "dataset",
@@ -160,3 +167,16 @@ SUMMARY_CI_METRICS = (
     "delta_rank_shift",
     "cue_shift",
 )
+
+SUMMARY_CI_COLUMNS = [
+    "metric",
+    "mean",
+    "ci_low",
+    "ci_high",
+    "bootstrap_iters",
+    "bootstrap_unit",
+    "cluster_count",
+    "unique_query_count",
+    "case_query_count",
+    "trial_count",
+]

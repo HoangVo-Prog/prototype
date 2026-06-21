@@ -23,7 +23,7 @@ if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from diagnostic.audit import log_validity_warnings
-from diagnostic.bootstrap import cluster_bootstrap_ci
+from diagnostic.bootstrap import bootstrap_count_summary, cluster_bootstrap_ci
 from diagnostic.clip_cue_scorer import OffTheShelfCLIPCueScorer
 from diagnostic.config import (
     jsonable,
@@ -33,7 +33,15 @@ from diagnostic.config import (
     set_deterministic,
     validate_args,
 )
-from diagnostic.constants import OUTPUT_FILES, PAIRED_DELTA_COLUMNS, SUMMARY_CI_METRICS
+from diagnostic.constants import (
+    CASE_QUERY_CLUSTER_COLS,
+    OUTPUT_FILES,
+    PAIRED_DELTA_COLUMNS,
+    PRIMARY_BOOTSTRAP_UNIT_FOR_BOTH,
+    SUMMARY_CI_COLUMNS,
+    SUMMARY_CI_METRICS,
+    UNIQUE_QUERY_CLUSTER_COLS,
+)
 from diagnostic.controls import construct_hardness_matched_controls
 from diagnostic.cue_cases import generate_auto_cases, load_cases, select_queries_for_cases
 from diagnostic.cue_ontology import load_cue_specs
@@ -258,6 +266,32 @@ def precompute_selected_full_scores(
     return score_cache
 
 
+def requested_bootstrap_units(bootstrap_unit: str) -> list[str]:
+    if bootstrap_unit == "both":
+        return ["unique_query", "case_query"]
+    return [bootstrap_unit]
+
+
+def primary_bootstrap_unit(bootstrap_unit: str) -> str:
+    return PRIMARY_BOOTSTRAP_UNIT_FOR_BOTH if bootstrap_unit == "both" else bootstrap_unit
+
+
+def cluster_columns_for_unit(bootstrap_unit: str) -> list[str]:
+    if bootstrap_unit == "unique_query":
+        return UNIQUE_QUERY_CLUSTER_COLS
+    if bootstrap_unit == "case_query":
+        return CASE_QUERY_CLUSTER_COLS
+    raise ValueError(f"Unsupported bootstrap unit: {bootstrap_unit}")
+
+
+def bootstrap_label(bootstrap_unit: str) -> str:
+    if bootstrap_unit == "unique_query":
+        return "unique-query cluster bootstrap"
+    if bootstrap_unit == "case_query":
+        return "case-query-instance cluster bootstrap"
+    raise ValueError(f"Unsupported bootstrap unit: {bootstrap_unit}")
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -451,6 +485,7 @@ def main() -> None:
             "args": vars(args),
             "repo_args": repo_args,
             "resolved_score_mode": score_mode,
+            "bootstrap_unit": args.bootstrap_unit,
             "cue_scorer": {
                 "name": args.cue_scorer,
                 "clip_model_name": args.clip_model_name,
@@ -813,33 +848,43 @@ def main() -> None:
         if not summary_overall.empty:
             summary_overall.loc[0, "valid_pair_rate"] = validity_counts[0]["valid_pair_rate"]
 
-    bootstrap_clusters = (
-        paired_delta_df[["dataset", "retriever_name", "case_id", "query_id"]]
-        .drop_duplicates()
-        .shape[0]
-        if not paired_delta_df.empty
-        else 0
+    summary_ci_by_unit: dict[str, pd.DataFrame] = {}
+    for unit in requested_bootstrap_units(args.bootstrap_unit):
+        cluster_cols = cluster_columns_for_unit(unit)
+        count_summary = bootstrap_count_summary(paired_delta_df, cluster_cols)
+        logger.info(
+            "Starting %s: bootstrap_unit=%s unique_query_count=%d case_query_count=%d "
+            "cluster_count=%d trial_count=%d bootstrap_iters=%d bootstrap_seed=%d",
+            bootstrap_label(unit),
+            unit,
+            count_summary["unique_query_count"],
+            count_summary["case_query_count"],
+            count_summary["cluster_count"],
+            count_summary["trial_count"],
+            args.bootstrap_iters,
+            args.bootstrap_seed,
+        )
+        bootstrap_started = time.perf_counter()
+        summary_ci_by_unit[unit] = cluster_bootstrap_ci(
+            paired_delta_df,
+            SUMMARY_CI_METRICS,
+            cluster_cols=cluster_cols,
+            iters=args.bootstrap_iters,
+            seed=args.bootstrap_seed,
+            bootstrap_unit=unit,
+        )
+        logger.info(
+            "%s finished in %.2fs rows=%d",
+            bootstrap_label(unit),
+            time.perf_counter() - bootstrap_started,
+            len(summary_ci_by_unit[unit]),
+        )
+    primary_unit = primary_bootstrap_unit(args.bootstrap_unit)
+    summary_ci = summary_ci_by_unit.get(
+        primary_unit,
+        pd.DataFrame(columns=SUMMARY_CI_COLUMNS),
     )
-    logger.info(
-        "Starting cluster bootstrap metrics=%d iters=%d clusters=%d trials=%d",
-        len(SUMMARY_CI_METRICS),
-        args.bootstrap_iters,
-        bootstrap_clusters,
-        len(paired_delta_df),
-    )
-    bootstrap_started = time.perf_counter()
-    summary_ci = cluster_bootstrap_ci(
-        paired_delta_df,
-        SUMMARY_CI_METRICS,
-        cluster_cols=("dataset", "retriever_name", "case_id", "query_id"),
-        iters=args.bootstrap_iters,
-        seed=args.bootstrap_seed,
-    )
-    logger.info(
-        "Cluster bootstrap finished in %.2fs rows=%d",
-        time.perf_counter() - bootstrap_started,
-        len(summary_ci),
-    )
+    logger.info("Primary CI output uses bootstrap_unit=%s", primary_unit)
     write_started = time.perf_counter()
     write_run_outputs(
         args.output_dir,
@@ -853,6 +898,7 @@ def main() -> None:
         summary_by_case,
         summary_overall,
         summary_ci,
+        summary_ci_by_unit,
         skipped_rows,
         gallery_rows,
         args.save_galleries,

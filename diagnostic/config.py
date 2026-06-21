@@ -13,7 +13,7 @@ from typing import Any, Dict
 import numpy as np
 import torch
 
-from diagnostic.constants import CUE_SCORERS, DATASET_NAMES, RETRIEVER_NAMES
+from diagnostic.constants import BOOTSTRAP_UNITS, CUE_SCORERS, DATASET_NAMES, RETRIEVER_NAMES
 
 
 def default_repo_args() -> Dict[str, Any]:
@@ -107,6 +107,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_pair_cue_shift", type=float, default=0.0)
     parser.add_argument("--bootstrap_iters", type=int, default=1000)
     parser.add_argument("--bootstrap_seed", type=int, default=123)
+    parser.add_argument(
+        "--bootstrap_unit",
+        choices=BOOTSTRAP_UNITS,
+        default="unique_query",
+        help=(
+            "Cluster unit for confidence intervals: case_query preserves the original "
+            "case-query-instance bootstrap, unique_query resamples underlying query_id "
+            "clusters, both writes both analyses and uses unique_query as primary."
+        ),
+    )
     parser.add_argument("--enable_random_control", action="store_true")
     parser.add_argument("--save_galleries", action="store_true")
     parser.add_argument("--save_image_paths", action="store_true")

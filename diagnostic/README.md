@@ -50,3 +50,37 @@ python diagnostic/run_cue_swap_diagnostic.py \
 Required outputs include per-gallery results, paired cue-swap results,
 hardness-matched control results, cue-swap minus control deltas, validity
 counts, and cluster-bootstrap confidence intervals over query clusters.
+
+## Bootstrap Units
+
+The diagnostic supports two cluster-bootstrap units:
+
+Case-query-instance bootstrap:
+Resamples each eligible `(case_id, query_id)` instance jointly with all of its
+repeated trials. This preserves the original implementation's uncertainty unit.
+
+Unique-query bootstrap:
+Resamples each underlying `query_id` jointly with every associated cue case and
+all repeated trials. This is the recommended primary analysis because it
+accounts for dependence among cue cases sharing the same query text, target
+identity, positive set, and retriever behavior.
+
+The reported metrics remain micro-averaged over valid case-query trials. The
+unique-query bootstrap changes the uncertainty estimate, not the full-sample
+point-estimate weighting. It is not a query-macro average.
+
+Use:
+
+```bash
+--bootstrap_unit unique_query
+--bootstrap_unit case_query
+--bootstrap_unit both
+```
+
+When `both` is selected, `summary_with_ci.csv` uses the unique-query bootstrap
+as the primary result and the run also writes:
+
+```text
+summary_with_ci_unique_query.csv
+summary_with_ci_case_query.csv
+```
