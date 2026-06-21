@@ -14,22 +14,80 @@ class HardnessControlBuild:
     diagnostics: dict[str, float]
 
 
-def _nearest_without_replacement(
+def _bin_matched_without_replacement(
     target_scores: np.ndarray,
     candidate_indices: np.ndarray,
     full_scores: np.ndarray,
+    num_bins: int | None = None,
 ) -> np.ndarray:
-    unused = list(int(index) for index in candidate_indices.tolist())
-    chosen: list[int] = []
-    for target in target_scores:
-        if not unused:
-            raise ValueError("not_enough_hardness_candidates")
-        best_pos = min(
-            range(len(unused)),
-            key=lambda pos: (abs(float(full_scores[unused[pos]]) - float(target)), int(unused[pos])),
+    """Quantile-bin hardness matching without replacement.
+
+    This follows the AGENTS.md-allowed stratified/bin matching strategy and is
+    much faster than per-target Python nearest-neighbor matching for large
+    galleries. Within each score bin, candidates closest to the target-bin mean
+    are selected deterministically.
+    """
+    target_scores = np.asarray(target_scores, dtype=float)
+    candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+    k = int(len(target_scores))
+    if k == 0:
+        return np.asarray([], dtype=np.int64)
+    if len(candidate_indices) < k:
+        raise ValueError("not_enough_hardness_candidates")
+
+    candidate_scores = np.asarray(full_scores[candidate_indices], dtype=float)
+    if num_bins is None:
+        num_bins = int(np.clip(np.sqrt(len(candidate_indices)), 8, 64))
+
+    combined_scores = np.concatenate([target_scores, candidate_scores])
+    edges = np.quantile(combined_scores, np.linspace(0.0, 1.0, num_bins + 1))
+    edges = np.unique(edges)
+    if len(edges) <= 2:
+        order = np.lexsort((candidate_indices, np.abs(candidate_scores - float(np.mean(target_scores)))))
+        return candidate_indices[order[:k]].astype(np.int64)
+
+    target_bins = np.searchsorted(edges[1:-1], target_scores, side="right")
+    candidate_bins = np.searchsorted(edges[1:-1], candidate_scores, side="right")
+
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    deficits: list[float] = []
+    for bin_id in range(len(edges) - 1):
+        target_in_bin = target_scores[target_bins == bin_id]
+        need = int(len(target_in_bin))
+        if need == 0:
+            continue
+        pool_mask = candidate_bins == bin_id
+        pool = candidate_indices[pool_mask]
+        pool_scores = candidate_scores[pool_mask]
+        target_center = float(np.mean(target_in_bin))
+        if len(pool) >= need:
+            order = np.lexsort((pool, np.abs(pool_scores - target_center)))
+            chosen = pool[order[:need]]
+            selected.extend(int(index) for index in chosen.tolist())
+            selected_set.update(int(index) for index in chosen.tolist())
+        else:
+            selected.extend(int(index) for index in pool.tolist())
+            selected_set.update(int(index) for index in pool.tolist())
+            deficits.extend(float(value) for value in target_in_bin[len(pool):].tolist())
+
+    if len(selected) < k:
+        remaining = np.asarray(
+            [int(index) for index in candidate_indices.tolist() if int(index) not in selected_set],
+            dtype=np.int64,
         )
-        chosen.append(unused.pop(best_pos))
-    return np.asarray(chosen, dtype=np.int64)
+        if len(remaining) < k - len(selected):
+            raise ValueError("not_enough_hardness_candidates")
+        target_center = float(np.mean(deficits if deficits else target_scores))
+        remaining_scores = full_scores[remaining]
+        order = np.lexsort((remaining, np.abs(remaining_scores - target_center)))
+        fill = remaining[order[: k - len(selected)]]
+        selected.extend(int(index) for index in fill.tolist())
+
+    selected_array = np.asarray(selected[:k], dtype=np.int64)
+    if len(np.unique(selected_array)) != k:
+        raise ValueError("hardness_control_contains_duplicate_image_ids")
+    return selected_array
 
 
 def _build_one_control(
@@ -57,7 +115,7 @@ def _build_one_control(
         raise ValueError("not_enough_hardness_candidates")
     target_order = np.lexsort((cue_distractors, full_scores[cue_distractors]))
     sorted_targets = cue_distractors[target_order]
-    matched = _nearest_without_replacement(full_scores[sorted_targets], candidate_pool, full_scores)
+    matched = _bin_matched_without_replacement(full_scores[sorted_targets], candidate_pool, full_scores)
     gallery = np.concatenate([positive_indices, matched]).astype(np.int64)
     if len(np.unique(gallery)) != len(gallery):
         raise ValueError("hardness_control_contains_duplicate_image_ids")
@@ -84,4 +142,3 @@ def construct_hardness_matched_controls(
         return None, str(exc)
     diagnostics = {**diag_a, **diag_b}
     return HardnessControlBuild(galleries={"hm_a": hm_a, "hm_b": hm_b}, diagnostics=diagnostics), None
-

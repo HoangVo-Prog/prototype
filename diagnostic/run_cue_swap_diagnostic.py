@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
+import torch
 
 if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -58,7 +59,6 @@ from diagnostic.retriever_loading import load_retriever
 from diagnostic.scoring import (
     compute_full_test_metrics,
     full_query_scores,
-    query_gallery_scores,
     resolve_score_mode,
 )
 
@@ -186,6 +186,76 @@ def gallery_result_row(
         "seed": args.seed,
     }
     return row, metrics, is_positive
+
+
+def precompute_selected_full_scores(
+    *,
+    cache: Any,
+    query_ids: list[int],
+    mode: str,
+    lambda_global: float,
+    device: torch.device,
+    logger: logging.Logger,
+    max_elements: int = 50_000_000,
+    chunk_size: int = 256,
+) -> dict[int, np.ndarray]:
+    unique_query_ids = sorted(set(int(query_id) for query_id in query_ids))
+    if not unique_query_ids:
+        return {}
+    num_gallery = int(cache.gallery_global.shape[0])
+    num_elements = len(unique_query_ids) * num_gallery
+    if num_elements > max_elements:
+        logger.info(
+            "Skipping upfront full-score precompute: unique_queries=%d gallery=%d elements=%d exceeds max_elements=%d; using lazy cache.",
+            len(unique_query_ids),
+            num_gallery,
+            num_elements,
+            max_elements,
+        )
+        return {}
+
+    compute_device = device if device.type == "cuda" else torch.device("cpu")
+    logger.info(
+        "Precomputing full query-gallery scores unique_queries=%d gallery=%d elements=%d device=%s chunk_size=%d",
+        len(unique_query_ids),
+        num_gallery,
+        num_elements,
+        compute_device,
+        chunk_size,
+    )
+    started = time.perf_counter()
+    query_ids_tensor = torch.as_tensor(unique_query_ids, dtype=torch.long)
+    gallery_global = cache.gallery_global.to(compute_device)
+    gallery_grab = cache.gallery_grab.to(compute_device) if cache.gallery_grab is not None else None
+    score_cache: dict[int, np.ndarray] = {}
+    with torch.no_grad():
+        for start in range(0, len(unique_query_ids), chunk_size):
+            end = min(start + chunk_size, len(unique_query_ids))
+            chunk_query_ids = query_ids_tensor[start:end]
+            global_scores = cache.query_global[chunk_query_ids].to(compute_device) @ gallery_global.T
+            if mode == "global":
+                scores = global_scores
+            else:
+                if cache.query_grab is None or gallery_grab is None:
+                    raise RuntimeError("GRAB/fusion score precompute requested without GRAB features")
+                grab_scores = cache.query_grab[chunk_query_ids].to(compute_device) @ gallery_grab.T
+                if mode == "grab":
+                    scores = grab_scores
+                elif mode == "fusion":
+                    scores = lambda_global * global_scores + (1.0 - lambda_global) * grab_scores
+                else:
+                    raise ValueError(f"Unsupported score mode: {mode}")
+            scores_np = scores.cpu().numpy()
+            for row_index, query_id in enumerate(unique_query_ids[start:end]):
+                score_cache[int(query_id)] = scores_np[row_index]
+            logger.info(
+                "Full-score precompute progress queries=%d/%d elapsed=%.1fs",
+                end,
+                len(unique_query_ids),
+                time.perf_counter() - started,
+            )
+    logger.info("Full-score precompute finished in %.2fs", time.perf_counter() - started)
+    return score_cache
 
 
 def main() -> None:
@@ -408,6 +478,17 @@ def main() -> None:
             "skip_reasons": defaultdict(int),
         }
     )
+    full_score_cache: dict[int, np.ndarray] = precompute_selected_full_scores(
+        cache=retriever_cache,
+        query_ids=[int(row["query_id"]) for row in selected_queries],
+        mode=score_mode,
+        lambda_global=args.lambda_global,
+        device=device,
+        logger=logger,
+    )
+    progress_started = time.perf_counter()
+    last_progress_time = progress_started
+    last_progress_index = 0
 
     for selected_index, selected in enumerate(selected_queries, start=1):
         case_id = str(selected["case_id"])
@@ -461,7 +542,10 @@ def main() -> None:
                 skipped_rows.append({"dataset": args.dataset, "case_id": case_id, "query_id": query_id, "trial_id": trial_id, "reason": reason, "cue_shift": shift_info["cue_shift"]})
                 continue
 
-            full_scores = full_query_scores(retriever_cache, query_id, score_mode, args.lambda_global)
+            full_scores = full_score_cache.get(query_id)
+            if full_scores is None:
+                full_scores = full_query_scores(retriever_cache, query_id, score_mode, args.lambda_global)
+                full_score_cache[query_id] = full_scores
             hm_build, hm_skip = construct_hardness_matched_controls(
                 query.pid,
                 build.galleries,
@@ -480,7 +564,7 @@ def main() -> None:
             hm_metrics: dict[str, dict[str, float]] = {}
             for gallery_type in ("a_dense", "b_dense"):
                 gallery_indices = build.galleries[gallery_type]
-                scores = query_gallery_scores(retriever_cache, query_id, gallery_indices, score_mode, args.lambda_global)
+                scores = full_scores[gallery_indices]
                 row, metrics, _ = gallery_result_row(
                     args=args,
                     score_mode=score_mode,
@@ -505,7 +589,7 @@ def main() -> None:
 
             for gallery_type in ("hm_a", "hm_b"):
                 gallery_indices = hm_build.galleries[gallery_type]
-                scores = query_gallery_scores(retriever_cache, query_id, gallery_indices, score_mode, args.lambda_global)
+                scores = full_scores[gallery_indices]
                 row, metrics, _ = gallery_result_row(
                     args=args,
                     score_mode=score_mode,
@@ -615,6 +699,9 @@ def main() -> None:
                     gallery_rows.append(gallery_row)
 
         if selected_index == 1 or selected_index % 50 == 0 or selected_index == len(selected_queries):
+            now = time.perf_counter()
+            interval_seconds = max(now - last_progress_time, 1e-9)
+            interval_queries = selected_index - last_progress_index
             attempted_so_far = sum(int(stats["attempted_pairs"]) for stats in constructibility.values())
             valid_so_far = sum(int(stats["valid_pairs"]) for stats in constructibility.values())
             skip_counts_so_far = Counter()
@@ -623,14 +710,22 @@ def main() -> None:
                 skip_counts_so_far.update({str(key): int(value) for key, value in stats["skip_reasons"].items()})
                 all_candidate_shifts.extend(float(value) for value in stats["candidate_cue_shifts"])
             logger.info(
-                "Progress selected_queries=%d/%d attempted_pairs=%d valid_pairs=%d skip_counts=[%s] candidate_cue_shift=[%s]",
+                "Progress selected_queries=%d/%d attempted_pairs=%d valid_pairs=%d "
+                "score_cache_queries=%d elapsed=%.1fs interval=%.1fs qps=%.2f "
+                "skip_counts=[%s] candidate_cue_shift=[%s]",
                 selected_index,
                 len(selected_queries),
                 attempted_so_far,
                 valid_so_far,
+                len(full_score_cache),
+                now - progress_started,
+                interval_seconds,
+                interval_queries / interval_seconds,
                 format_counts(skip_counts_so_far),
                 format_description(describe_values(all_candidate_shifts)),
             )
+            last_progress_time = now
+            last_progress_index = selected_index
 
     constructibility_rows = []
     for case in cases:
