@@ -67,6 +67,8 @@ def load_cases(cases_file: Path) -> list[dict[str, Any]]:
 def case_needles(case: Mapping[str, Any]) -> list[str]:
     if "query_include_all" in case:
         needles = [normalize_text(value) for value in case["query_include_all"]]
+    elif "query_regex" in case:
+        needles = []
     else:
         needles = normalize_text(f"{case['cue_a']} {case['cue_b']}").split()
     return [needle for needle in needles if needle]
@@ -202,4 +204,3 @@ def select_queries_for_cases(
                 }
             )
     return selected, skipped
-

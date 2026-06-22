@@ -1,0 +1,880 @@
+version: 1
+cues:
+  - id: upper_body_color__black
+    family: clothing_footwear_color
+    slot: upper_body_color
+    value: black
+    display_name: black upper-body clothing
+    runtime_expression: black upper-body clothing
+    aliases: [black]
+    matcher: {type: color_context, context_group: upper_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_body_color__white
+    family: clothing_footwear_color
+    slot: upper_body_color
+    value: white
+    display_name: white upper-body clothing
+    runtime_expression: white upper-body clothing
+    aliases: [white]
+    matcher: {type: color_context, context_group: upper_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_body_color__red
+    family: clothing_footwear_color
+    slot: upper_body_color
+    value: red
+    display_name: red upper-body clothing
+    runtime_expression: red upper-body clothing
+    aliases: [red]
+    matcher: {type: color_context, context_group: upper_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_body_color__blue
+    family: clothing_footwear_color
+    slot: upper_body_color
+    value: blue
+    display_name: blue upper-body clothing
+    runtime_expression: blue upper-body clothing
+    aliases: [blue]
+    matcher: {type: color_context, context_group: upper_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_body_color__green
+    family: clothing_footwear_color
+    slot: upper_body_color
+    value: green
+    display_name: green upper-body clothing
+    runtime_expression: green upper-body clothing
+    aliases: [green]
+    matcher: {type: color_context, context_group: upper_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_body_color__yellow
+    family: clothing_footwear_color
+    slot: upper_body_color
+    value: yellow
+    display_name: yellow upper-body clothing
+    runtime_expression: yellow upper-body clothing
+    aliases: [yellow]
+    matcher: {type: color_context, context_group: upper_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_body_color__gray
+    family: clothing_footwear_color
+    slot: upper_body_color
+    value: gray
+    display_name: gray upper-body clothing
+    runtime_expression: gray upper-body clothing
+    aliases: [gray, grey]
+    matcher: {type: color_context, context_group: upper_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_body_color__brown
+    family: clothing_footwear_color
+    slot: upper_body_color
+    value: brown
+    display_name: brown upper-body clothing
+    runtime_expression: brown upper-body clothing
+    aliases: [brown]
+    matcher: {type: color_context, context_group: upper_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_body_color__pink
+    family: clothing_footwear_color
+    slot: upper_body_color
+    value: pink
+    display_name: pink upper-body clothing
+    runtime_expression: pink upper-body clothing
+    aliases: [pink]
+    matcher: {type: color_context, context_group: upper_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_body_color__purple
+    family: clothing_footwear_color
+    slot: upper_body_color
+    value: purple
+    display_name: purple upper-body clothing
+    runtime_expression: purple upper-body clothing
+    aliases: [purple]
+    matcher: {type: color_context, context_group: upper_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_body_color__orange
+    family: clothing_footwear_color
+    slot: upper_body_color
+    value: orange
+    display_name: orange upper-body clothing
+    runtime_expression: orange upper-body clothing
+    aliases: [orange]
+    matcher: {type: color_context, context_group: upper_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+
+  - id: lower_body_color__black
+    family: clothing_footwear_color
+    slot: lower_body_color
+    value: black
+    display_name: black lower-body clothing
+    runtime_expression: black lower-body clothing
+    aliases: [black]
+    matcher: {type: color_context, context_group: lower_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_body_color__white
+    family: clothing_footwear_color
+    slot: lower_body_color
+    value: white
+    display_name: white lower-body clothing
+    runtime_expression: white lower-body clothing
+    aliases: [white]
+    matcher: {type: color_context, context_group: lower_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_body_color__red
+    family: clothing_footwear_color
+    slot: lower_body_color
+    value: red
+    display_name: red lower-body clothing
+    runtime_expression: red lower-body clothing
+    aliases: [red]
+    matcher: {type: color_context, context_group: lower_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_body_color__blue
+    family: clothing_footwear_color
+    slot: lower_body_color
+    value: blue
+    display_name: blue lower-body clothing
+    runtime_expression: blue lower-body clothing
+    aliases: [blue]
+    matcher: {type: color_context, context_group: lower_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_body_color__green
+    family: clothing_footwear_color
+    slot: lower_body_color
+    value: green
+    display_name: green lower-body clothing
+    runtime_expression: green lower-body clothing
+    aliases: [green]
+    matcher: {type: color_context, context_group: lower_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_body_color__yellow
+    family: clothing_footwear_color
+    slot: lower_body_color
+    value: yellow
+    display_name: yellow lower-body clothing
+    runtime_expression: yellow lower-body clothing
+    aliases: [yellow]
+    matcher: {type: color_context, context_group: lower_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_body_color__gray
+    family: clothing_footwear_color
+    slot: lower_body_color
+    value: gray
+    display_name: gray lower-body clothing
+    runtime_expression: gray lower-body clothing
+    aliases: [gray, grey]
+    matcher: {type: color_context, context_group: lower_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_body_color__brown
+    family: clothing_footwear_color
+    slot: lower_body_color
+    value: brown
+    display_name: brown lower-body clothing
+    runtime_expression: brown lower-body clothing
+    aliases: [brown]
+    matcher: {type: color_context, context_group: lower_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_body_color__pink
+    family: clothing_footwear_color
+    slot: lower_body_color
+    value: pink
+    display_name: pink lower-body clothing
+    runtime_expression: pink lower-body clothing
+    aliases: [pink]
+    matcher: {type: color_context, context_group: lower_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_body_color__purple
+    family: clothing_footwear_color
+    slot: lower_body_color
+    value: purple
+    display_name: purple lower-body clothing
+    runtime_expression: purple lower-body clothing
+    aliases: [purple]
+    matcher: {type: color_context, context_group: lower_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_body_color__orange
+    family: clothing_footwear_color
+    slot: lower_body_color
+    value: orange
+    display_name: orange lower-body clothing
+    runtime_expression: orange lower-body clothing
+    aliases: [orange]
+    matcher: {type: color_context, context_group: lower_body, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+
+  - id: footwear_color__black
+    family: clothing_footwear_color
+    slot: footwear_color
+    value: black
+    display_name: black footwear
+    runtime_expression: black footwear
+    aliases: [black]
+    matcher: {type: color_context, context_group: footwear, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: footwear_color__white
+    family: clothing_footwear_color
+    slot: footwear_color
+    value: white
+    display_name: white footwear
+    runtime_expression: white footwear
+    aliases: [white]
+    matcher: {type: color_context, context_group: footwear, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: footwear_color__red
+    family: clothing_footwear_color
+    slot: footwear_color
+    value: red
+    display_name: red footwear
+    runtime_expression: red footwear
+    aliases: [red]
+    matcher: {type: color_context, context_group: footwear, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: footwear_color__blue
+    family: clothing_footwear_color
+    slot: footwear_color
+    value: blue
+    display_name: blue footwear
+    runtime_expression: blue footwear
+    aliases: [blue]
+    matcher: {type: color_context, context_group: footwear, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: footwear_color__gray
+    family: clothing_footwear_color
+    slot: footwear_color
+    value: gray
+    display_name: gray footwear
+    runtime_expression: gray footwear
+    aliases: [gray, grey]
+    matcher: {type: color_context, context_group: footwear, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: footwear_color__brown
+    family: clothing_footwear_color
+    slot: footwear_color
+    value: brown
+    display_name: brown footwear
+    runtime_expression: brown footwear
+    aliases: [brown]
+    matcher: {type: color_context, context_group: footwear, max_token_distance: 3}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+
+  - id: upper_garment_type__shirt
+    family: garment_footwear_type
+    slot: upper_garment_type
+    value: shirt
+    display_name: shirt
+    runtime_expression: shirt
+    aliases: [shirt]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_garment_type__t_shirt
+    family: garment_footwear_type
+    slot: upper_garment_type
+    value: t_shirt
+    display_name: t-shirt
+    runtime_expression: t-shirt
+    aliases: [t-shirt, tshirt, t shirt, tee]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_garment_type__jacket
+    family: garment_footwear_type
+    slot: upper_garment_type
+    value: jacket
+    display_name: jacket
+    runtime_expression: jacket
+    aliases: [jacket]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_garment_type__coat
+    family: garment_footwear_type
+    slot: upper_garment_type
+    value: coat
+    display_name: coat
+    runtime_expression: coat
+    aliases: [coat]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_garment_type__hoodie
+    family: garment_footwear_type
+    slot: upper_garment_type
+    value: hoodie
+    display_name: hoodie
+    runtime_expression: hoodie
+    aliases: [hoodie]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_garment_type__sweater
+    family: garment_footwear_type
+    slot: upper_garment_type
+    value: sweater
+    display_name: sweater
+    runtime_expression: sweater
+    aliases: [sweater, sweatshirt]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_garment_type__vest
+    family: garment_footwear_type
+    slot: upper_garment_type
+    value: vest
+    display_name: vest
+    runtime_expression: vest
+    aliases: [vest]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_garment_type__blazer
+    family: garment_footwear_type
+    slot: upper_garment_type
+    value: blazer
+    display_name: blazer
+    runtime_expression: blazer
+    aliases: [blazer]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_garment_type__suit
+    family: garment_footwear_type
+    slot: upper_garment_type
+    value: suit
+    display_name: suit
+    runtime_expression: suit
+    aliases: [suit]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: upper_garment_type__top
+    family: garment_footwear_type
+    slot: upper_garment_type
+    value: top
+    display_name: top
+    runtime_expression: top
+    aliases: [top, blouse, jersey]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+
+  - id: lower_garment_type__pants
+    family: garment_footwear_type
+    slot: lower_garment_type
+    value: pants
+    display_name: pants
+    runtime_expression: pants
+    aliases: [pants, trousers]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_garment_type__jeans
+    family: garment_footwear_type
+    slot: lower_garment_type
+    value: jeans
+    display_name: jeans
+    runtime_expression: jeans
+    aliases: [jeans]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_garment_type__shorts
+    family: garment_footwear_type
+    slot: lower_garment_type
+    value: shorts
+    display_name: shorts
+    runtime_expression: shorts
+    aliases: [shorts]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_garment_type__skirt
+    family: garment_footwear_type
+    slot: lower_garment_type
+    value: skirt
+    display_name: skirt
+    runtime_expression: skirt
+    aliases: [skirt]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_garment_type__dress
+    family: garment_footwear_type
+    slot: lower_garment_type
+    value: dress
+    display_name: dress
+    runtime_expression: dress
+    aliases: [dress]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: lower_garment_type__leggings
+    family: garment_footwear_type
+    slot: lower_garment_type
+    value: leggings
+    display_name: leggings
+    runtime_expression: leggings
+    aliases: [leggings]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+
+  - id: footwear_type__shoes
+    family: garment_footwear_type
+    slot: footwear_type
+    value: shoes
+    display_name: shoes
+    runtime_expression: shoes
+    aliases: [shoes, shoe]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: footwear_type__sneakers
+    family: garment_footwear_type
+    slot: footwear_type
+    value: sneakers
+    display_name: sneakers
+    runtime_expression: sneakers
+    aliases: [sneakers, sneaker, trainers, trainer]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: footwear_type__boots
+    family: garment_footwear_type
+    slot: footwear_type
+    value: boots
+    display_name: boots
+    runtime_expression: boots
+    aliases: [boots, boot]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: footwear_type__sandals
+    family: garment_footwear_type
+    slot: footwear_type
+    value: sandals
+    display_name: sandals
+    runtime_expression: sandals
+    aliases: [sandals, sandal]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: footwear_type__heels
+    family: garment_footwear_type
+    slot: footwear_type
+    value: heels
+    display_name: heels
+    runtime_expression: heels
+    aliases: [heels, heel]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+
+  - id: sleeve_length__short
+    family: sleeve_length
+    slot: sleeve_length
+    value: short
+    display_name: short sleeves
+    runtime_expression: short sleeves
+    aliases: [short sleeve, short sleeves, short sleeved, short-sleeved]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: sleeve_length__long
+    family: sleeve_length
+    slot: sleeve_length
+    value: long
+    display_name: long sleeves
+    runtime_expression: long sleeves
+    aliases: [long sleeve, long sleeves, long sleeved, long-sleeved]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: sleeve_length__sleeveless
+    family: sleeve_length
+    slot: sleeve_length
+    value: sleeveless
+    display_name: sleeveless
+    runtime_expression: sleeveless
+    aliases: [sleeveless]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+
+  - id: carried_item__bag
+    family: carried_item
+    slot: carried_item
+    value: bag
+    display_name: bag
+    runtime_expression: bag
+    aliases: [bag, bags]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: [carried_item__backpack, carried_item__handbag, carried_item__shoulder_bag, carried_item__tote_bag, carried_item__shopping_bag, carried_item__briefcase]
+    incompatible_with: []
+  - id: carried_item__backpack
+    family: carried_item
+    slot: carried_item
+    value: backpack
+    display_name: backpack
+    runtime_expression: backpack
+    aliases: [backpack, rucksack, back pack]
+    matcher: {type: phrase}
+    broader_than: [carried_item__bag]
+    narrower_than: []
+    incompatible_with: []
+  - id: carried_item__handbag
+    family: carried_item
+    slot: carried_item
+    value: handbag
+    display_name: handbag
+    runtime_expression: handbag
+    aliases: [handbag, hand bag, purse]
+    matcher: {type: phrase}
+    broader_than: [carried_item__bag]
+    narrower_than: []
+    incompatible_with: []
+  - id: carried_item__shoulder_bag
+    family: carried_item
+    slot: carried_item
+    value: shoulder_bag
+    display_name: shoulder bag
+    runtime_expression: shoulder bag
+    aliases: [shoulder bag]
+    matcher: {type: phrase}
+    broader_than: [carried_item__bag]
+    narrower_than: []
+    incompatible_with: []
+  - id: carried_item__tote_bag
+    family: carried_item
+    slot: carried_item
+    value: tote_bag
+    display_name: tote bag
+    runtime_expression: tote bag
+    aliases: [tote bag]
+    matcher: {type: phrase}
+    broader_than: [carried_item__bag]
+    narrower_than: []
+    incompatible_with: []
+  - id: carried_item__shopping_bag
+    family: carried_item
+    slot: carried_item
+    value: shopping_bag
+    display_name: shopping bag
+    runtime_expression: shopping bag
+    aliases: [shopping bag]
+    matcher: {type: phrase}
+    broader_than: [carried_item__bag]
+    narrower_than: []
+    incompatible_with: []
+  - id: carried_item__briefcase
+    family: carried_item
+    slot: carried_item
+    value: briefcase
+    display_name: briefcase
+    runtime_expression: briefcase
+    aliases: [briefcase]
+    matcher: {type: phrase}
+    broader_than: [carried_item__bag]
+    narrower_than: []
+    incompatible_with: []
+  - id: carried_item__suitcase
+    family: carried_item
+    slot: carried_item
+    value: suitcase
+    display_name: suitcase
+    runtime_expression: suitcase
+    aliases: [suitcase, luggage]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: carried_item__umbrella
+    family: carried_item
+    slot: carried_item
+    value: umbrella
+    display_name: umbrella
+    runtime_expression: umbrella
+    aliases: [umbrella]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+
+  - id: worn_accessory__hat
+    family: worn_accessory
+    slot: worn_accessory
+    value: hat
+    display_name: hat
+    runtime_expression: hat
+    aliases: [hat]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: worn_accessory__cap
+    family: worn_accessory
+    slot: worn_accessory
+    value: cap
+    display_name: cap
+    runtime_expression: cap
+    aliases: [cap, baseball cap]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: worn_accessory__glasses
+    family: worn_accessory
+    slot: worn_accessory
+    value: glasses
+    display_name: glasses
+    runtime_expression: glasses
+    aliases: [glasses, spectacles, eyeglasses]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: [worn_accessory__sunglasses]
+    incompatible_with: []
+  - id: worn_accessory__sunglasses
+    family: worn_accessory
+    slot: worn_accessory
+    value: sunglasses
+    display_name: sunglasses
+    runtime_expression: sunglasses
+    aliases: [sunglasses, sun glasses]
+    matcher: {type: phrase}
+    broader_than: [worn_accessory__glasses]
+    narrower_than: []
+    incompatible_with: []
+  - id: worn_accessory__scarf
+    family: worn_accessory
+    slot: worn_accessory
+    value: scarf
+    display_name: scarf
+    runtime_expression: scarf
+    aliases: [scarf]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: worn_accessory__mask
+    family: worn_accessory
+    slot: worn_accessory
+    value: mask
+    display_name: mask
+    runtime_expression: mask
+    aliases: [mask, face mask]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: worn_accessory__helmet
+    family: worn_accessory
+    slot: worn_accessory
+    value: helmet
+    display_name: helmet
+    runtime_expression: helmet
+    aliases: [helmet]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: worn_accessory__beanie
+    family: worn_accessory
+    slot: worn_accessory
+    value: beanie
+    display_name: beanie
+    runtime_expression: beanie
+    aliases: [beanie]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+  - id: worn_accessory__watch
+    family: worn_accessory
+    slot: worn_accessory
+    value: watch
+    display_name: watch
+    runtime_expression: watch
+    aliases: [watch, wristwatch]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: []
+    incompatible_with: []
+
+  - id: clothing_pattern__patterned
+    family: clothing_pattern
+    slot: clothing_pattern
+    value: patterned
+    display_name: patterned clothing
+    runtime_expression: patterned clothing
+    aliases: [patterned]
+    matcher: {type: phrase}
+    broader_than: []
+    narrower_than: [clothing_pattern__striped, clothing_pattern__plaid, clothing_pattern__checkered, clothing_pattern__floral, clothing_pattern__camouflage, clothing_pattern__logo, clothing_pattern__printed, clothing_pattern__polka_dot]
+    incompatible_with: []
+  - id: clothing_pattern__striped
+    family: clothing_pattern
+    slot: clothing_pattern
+    value: striped
+    display_name: striped clothing
+    runtime_expression: striped clothing
+    aliases: [striped, stripe, stripes]
+    matcher: {type: phrase}
+    broader_than: [clothing_pattern__patterned]
+    narrower_than: []
+    incompatible_with: []
+  - id: clothing_pattern__plaid
+    family: clothing_pattern
+    slot: clothing_pattern
+    value: plaid
+    display_name: plaid clothing
+    runtime_expression: plaid clothing
+    aliases: [plaid]
+    matcher: {type: phrase}
+    broader_than: [clothing_pattern__patterned]
+    narrower_than: []
+    incompatible_with: []
+  - id: clothing_pattern__checkered
+    family: clothing_pattern
+    slot: clothing_pattern
+    value: checkered
+    display_name: checkered clothing
+    runtime_expression: checkered clothing
+    aliases: [checkered, checked]
+    matcher: {type: phrase}
+    broader_than: [clothing_pattern__patterned]
+    narrower_than: []
+    incompatible_with: []
+  - id: clothing_pattern__floral
+    family: clothing_pattern
+    slot: clothing_pattern
+    value: floral
+    display_name: floral clothing
+    runtime_expression: floral clothing
+    aliases: [floral]
+    matcher: {type: phrase}
+    broader_than: [clothing_pattern__patterned]
+    narrower_than: []
+    incompatible_with: []
+  - id: clothing_pattern__camouflage
+    family: clothing_pattern
+    slot: clothing_pattern
+    value: camouflage
+    display_name: camouflage clothing
+    runtime_expression: camouflage clothing
+    aliases: [camouflage, camo]
+    matcher: {type: phrase}
+    broader_than: [clothing_pattern__patterned]
+    narrower_than: []
+    incompatible_with: []
+  - id: clothing_pattern__logo
+    family: clothing_pattern
+    slot: clothing_pattern
+    value: logo
+    display_name: logo clothing
+    runtime_expression: logo clothing
+    aliases: [logo]
+    matcher: {type: phrase}
+    broader_than: [clothing_pattern__patterned]
+    narrower_than: []
+    incompatible_with: []
+  - id: clothing_pattern__printed
+    family: clothing_pattern
+    slot: clothing_pattern
+    value: printed
+    display_name: printed clothing
+    runtime_expression: printed clothing
+    aliases: [printed, print]
+    matcher: {type: phrase}
+    broader_than: [clothing_pattern__patterned]
+    narrower_than: []
+    incompatible_with: []
+  - id: clothing_pattern__polka_dot
+    family: clothing_pattern
+    slot: clothing_pattern
+    value: polka_dot
+    display_name: polka-dot clothing
+    runtime_expression: polka-dot clothing
+    aliases: [polka dot, polka dots]
+    matcher: {type: phrase}
+    broader_than: [clothing_pattern__patterned]
+    narrower_than: []
+    incompatible_with: []
