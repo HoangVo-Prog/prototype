@@ -172,8 +172,6 @@ def get_args():
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--test_batch_size", type=int, default=512)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--eval_log_interval", type=float, default=30.0,
-                        help="seconds between evaluation progress logs; <= 0 disables periodic progress logs")
     parser.add_argument("--test", dest='training', default=True, action='store_false')
     wandb_group = parser.add_mutually_exclusive_group()
     wandb_group.add_argument("--use_wandb", dest="use_wandb", action="store_true",
