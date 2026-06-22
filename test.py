@@ -197,6 +197,7 @@ def _ensure_inference_defaults(args, config_file, config_keys=None):
     _set_if_not_present(args, "root_dir", "data")
     _set_if_not_present(args, "num_workers", 4)
     _set_if_not_present(args, "test_batch_size", 512)
+    _set_if_not_present(args, "eval_log_interval", 30.0)
     _set_if_not_present(args, "seed", 1)
     _set_if_not_present(args, "deterministic", True)
     _set_if_not_present(args, "deterministic_warn_only", False)
@@ -232,6 +233,7 @@ def _apply_cli_overrides(args, cli_args, config_file, checkpoint, eval_dir):
         "root_dir",
         "test_batch_size",
         "num_workers",
+        "eval_log_interval",
         "seed",
         "deterministic",
         "deterministic_warn_only",

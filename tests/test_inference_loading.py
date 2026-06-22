@@ -40,6 +40,7 @@ class InferenceConfigLoadingTests(unittest.TestCase):
             self.assertTrue(args.only_global)
             self.assertTrue(hasattr(args, "topm_rank_space"))
             self.assertTrue(hasattr(args, "mixer_hidden_readout"))
+            self.assertEqual(args.eval_log_interval, 30.0)
 
     def test_checkpoint_resolves_from_config_output_dir(self):
         inference = load_inference_module()

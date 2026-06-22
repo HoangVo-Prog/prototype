@@ -84,6 +84,12 @@ def get_test_args():
     parser.add_argument("--test_batch_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument(
+        "--eval_log_interval",
+        type=float,
+        default=None,
+        help="seconds between evaluation progress logs; <= 0 disables periodic progress logs",
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         help="device for inference, for example auto, cuda, cuda:0, or cpu",
