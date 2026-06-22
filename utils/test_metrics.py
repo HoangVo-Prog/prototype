@@ -118,6 +118,11 @@ def _ablation_lambda_from_key(key):
     return float(match.group(1)) if match else 0.0
 
 
+def _clear_cuda_cache_if_available():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 class Evaluator:
     def __init__(self, img_loader, txt_loader, args):
         self.img_loader = img_loader
@@ -461,6 +466,17 @@ class Evaluator:
                     + proto_lambda * sims_target
                 )
 
+    def _num_base_tasks(self):
+        if self.args.only_global:
+            return 1
+        return 2 + len(_global_grab_lambdas())
+
+    def _num_eval_tasks(self, use_target_enrichment):
+        base_tasks = self._num_base_tasks()
+        if not use_target_enrichment:
+            return base_tasks
+        return base_tasks * (1 + len(_prototype_lambdas()))
+
     def eval(self, model, i2t_metric=False, use_target_enrichment=None):
         if use_target_enrichment is None:
             use_target_enrichment = getattr(self.args, "target_enrichment", False)
@@ -495,14 +511,13 @@ class Evaluator:
                 target_cache,
             )
             target_qfeats = F.normalize(target_qfeats, p=2, dim=1)
-            target_gfeats = F.normalize(
-                target_cache["retrieval_features"].detach().cpu(),
-                p=2,
-                dim=1,
-            )
+            target_gfeats = F.normalize(target_cache["retrieval_features"].detach().cpu(), p=2, dim=1)
             sims_target = target_qfeats @ target_gfeats.t()
             qids = target_qids
             gids = target_gids
+            del target_cache
+            _clear_cuda_cache_if_available()
+            self.logger.info("Released target gallery cache from GPU memory")
             self.logger.info("Target-aware similarity matrix ready")
 
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP", "rSum"])
@@ -514,12 +529,15 @@ class Evaluator:
         best_row = None
         best_ablation_task = None
         best_ablation_row = None
-        eval_tasks = list(self._iter_eval_tasks(sims_global, sims_grab, sims_target))
-        self.logger.info("Scoring {} evaluation tasks".format(len(eval_tasks)))
+        total_eval_tasks = self._num_eval_tasks(sims_target is not None)
+        self.logger.info("Scoring {} evaluation tasks".format(total_eval_tasks))
         task_start_time = time.monotonic()
         last_task_log_time = task_start_time
 
-        for task_idx, (key, sims) in enumerate(eval_tasks, 1):
+        for task_idx, (key, sims) in enumerate(
+            self._iter_eval_tasks(sims_global, sims_grab, sims_target),
+            1,
+        ):
             rs = get_metrics(sims, qids, gids, "{}-t2i".format(key), False)
             table.add_row(rs)
             rows_by_task[key] = rs
@@ -561,7 +579,7 @@ class Evaluator:
             now = time.monotonic()
             if (
                 task_idx == 1
-                or task_idx == len(eval_tasks)
+                or task_idx == total_eval_tasks
                 or (
                     self.progress_log_interval > 0
                     and now - last_task_log_time >= self.progress_log_interval
@@ -569,7 +587,7 @@ class Evaluator:
             ):
                 self._log_task_progress(
                     task_idx,
-                    len(eval_tasks),
+                    total_eval_tasks,
                     task_start_time,
                     force=True,
                 )

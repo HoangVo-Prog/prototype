@@ -115,6 +115,11 @@ def _ablation_lambda_from_key(key):
     return float(match.group(1)) if match else 0.0
 
 
+def _clear_cuda_cache_if_available():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 class Evaluator():
     def __init__(self, img_loader, txt_loader, args):
         self.img_loader = img_loader # gallery
@@ -425,6 +430,45 @@ class Evaluator():
         )
         return qfeats.cpu(), qids.cpu()
 
+    def _iter_base_tasks(self, sims_global, sims_grab):
+        yield "global", sims_global
+        if self.args.only_global:
+            return
+
+        yield "grab", sims_grab
+        for lambda_value in _global_grab_lambdas():
+            alpha = _format_lambda(lambda_value)
+            fused_name = "global+grab({})".format(alpha)
+            yield fused_name, _scaled_fuse(sims_global, sims_grab, lambda_value)
+
+    def _iter_eval_tasks(self, sims_global, sims_grab, sims_target):
+        for task_name, task_scores in self._iter_base_tasks(sims_global, sims_grab):
+            yield task_name, task_scores
+
+        if sims_target is None:
+            return
+
+        for proto_lambda in _prototype_lambdas():
+            proto_value = _format_lambda(proto_lambda)
+            for base_name, base_scores in self._iter_base_tasks(sims_global, sims_grab):
+                fused_name = "{}+proto({})".format(base_name, proto_value)
+                scaled_base_scores = _scale_scores_like(base_scores, sims_target)
+                yield fused_name, (
+                    (1.0 - proto_lambda) * scaled_base_scores
+                    + proto_lambda * sims_target
+                )
+
+    def _num_base_tasks(self):
+        if self.args.only_global:
+            return 1
+        return 2 + len(_global_grab_lambdas())
+
+    def _num_eval_tasks(self, use_target_enrichment):
+        base_tasks = self._num_base_tasks()
+        if not use_target_enrichment:
+            return base_tasks
+        return base_tasks * (1 + len(_prototype_lambdas()))
+
     def eval(self, model, i2t_metric=False, use_target_enrichment=None):
         if use_target_enrichment is None:
             use_target_enrichment = getattr(self.args, "target_enrichment", False)
@@ -449,25 +493,6 @@ class Evaluator():
             sims_grab = vq_feats@vg_feats.t()
             self.logger.info("GRAB similarity matrix ready")
 
-        if self.args.only_global:
-            sims_dict = {"global": sims_global}
-            proto_bases = {"global": sims_global}
-        else:
-            sims_dict = {
-                "global": sims_global,
-                "grab": sims_grab,
-            }
-            proto_bases = {
-                "global": sims_global,
-                "grab": sims_grab,
-            }
-            for lambda_value in _global_grab_lambdas():
-                alpha = _format_lambda(lambda_value)
-                fused_name = "global+grab({})".format(alpha)
-                fused_scores = _scaled_fuse(sims_global, sims_grab, lambda_value)
-                sims_dict[fused_name] = fused_scores
-                proto_bases[fused_name] = fused_scores
-
         if use_target_enrichment:
             self.logger.info("Computing target-aware enrichment features")
             target_cache, target_gids = self._compute_target_gallery_cache(model)
@@ -475,18 +500,14 @@ class Evaluator():
             target_qfeats = F.normalize(target_qfeats, p=2, dim=1)
             target_gfeats = F.normalize(target_cache["retrieval_features"].detach().cpu(), p=2, dim=1)
             sims_target = target_qfeats @ target_gfeats.t()
-            for proto_lambda in _prototype_lambdas():
-                proto_value = _format_lambda(proto_lambda)
-                for base_name, base_scores in proto_bases.items():
-                    fused_name = "{}+proto({})".format(base_name, proto_value)
-                    scaled_base_scores = _scale_scores_like(base_scores, sims_target)
-                    sims_dict[fused_name] = (
-                        (1.0 - proto_lambda) * scaled_base_scores
-                        + proto_lambda * sims_target
-                    )
             qids = target_qids
             gids = target_gids
+            del target_cache
+            _clear_cuda_cache_if_available()
+            self.logger.info("Released target gallery cache from GPU memory")
             self.logger.info("Target-aware similarity matrix ready")
+        else:
+            sims_target = None
 
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP","rSum"])
 
@@ -498,12 +519,15 @@ class Evaluator():
         best_ablation_task = None
         best_ablation_row = None
 
-        self.logger.info("Scoring {} evaluation tasks".format(len(sims_dict)))
+        total_eval_tasks = self._num_eval_tasks(sims_target is not None)
+        self.logger.info("Scoring {} evaluation tasks".format(total_eval_tasks))
         task_start_time = time.monotonic()
         last_task_log_time = task_start_time
 
-        for task_idx, key in enumerate(sims_dict.keys(), 1):
-            sims = sims_dict[key]
+        for task_idx, (key, sims) in enumerate(
+            self._iter_eval_tasks(sims_global, sims_grab, sims_target),
+            1,
+        ):
             rs = get_metrics(sims, qids, gids, f'{key}-t2i',False)
             table.add_row(rs)
             rows_by_task[key] = rs
@@ -533,7 +557,7 @@ class Evaluator():
             now = time.monotonic()
             if (
                 task_idx == 1
-                or task_idx == len(sims_dict)
+                or task_idx == total_eval_tasks
                 or (
                     self.progress_log_interval > 0
                     and now - last_task_log_time >= self.progress_log_interval
@@ -541,7 +565,7 @@ class Evaluator():
             ):
                 self._log_task_progress(
                     task_idx,
-                    len(sims_dict),
+                    total_eval_tasks,
                     task_start_time,
                     force=True,
                 )
