@@ -72,10 +72,17 @@ class Checkpointer:
         return checkpoint
 
     def _load_file(self, f):
-        return torch.load(f, map_location=torch.device("cpu"))
+        try:
+            return torch.load(f, map_location=torch.device("cpu"))
+        except RuntimeError:
+            return torch.jit.load(f, map_location=torch.device("cpu")).state_dict()
 
     def _load_model(self, checkpoint, except_keys=None):
-        load_state_dict(self.model, checkpoint.pop("model"), except_keys)
+        state_dict = unwrap_checkpoint_state_dict(checkpoint)
+        load_state_dict(self.model, state_dict, except_keys)
+        if isinstance(checkpoint, dict):
+            checkpoint.pop("model", None)
+            checkpoint.pop("state_dict", None)
 
 
 def delete_output_checkpoints(output_dir, logger=None, pattern="*.pth"):
@@ -148,7 +155,22 @@ def align_and_update_state_dicts(model_state_dict, loaded_state_dict, except_key
         key_old = loaded_keys[idx_old]
         if check_key(key, except_keys):
             continue
-        model_state_dict[key] = loaded_state_dict[key_old]
+        loaded_value = loaded_state_dict[key_old]
+        current_value = model_state_dict[key]
+        if not torch.is_tensor(loaded_value):
+            logger.info("Skipping non-tensor checkpoint entry {}".format(key_old))
+            continue
+        if tuple(current_value.shape) != tuple(loaded_value.shape):
+            logger.info(
+                "Skipping shape-mismatch checkpoint entry {} -> {}: {} vs {}".format(
+                    key_old,
+                    key,
+                    tuple(loaded_value.shape),
+                    tuple(current_value.shape),
+                )
+            )
+            continue
+        model_state_dict[key] = loaded_value
         logger.info(
             log_str_template.format(
                 key,

@@ -35,13 +35,18 @@ def get_test_args():
     )
     parser.add_argument(
         "--config_file",
+        "--config",
+        dest="config_file",
         default=None,
         help="training config file; defaults to <run_dir>/configs.yaml",
     )
     parser.add_argument(
         "--checkpoint",
         default=None,
-        help="checkpoint path; defaults to <run_dir>/best.pth",
+        help=(
+            "checkpoint path; if omitted, test.py searches checkpoint fields in "
+            "the config and then best.pth under the config/output directory"
+        ),
     )
     parser.add_argument(
         "--source_domain",

@@ -3,21 +3,47 @@
 @author:  sherlock
 @contact: sherlockliao01@gmail.com
 """
-from PIL import Image, ImageFile
 import errno
 import json
 import pickle as pkl
 import os
 import os.path as osp
 import yaml
-from easydict import EasyDict as edict
 
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+try:
+    from PIL import Image, ImageFile
+except ImportError:
+    Image = None
+    ImageFile = None
+
+try:
+    from easydict import EasyDict as edict
+except ImportError:
+    class edict(dict):
+        def __getattr__(self, name):
+            try:
+                return self[name]
+            except KeyError as error:
+                raise AttributeError(name) from error
+
+        def __setattr__(self, name, value):
+            self[name] = value
+
+        def __delattr__(self, name):
+            try:
+                del self[name]
+            except KeyError as error:
+                raise AttributeError(name) from error
+
+if ImageFile is not None:
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def read_image(img_path):
     """Keep reading image until succeed.
     This can avoid IOError incurred by heavy IO process."""
+    if Image is None:
+        raise ImportError("Pillow is required to read images")
     got_img = False
     if not osp.exists(img_path):
         raise IOError("{} does not exist".format(img_path))
