@@ -372,6 +372,7 @@ def main() -> None:
         split.query_records,
         split.gallery_pids,
         args.max_queries_per_case,
+        logger=logger,
     )
     selected_by_case = Counter(str(row["case_id"]) for row in selected_queries)
     logger.info(

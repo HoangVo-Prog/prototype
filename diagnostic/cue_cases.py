@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -142,21 +144,94 @@ def _slug(value: str) -> str:
     return slug or "cue"
 
 
+def _positive_lookahead_fragments(pattern: str) -> list[str] | None:
+    """Return fragments from generated (?=.*fragment) case regexes."""
+    fragments: list[str] = []
+    index = 0
+    prefix = "(?=.*"
+    while index < len(pattern):
+        if not pattern.startswith(prefix, index):
+            return None
+        start = index + len(prefix)
+        depth = 1
+        escaped = False
+        in_char_class = False
+        cursor = start
+        while cursor < len(pattern):
+            char = pattern[cursor]
+            if escaped:
+                escaped = False
+                cursor += 1
+                continue
+            if char == "\\":
+                escaped = True
+                cursor += 1
+                continue
+            if char == "[" and not in_char_class:
+                in_char_class = True
+                cursor += 1
+                continue
+            if char == "]" and in_char_class:
+                in_char_class = False
+                cursor += 1
+                continue
+            if not in_char_class:
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0:
+                        fragments.append(pattern[start:cursor])
+                        index = cursor + 1
+                        break
+            cursor += 1
+        else:
+            return None
+    return fragments or None
+
+
 def select_queries_for_cases(
     dataset_name: str,
     cases: Sequence[Mapping[str, Any]],
     query_records: Sequence[QueryRecord],
     gallery_pids: np.ndarray,
     max_queries_per_case: int | None,
+    logger: logging.Logger | None = None,
+    progress_interval: int = 250,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     selected: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     query_by_id = {record.query_id: record for record in query_records}
+    normalized_by_query_id = {record.query_id: normalize_text(record.text) for record in query_records}
     pids_with_gallery = set(int(pid) for pid in gallery_pids.tolist())
+    fragment_match_cache: dict[str, set[int]] = {}
+    selection_started = time.perf_counter()
+    last_progress_time = selection_started
 
-    for case in cases:
+    def matching_records_for_fragments(fragments: list[str]) -> list[QueryRecord] | None:
+        matching_sets: list[set[int]] = []
+        for fragment in fragments:
+            if fragment not in fragment_match_cache:
+                try:
+                    compiled = re.compile(fragment, flags=re.IGNORECASE)
+                except re.error:
+                    return None
+                fragment_match_cache[fragment] = {
+                    record.query_id
+                    for record in query_records
+                    if compiled.search(normalized_by_query_id[record.query_id]) is not None
+                }
+            matching_sets.append(fragment_match_cache[fragment])
+        if not matching_sets:
+            return None
+        candidate_ids = set.intersection(*matching_sets)
+        return [record for record in query_records if record.query_id in candidate_ids]
+
+    total_cases = len(cases)
+    for case_index, case in enumerate(cases, start=1):
         case_id = str(case["case_id"])
-        regex = re.compile(str(case["query_regex"]), flags=re.IGNORECASE) if "query_regex" in case else None
+        regex_pattern = str(case["query_regex"]) if "query_regex" in case else None
+        regex_fragments = _positive_lookahead_fragments(regex_pattern) if regex_pattern is not None else None
         if "query_ids" in case:
             candidates = []
             for query_id in case["query_ids"]:
@@ -169,11 +244,22 @@ def select_queries_for_cases(
         else:
             needles = case_needles(case)
             candidates = []
-            for record in query_records:
-                normalized = normalize_text(record.text)
+            source_records = (
+                matching_records_for_fragments(regex_fragments)
+                if regex_fragments is not None
+                else None
+            )
+            regex = (
+                re.compile(regex_pattern, flags=re.IGNORECASE)
+                if regex_pattern is not None and source_records is None
+                else None
+            )
+            records_to_scan = source_records if source_records is not None else query_records
+            for record in records_to_scan:
+                normalized = normalized_by_query_id[record.query_id]
                 if not all(contains_normalized_phrase(normalized, needle) for needle in needles):
                     continue
-                if regex is not None and regex.search(normalized) is None:
+                if source_records is None and regex is not None and regex.search(normalized) is None:
                     continue
                 candidates.append(record)
             selection_method = "query_text_filter"
@@ -203,4 +289,22 @@ def select_queries_for_cases(
                     "selection_method": selection_method,
                 }
             )
+        if logger is not None and (
+            case_index == 1
+            or case_index == total_cases
+            or (progress_interval > 0 and case_index % progress_interval == 0)
+        ):
+            now = time.perf_counter()
+            logger.info(
+                "Query selection progress cases=%d/%d selected_queries=%d skipped_rows=%d "
+                "cached_regex_fragments=%d elapsed=%.1fs interval=%.1fs",
+                case_index,
+                total_cases,
+                len(selected),
+                len(skipped),
+                len(fragment_match_cache),
+                now - selection_started,
+                now - last_progress_time,
+            )
+            last_progress_time = now
     return selected, skipped
