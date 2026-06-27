@@ -2,19 +2,6 @@ from prettytable import PrettyTable
 import torch
 import torch.nn.functional as F
 import logging
-# from nnn import NNNRetriever, NNNRanker
-import matplotlib.pyplot as plt
-from PIL import Image
-import numpy as np
-import os
-from skimage.transform import resize
-import cv2
-import torchvision.transforms as T
-import json
-
-import numpy as np
-import matplotlib.pyplot as plt
-from collections import defaultdict
 import re
 
 
@@ -30,7 +17,7 @@ def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
     pred_labels = g_pids[indices.cpu()]  # q * k
     matches = pred_labels.eq(q_pids.view(-1, 1))  # q * k
 
-    all_cmc = matches[:, :max_rank].cumsum(1) # cumulative sum
+    all_cmc = matches[:, :max_rank].cumsum(1)  # cumulative sum
     all_cmc[all_cmc > 1] = 1
     all_cmc = all_cmc.float().mean(0) * 100
     # all_cmc = all_cmc[topk - 1]
@@ -41,11 +28,18 @@ def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
     num_rel = matches.sum(1)  # q
     tmp_cmc = matches.cumsum(1)  # q * k
 
-    inp = [tmp_cmc[i][match_row.nonzero()[-1]] / (match_row.nonzero()[-1] + 1.) for i, match_row in enumerate(matches)]
-    mINP = torch.cat(inp).mean() * 100
+    last_rel_rank = (tmp_cmc != num_rel.view(-1, 1)).sum(1) + 1
+    mINP = (num_rel.float() / last_rel_rank.float()).mean() * 100
 
-    tmp_cmc = [tmp_cmc[:, i] / (i + 1.0) for i in range(tmp_cmc.shape[1])]
-    tmp_cmc = torch.stack(tmp_cmc, 1) * matches
+    rank_positions = torch.arange(
+        1,
+        tmp_cmc.shape[1] + 1,
+        device=tmp_cmc.device,
+        dtype=torch.float32,
+    ).view(1, -1)
+    tmp_cmc = tmp_cmc.float()
+    tmp_cmc.div_(rank_positions)
+    tmp_cmc.mul_(matches)
     AP = tmp_cmc.sum(1) / num_rel  # q
     mAP = AP.mean() * 100
 
@@ -230,6 +224,38 @@ class Evaluator():
         qfeats = torch.cat(qfeats, 0)
         return qfeats.cpu(), qids.cpu()
 
+    def _build_base_tasks(self, sims_global, sims_grab):
+        base_tasks = [("global", sims_global)]
+        if self.args.only_global:
+            return base_tasks
+
+        base_tasks.append(("grab", sims_grab))
+        for lambda_value in _global_grab_lambdas():
+            alpha = _format_lambda(lambda_value)
+            fused_name = "global+grab({})".format(alpha)
+            base_tasks.append((
+                fused_name,
+                _scaled_fuse(sims_global, sims_grab, lambda_value),
+            ))
+        return base_tasks
+
+    def _iter_eval_tasks(self, base_tasks, sims_target):
+        for task_name, task_scores in base_tasks:
+            yield task_name, task_scores
+
+        if sims_target is None:
+            return
+
+        for proto_lambda in _prototype_lambdas():
+            proto_value = _format_lambda(proto_lambda)
+            for base_name, base_scores in base_tasks:
+                fused_name = "{}+proto({})".format(base_name, proto_value)
+                scaled_base_scores = _scale_scores_like(base_scores, sims_target)
+                yield fused_name, (
+                    (1.0 - proto_lambda) * scaled_base_scores
+                    + proto_lambda * sims_target
+                )
+
     def eval(self, model, i2t_metric=False, use_target_enrichment=None):
         if use_target_enrichment is None:
             use_target_enrichment = getattr(self.args, "target_enrichment", False)
@@ -239,46 +265,21 @@ class Evaluator():
         gfeats = F.normalize(gfeats, p=2, dim=1) # image features
         sims_global = qfeats @ gfeats.t()
 
+        sims_grab = None
         if not self.args.only_global:
             vq_feats, vg_feats, _, _ = self._compute_embedding_grab(model)
             vq_feats = F.normalize(vq_feats, p=2, dim=1) # text features
             vg_feats = F.normalize(vg_feats, p=2, dim=1) # image features
             sims_grab = vq_feats@vg_feats.t()
 
-        if self.args.only_global:
-            sims_dict = {"global": sims_global}
-            proto_bases = {"global": sims_global}
-        else:
-            sims_dict = {
-                "global": sims_global,
-                "grab": sims_grab,
-            }
-            proto_bases = {
-                "global": sims_global,
-                "grab": sims_grab,
-            }
-            for lambda_value in _global_grab_lambdas():
-                alpha = _format_lambda(lambda_value)
-                fused_name = "global+grab({})".format(alpha)
-                fused_scores = _scaled_fuse(sims_global, sims_grab, lambda_value)
-                sims_dict[fused_name] = fused_scores
-                proto_bases[fused_name] = fused_scores
-
+        base_tasks = self._build_base_tasks(sims_global, sims_grab)
+        sims_target = None
         if use_target_enrichment:
             target_cache, target_gids = self._compute_target_gallery_cache(model)
             target_qfeats, target_qids = self._compute_enriched_text_embedding(model, target_cache)
             target_qfeats = F.normalize(target_qfeats, p=2, dim=1)
             target_gfeats = F.normalize(target_cache["retrieval_features"].detach().cpu(), p=2, dim=1)
             sims_target = target_qfeats @ target_gfeats.t()
-            for proto_lambda in _prototype_lambdas():
-                proto_value = _format_lambda(proto_lambda)
-                for base_name, base_scores in proto_bases.items():
-                    fused_name = "{}+proto({})".format(base_name, proto_value)
-                    scaled_base_scores = _scale_scores_like(base_scores, sims_target)
-                    sims_dict[fused_name] = (
-                        (1.0 - proto_lambda) * scaled_base_scores
-                        + proto_lambda * sims_target
-                    )
             qids = target_qids
             gids = target_gids
 
@@ -292,8 +293,7 @@ class Evaluator():
         best_ablation_task = None
         best_ablation_row = None
 
-        for key in sims_dict.keys():
-            sims = sims_dict[key]
+        for key, sims in self._iter_eval_tasks(base_tasks, sims_target):
             rs = get_metrics(sims, qids, gids, f'{key}-t2i',False)
             table.add_row(rs)
             rows_by_task[key] = rs

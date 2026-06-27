@@ -27,14 +27,18 @@ def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
     num_rel = matches.sum(1)
     tmp_cmc = matches.cumsum(1)
 
-    inp = [
-        tmp_cmc[i][match_row.nonzero()[-1]] / (match_row.nonzero()[-1] + 1.0)
-        for i, match_row in enumerate(matches)
-    ]
-    mINP = torch.cat(inp).mean() * 100
+    last_rel_rank = (tmp_cmc != num_rel.view(-1, 1)).sum(1) + 1
+    mINP = (num_rel.float() / last_rel_rank.float()).mean() * 100
 
-    tmp_cmc = [tmp_cmc[:, i] / (i + 1.0) for i in range(tmp_cmc.shape[1])]
-    tmp_cmc = torch.stack(tmp_cmc, 1) * matches
+    rank_positions = torch.arange(
+        1,
+        tmp_cmc.shape[1] + 1,
+        device=tmp_cmc.device,
+        dtype=torch.float32,
+    ).view(1, -1)
+    tmp_cmc = tmp_cmc.float()
+    tmp_cmc.div_(rank_positions)
+    tmp_cmc.mul_(matches)
     AP = tmp_cmc.sum(1) / num_rel
     mAP = AP.mean() * 100
 
@@ -435,22 +439,22 @@ class Evaluator:
         )
         return qfeats.cpu(), qids.cpu()
 
-    def _iter_base_tasks(self, sims_global, sims_grab):
-        yield "global", sims_global
+    def _build_base_tasks(self, sims_global, sims_grab):
+        base_tasks = [("global", sims_global)]
         if self.args.only_global:
-            return
+            return base_tasks
 
-        yield "grab", sims_grab
+        base_tasks.append(("grab", sims_grab))
         for lambda_value in _global_grab_lambdas():
             alpha = _format_lambda(lambda_value)
-            yield "global+grab({})".format(alpha), _scaled_fuse(
-                sims_global,
-                sims_grab,
-                lambda_value,
-            )
+            base_tasks.append((
+                "global+grab({})".format(alpha),
+                _scaled_fuse(sims_global, sims_grab, lambda_value),
+            ))
+        return base_tasks
 
-    def _iter_eval_tasks(self, sims_global, sims_grab, sims_target):
-        for task_name, task_scores in self._iter_base_tasks(sims_global, sims_grab):
+    def _iter_eval_tasks(self, base_tasks, sims_target):
+        for task_name, task_scores in base_tasks:
             yield task_name, task_scores
 
         if sims_target is None:
@@ -458,24 +462,13 @@ class Evaluator:
 
         for proto_lambda in _prototype_lambdas():
             proto_value = _format_lambda(proto_lambda)
-            for base_name, base_scores in self._iter_base_tasks(sims_global, sims_grab):
+            for base_name, base_scores in base_tasks:
                 fused_name = "{}+proto({})".format(base_name, proto_value)
                 scaled_base_scores = _scale_scores_like(base_scores, sims_target)
                 yield fused_name, (
                     (1.0 - proto_lambda) * scaled_base_scores
                     + proto_lambda * sims_target
                 )
-
-    def _num_base_tasks(self):
-        if self.args.only_global:
-            return 1
-        return 2 + len(_global_grab_lambdas())
-
-    def _num_eval_tasks(self, use_target_enrichment):
-        base_tasks = self._num_base_tasks()
-        if not use_target_enrichment:
-            return base_tasks
-        return base_tasks * (1 + len(_prototype_lambdas()))
 
     def eval(self, model, i2t_metric=False, use_target_enrichment=None):
         if use_target_enrichment is None:
@@ -502,6 +495,7 @@ class Evaluator:
             sims_grab = vq_feats @ vg_feats.t()
             self.logger.info("GRAB similarity matrix ready")
 
+        base_tasks = self._build_base_tasks(sims_global, sims_grab)
         sims_target = None
         if use_target_enrichment:
             self.logger.info("Computing target-aware enrichment features")
@@ -529,13 +523,15 @@ class Evaluator:
         best_row = None
         best_ablation_task = None
         best_ablation_row = None
-        total_eval_tasks = self._num_eval_tasks(sims_target is not None)
+        total_eval_tasks = len(base_tasks)
+        if sims_target is not None:
+            total_eval_tasks *= 1 + len(_prototype_lambdas())
         self.logger.info("Scoring {} evaluation tasks".format(total_eval_tasks))
         task_start_time = time.monotonic()
         last_task_log_time = task_start_time
 
         for task_idx, (key, sims) in enumerate(
-            self._iter_eval_tasks(sims_global, sims_grab, sims_target),
+            self._iter_eval_tasks(base_tasks, sims_target),
             1,
         ):
             rs = get_metrics(sims, qids, gids, "{}-t2i".format(key), False)
