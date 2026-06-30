@@ -1,5 +1,7 @@
 import argparse
 
+from utils.qcrs_mixer_variants import QCRS_MIXER_VARIANTS, apply_qcrs_mixer_variant
+
 
 _EXTRACTOR_BASE_MODES = (
     "global",
@@ -251,6 +253,9 @@ def get_args():
     parser.add_argument("--context_module", type=str, default="mixer",
                         choices=["mixer"],
                         help="context construction module for target enrichment")
+    parser.add_argument("--qcrs_mixer_variant", type=str, default="qcrs_full",
+                        choices=QCRS_MIXER_VARIANTS,
+                        help="QCRS-Mixer ablation variant for target enrichment context construction")
     parser.add_argument("--mixer_dim", type=int, default=256,
                         help="rank-part mixer bottleneck dimension")
     parser.add_argument("--mixer_depth", type=int, default=2,
@@ -332,4 +337,5 @@ def get_args():
         parser.error("--mixer_hidden_channel must be a positive integer")
     if args.mixer_hidden_readout < 1:
         parser.error("--mixer_hidden_readout must be a positive integer")
+    apply_qcrs_mixer_variant(args)
     return args

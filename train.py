@@ -157,6 +157,18 @@ if __name__ == '__main__':
     logger = setup_logger('ITSELF', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
     logger.info("Using {} GPUs".format(num_gpus))
     logger.info(str(args).replace(',', '\n'))
+    logger.info(
+        "QCRS-Mixer variant: %s (mode=%s, FiLM=%s, rank_emb=%s, slot_emb=%s, "
+        "SlotMix=%s, RankMix=%s, ChanMix=%s)",
+        getattr(args, "qcrs_mixer_variant", "qcrs_full"),
+        getattr(args, "qcrs_mixer_mode", "qcrs"),
+        getattr(args, "qcrs_use_film", True),
+        getattr(args, "qcrs_use_rank_emb", True),
+        getattr(args, "qcrs_use_slot_emb", True),
+        getattr(args, "qcrs_use_slotmix", True),
+        getattr(args, "qcrs_use_rankmix", True),
+        getattr(args, "qcrs_use_chanmix", True),
+    )
     save_train_configs(args.output_dir, args)
     if not os.path.isdir(args.output_dir+'/img'):
         os.makedirs(args.output_dir+'/img')

@@ -42,6 +42,7 @@ def args(**overrides):
         topm_rank_lambda=0.5,
         extractor_mode="global,horizontal",
         num_parts=6,
+        qcrs_mixer_variant="qcrs_full",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -151,6 +152,75 @@ class EnrichmentShapeTests(unittest.TestCase):
                 continue
             self.assertIn(key, adapter.last_diagnostics)
         c_q.sum().backward()
+
+    def test_qcrs_full_keeps_original_parameter_names(self):
+        adapter = modules.RankPartQueryConditionedMixerAdapter(
+            embed_dim=16,
+            num_ranks=3,
+            num_slots=5,
+            mixer_dim=8,
+            depth=1,
+            hidden_part=6,
+            hidden_rank=7,
+            hidden_channel=12,
+            hidden_readout=4,
+        )
+
+        keys = set(adapter.state_dict().keys())
+        for key in (
+            "rank_emb",
+            "part_emb",
+            "w_q.weight",
+            "film_mlp.0.weight",
+            "film_ln.weight",
+            "blocks.0.part_mlp.0.weight",
+            "blocks.0.rank_mlp.0.weight",
+            "blocks.0.channel_mlp.0.weight",
+            "readout_mlp.0.weight",
+        ):
+            self.assertIn(key, keys)
+
+    def test_qcrs_mixer_variants_produce_context_and_remove_disabled_modules(self):
+        for variant in modules.QCRS_MIXER_VARIANTS:
+            with self.subTest(variant=variant):
+                cfg = modules.qcrs_mixer_variant_config(variant)
+                adapter = modules.RankPartQueryConditionedMixerAdapter(
+                    embed_dim=16,
+                    num_ranks=3,
+                    num_slots=5,
+                    mixer_dim=8,
+                    depth=1,
+                    hidden_part=6,
+                    hidden_rank=7,
+                    hidden_channel=12,
+                    hidden_readout=4,
+                    qcrs_mixer_variant=variant,
+                ).float()
+                z_q = torch.randn(2, 16, requires_grad=True)
+                B_q_M = torch.randn(2, 3, 5, 16, requires_grad=True)
+
+                c_q = adapter(z_q, B_q_M)
+
+                self.assertEqual(c_q.shape, (2, 16))
+                self.assertEqual(adapter.mixer_mode, cfg["mixer_mode"])
+                self.assertEqual(adapter.use_film, cfg["use_film"])
+                self.assertEqual(adapter.rank_emb is not None, cfg["use_rank_emb"])
+                self.assertEqual(adapter.part_emb is not None, cfg["use_slot_emb"])
+                self.assertEqual(hasattr(adapter, "w_q"), cfg["use_film"])
+                self.assertEqual(hasattr(adapter, "film_mlp"), cfg["use_film"])
+                self.assertEqual(hasattr(adapter, "readout_mlp"), cfg["mixer_mode"] == "qcrs")
+                self.assertEqual(hasattr(adapter, "flat_mlp"), cfg["mixer_mode"] == "flat_mlp")
+                self.assertEqual(len(adapter.blocks), 1 if cfg["mixer_mode"] == "qcrs" else 0)
+                if adapter.blocks:
+                    block = adapter.blocks[0]
+                    self.assertEqual(hasattr(block, "part_mlp"), cfg["use_slotmix"])
+                    self.assertEqual(hasattr(block, "rank_mlp"), cfg["use_rankmix"])
+                    self.assertEqual(hasattr(block, "channel_mlp"), cfg["use_chanmix"])
+                if cfg["use_film"]:
+                    self.assertIn("mixer/film_scale_mean", adapter.last_diagnostics)
+                else:
+                    self.assertNotIn("mixer/film_scale_mean", adapter.last_diagnostics)
+                c_q.sum().backward()
 
     def test_rank_part_mixer_rejects_removed_attention_pooling_modes(self):
         for context_pooling in ("late_attention", "hybrid_attention"):
@@ -296,6 +366,43 @@ class EnrichmentShapeTests(unittest.TestCase):
         self.assertNotIn("guard_loss", out)
         self.assertNotIn("gain_loss", out)
         out["total_loss"].backward()
+
+    def test_enricher_qcrs_mixer_variants_preserve_enriched_feature_shape(self):
+        cache = {
+            "host_image_features": torch.randn(4, 8),
+            "retrieval_features": torch.randn(4, 8),
+            "prototypes": torch.randn(4, 3, 8),
+            "pids": torch.tensor([0, 1, 0, 1]),
+        }
+        for variant in modules.QCRS_MIXER_VARIANTS:
+            with self.subTest(variant=variant):
+                enricher = modules.TargetPrototypeEnricher(
+                    8,
+                    16,
+                    args(
+                        top_m=2,
+                        extractor_mode="global,horizontal",
+                        num_parts=2,
+                        qcrs_mixer_variant=variant,
+                        mixer_dim=4,
+                        mixer_depth=1,
+                        mixer_hidden_part=3,
+                        mixer_hidden_rank=3,
+                        mixer_hidden_channel=8,
+                        mixer_hidden_readout=5,
+                    ),
+                ).float()
+                out = enricher(
+                    query_features=torch.randn(2, 8, requires_grad=True),
+                    host_text_features=torch.randn(2, 8),
+                    query_pids=torch.tensor([0, 1]),
+                    pool_cache=cache,
+                    space="global",
+                )
+
+                self.assertEqual(out["enriched_features"].shape, (2, 8))
+                self.assertEqual(out["top_indices"].shape, (2, 2))
+                self.assertTrue(torch.isfinite(out["total_loss"]))
 
     def test_enricher_uses_extractor_mode_slot_count(self):
         enricher = modules.TargetPrototypeEnricher(
@@ -1083,6 +1190,38 @@ class SchedulerOptionTests(unittest.TestCase):
         self.assertEqual(parsed.evidence_projection, "auto")
         self.assertEqual(parsed.wandb_project, "enrichment")
         self.assertFalse(parsed.delete_checkpoints_after_run)
+        self.assertEqual(parsed.qcrs_mixer_variant, "qcrs_full")
+        self.assertEqual(parsed.qcrs_mixer_mode, "qcrs")
+        self.assertTrue(parsed.qcrs_use_film)
+        self.assertTrue(parsed.qcrs_use_rank_emb)
+        self.assertTrue(parsed.qcrs_use_slot_emb)
+        self.assertTrue(parsed.qcrs_use_slotmix)
+        self.assertTrue(parsed.qcrs_use_rankmix)
+        self.assertTrue(parsed.qcrs_use_chanmix)
+
+    def test_qcrs_mixer_variant_cli_parses_and_derives_flags(self):
+        options = importlib.import_module("utils.options")
+        old_argv = sys.argv
+        try:
+            for variant in modules.QCRS_MIXER_VARIANTS:
+                with self.subTest(variant=variant):
+                    sys.argv = ["test", "--qcrs_mixer_variant", variant]
+                    parsed = options.get_args()
+                    cfg = modules.qcrs_mixer_variant_config(variant)
+                    self.assertEqual(parsed.qcrs_mixer_variant, variant)
+                    self.assertEqual(parsed.qcrs_mixer_mode, cfg["mixer_mode"])
+                    self.assertEqual(parsed.qcrs_use_film, cfg["use_film"])
+                    self.assertEqual(parsed.qcrs_use_rank_emb, cfg["use_rank_emb"])
+                    self.assertEqual(parsed.qcrs_use_slot_emb, cfg["use_slot_emb"])
+                    self.assertEqual(parsed.qcrs_use_slotmix, cfg["use_slotmix"])
+                    self.assertEqual(parsed.qcrs_use_rankmix, cfg["use_rankmix"])
+                    self.assertEqual(parsed.qcrs_use_chanmix, cfg["use_chanmix"])
+
+            sys.argv = ["test", "--qcrs_mixer_variant", "unknown"]
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                options.get_args()
+        finally:
+            sys.argv = old_argv
 
     def test_delete_checkpoints_after_run_cli_parses(self):
         options = importlib.import_module("utils.options")

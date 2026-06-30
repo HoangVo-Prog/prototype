@@ -11,6 +11,7 @@ from .prototypes import (
     evidence_slot_indices,
     prototype_slot_count,
 )
+from utils.qcrs_mixer_variants import qcrs_mixer_variant_config
 
 
 DEFAULT_RESIDUAL_GATE_INIT = 0.1
@@ -65,6 +66,8 @@ class TargetPrototypeEnricher(nn.Module):
         self.context_module = getattr(args, "context_module", "mixer")
         if self.context_module != "mixer":
             raise ValueError("--context_module must be mixer; attention context construction has been removed")
+        self.qcrs_mixer_variant = getattr(args, "qcrs_mixer_variant", "qcrs_full")
+        self.qcrs_mixer_config = qcrs_mixer_variant_config(self.qcrs_mixer_variant)
         self.enrichment_space = getattr(args, "enrichment_space", "global")
         if self.enrichment_space not in ("global", "grab"):
             raise ValueError("--enrichment_space must be either 'global' or 'grab'")
@@ -113,6 +116,7 @@ class TargetPrototypeEnricher(nn.Module):
             hidden_channel=getattr(args, "mixer_hidden_channel", 512),
             hidden_readout=getattr(args, "mixer_hidden_readout", 128),
             context_pooling=getattr(args, "context_pooling", "mlp"),
+            qcrs_mixer_variant=self.qcrs_mixer_variant,
         )
         if self.enable_global:
             self.global_context = RankPartQueryConditionedMixerAdapter(embed_dim, **mixer_kwargs)

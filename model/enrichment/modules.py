@@ -6,6 +6,7 @@ try:
         _RankPartMixerBlock,
         _two_layer_mlp,
     )
+    from utils.qcrs_mixer_variants import QCRS_MIXER_VARIANTS, qcrs_mixer_variant_config
     from .prototypes import (
         EXTRACTOR_MODES,
         TARGET_RELATIVE_MODES,
@@ -49,6 +50,7 @@ except ImportError:
     _FusionMLP = _mixer._FusionMLP
     _RankPartMixerBlock = _mixer._RankPartMixerBlock
     _two_layer_mlp = _mixer._two_layer_mlp
+    from utils.qcrs_mixer_variants import QCRS_MIXER_VARIANTS, qcrs_mixer_variant_config
     EXTRACTOR_MODES = _prototypes.EXTRACTOR_MODES
     TARGET_RELATIVE_MODES = _prototypes.TARGET_RELATIVE_MODES
     build_evidence_bank = _prototypes.build_evidence_bank
@@ -59,6 +61,7 @@ except ImportError:
 
 __all__ = [
     "EXTRACTOR_MODES",
+    "QCRS_MIXER_VARIANTS",
     "RankPartQueryConditionedMixerAdapter",
     "TARGET_RELATIVE_MODES",
     "TargetPrototypeEnricher",
@@ -67,4 +70,5 @@ __all__ = [
     "evidence_slot_indices",
     "finalize_target_evidence_cache",
     "prototype_slot_count",
+    "qcrs_mixer_variant_config",
 ]
