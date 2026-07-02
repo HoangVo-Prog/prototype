@@ -143,7 +143,7 @@ class ITSELF(nn.Module):
     def encode_image(self, image):
         x, _ = self.base_model.encode_image(image)
         return x[:, 0, :].float()
-      
+
     def encode_text(self, text):
         x, _ = self.base_model.encode_text(text.long())
         return x[torch.arange(x.shape[0]), text.argmax(dim=-1)].float()
@@ -158,17 +158,38 @@ class ITSELF(nn.Module):
         t_grab_f = self.texual_emb_layer(x, text, atten_t)
         return t_grab_f.float()
 
-    def encode_target_image_cache(self, image, cache_prototypes=True):
+    def encode_eval_text_bundle(self, text, include_grab=False):
+        x, atten_t = self.base_model.encode_text(text.long())
+        token_idx = text.argmax(dim=-1)
+        host_features = x[torch.arange(x.shape[0], device=x.device), token_idx].float()
+        bundle = {"host_features": host_features}
+        if include_grab:
+            bundle["grab_features"] = self.texual_emb_layer(x, text, atten_t).float()
+        return bundle
+
+    def encode_eval_image_bundle(self, image, include_grab=False, cache_target=False, cache_prototypes=True):
         image_feats, atten_i = self.base_model.encode_image(image)
         host_features = image_feats[:, 0, :].float()
-        cache = {"host_image_features": host_features}
-        if not cache_prototypes:
-            return cache
+        bundle = {"host_features": host_features}
 
         needs_grab_rank = getattr(self.args, "topm_rank_space", "host_global") == "hybrid_global_grab"
+        needs_grab_cache = cache_target and (
+            getattr(self.args, "enrichment_space", "global") == "grab" or needs_grab_rank
+        )
         grab_features = None
-        if getattr(self.args, "enrichment_space", "global") == "grab" or needs_grab_rank:
+        if include_grab or needs_grab_cache:
             grab_features = self.visul_emb_layer(image_feats, atten_i).float()
+        if include_grab:
+            bundle["grab_features"] = grab_features
+
+        if not cache_target:
+            return bundle
+
+        cache = {"host_image_features": host_features}
+        if not cache_prototypes:
+            bundle["target_cache"] = cache
+            return bundle
+
         if getattr(self.args, "enrichment_space", "global") == "grab":
             cache["retrieval_features"] = grab_features
         else:
@@ -203,7 +224,16 @@ class ITSELF(nn.Module):
                     "when retrieval feature dim differs from the shared evidence dim"
                 )
             cache["retrieval_backbone_features"] = cache["retrieval_features"]
-        return cache
+        bundle["target_cache"] = cache
+        return bundle
+
+    def encode_target_image_cache(self, image, cache_prototypes=True):
+        return self.encode_eval_image_bundle(
+            image,
+            include_grab=False,
+            cache_target=True,
+            cache_prototypes=cache_prototypes,
+        )["target_cache"]
 
     def finalize_target_cache(self, cache):
         return finalize_target_evidence_cache(cache, self.args, self.embed_dim)
