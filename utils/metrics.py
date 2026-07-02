@@ -293,6 +293,64 @@ class Evaluator():
         qfeats = torch.cat(qfeats, 0)
         return qfeats.cpu(), qids.cpu()
 
+    def _run_enrich_text_features(
+        self,
+        model,
+        target_cache,
+        host_text_feat,
+        grab_text_feat,
+    ):
+        query_feat = grab_text_feat if self.args.enrichment_space == "grab" else host_text_feat
+        with torch.no_grad():
+            return model.enrich_text_features(
+                query_feat,
+                host_text_feat,
+                target_cache,
+                grab_text_features=grab_text_feat,
+            ).cpu()
+
+    def _enrich_text_features_adaptive(
+        self,
+        model,
+        target_cache,
+        host_text_feat,
+        grab_text_feat,
+    ):
+        try:
+            return self._run_enrich_text_features(
+                model,
+                target_cache,
+                host_text_feat,
+                grab_text_feat,
+            )
+        except torch.cuda.OutOfMemoryError as error:
+            batch_size = host_text_feat.shape[0]
+            if batch_size <= 1:
+                raise
+            error.__traceback__ = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            split = batch_size // 2
+            self.logger.warning(
+                "CUDA OOM during enriched text evaluation for batch size {}; "
+                "retrying as {} + {}".format(batch_size, split, batch_size - split)
+            )
+            left_grab = grab_text_feat[:split] if grab_text_feat is not None else None
+            right_grab = grab_text_feat[split:] if grab_text_feat is not None else None
+            left = self._enrich_text_features_adaptive(
+                model,
+                target_cache,
+                host_text_feat[:split],
+                left_grab,
+            )
+            right = self._enrich_text_features_adaptive(
+                model,
+                target_cache,
+                host_text_feat[split:],
+                right_grab,
+            )
+            return torch.cat([left, right], dim=0)
+
     def _compute_enriched_text_embedding_from_features(
         self,
         model,
@@ -319,14 +377,12 @@ class Evaluator():
                 if grab_text_features is None:
                     raise ValueError("Target enrichment requires cached GRAB text features")
                 grab_text_feat = grab_text_features[offset:end].to(device)
-            query_feat = grab_text_feat if self.args.enrichment_space == "grab" else host_text_feat
-            with torch.no_grad():
-                text_feat = model.enrich_text_features(
-                    query_feat,
-                    host_text_feat,
-                    target_cache,
-                    grab_text_features=grab_text_feat,
-                ).cpu()
+            text_feat = self._enrich_text_features_adaptive(
+                model,
+                target_cache,
+                host_text_feat,
+                grab_text_feat,
+            )
             qfeats.append(text_feat)
             offset = end
 

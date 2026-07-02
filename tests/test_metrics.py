@@ -66,10 +66,11 @@ def _legacy_rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
 
 
 class _FakeAblationModel(torch.nn.Module):
-    def __init__(self, dim=8):
+    def __init__(self, dim=8, max_enrich_batch=None):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(1))
         self.dim = dim
+        self.max_enrich_batch = max_enrich_batch
         self.reset_counts()
 
     def reset_counts(self):
@@ -150,6 +151,11 @@ class _FakeAblationModel(torch.nn.Module):
         grab_text_features=None,
     ):
         self.enrich_text_calls += 1
+        if (
+            self.max_enrich_batch is not None
+            and host_text_features.shape[0] > self.max_enrich_batch
+        ):
+            raise torch.cuda.OutOfMemoryError("synthetic enrichment OOM")
         context = target_cache["host_image_features"].mean(dim=0, keepdim=True)
         return host_text_features + 0.05 * context
 
@@ -401,6 +407,43 @@ class RetrievalMetricTests(unittest.TestCase):
                 self.assertEqual(0, optimized_model.encode_text_grab_calls)
                 self.assertEqual(0, optimized_model.encode_image_grab_calls)
                 self.assertEqual(0, optimized_model.encode_target_image_cache_calls)
+
+    def test_enriched_eval_retries_smaller_chunks_after_cuda_oom(self):
+        args = SimpleNamespace(
+            only_global=False,
+            target_enrichment=True,
+            enrichment_space="global",
+            topm_rank_space="host_global",
+            eval_log_interval=0.0,
+        )
+
+        for module in (self.train_metrics, self.test_metrics):
+            with self.subTest(module=module.__name__):
+                img_loader, txt_loader = _fake_loaders()
+                expected_model = _FakeAblationModel()
+                expected_evaluator = module.Evaluator(img_loader, txt_loader, args)
+                expected_top1 = expected_evaluator.eval(
+                    expected_model,
+                    use_target_enrichment=True,
+                )
+
+                oom_model = _FakeAblationModel(max_enrich_batch=1)
+                oom_evaluator = module.Evaluator(img_loader, txt_loader, args)
+                actual_top1 = oom_evaluator.eval(
+                    oom_model,
+                    use_target_enrichment=True,
+                )
+
+                self.assertAlmostEqual(expected_top1, actual_top1, places=6)
+                self.assertEqual(expected_evaluator.last_best_task, oom_evaluator.last_best_task)
+                for key, expected_value in expected_evaluator.last_metrics.items():
+                    self.assertIn(key, oom_evaluator.last_metrics)
+                    self.assertAlmostEqual(
+                        expected_value,
+                        oom_evaluator.last_metrics[key],
+                        places=5,
+                    )
+                self.assertGreater(oom_model.enrich_text_calls, len(txt_loader))
 
 
 if __name__ == "__main__":
