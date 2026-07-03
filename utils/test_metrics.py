@@ -661,6 +661,8 @@ class Evaluator:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             split = batch_size // 2
+            current_limit = getattr(self, "_eval_enrich_batch_limit", batch_size)
+            self._eval_enrich_batch_limit = max(1, min(int(current_limit), int(split)))
             self.logger.warning(
                 "CUDA OOM during enriched text evaluation for batch size {}; "
                 "retrying as {} + {}".format(batch_size, split, batch_size - split)
@@ -697,6 +699,16 @@ class Evaluator:
             self.args.enrichment_space == "grab"
             or getattr(self.args, "topm_rank_space", "host_global") == "hybrid_global_grab"
         )
+        default_limit = 128 if needs_grab else max(batch_sizes)
+        configured_limit = getattr(self.args, "target_query_batch_size", None)
+        if configured_limit is None:
+            configured_limit = getattr(self, "_eval_enrich_batch_limit", default_limit)
+        eval_batch_limit = max(1, int(configured_limit))
+        self._eval_enrich_batch_limit = eval_batch_limit
+        if eval_batch_limit < max(batch_sizes):
+            self.logger.info(
+                "Target enrichment eval batch cap: %d query item(s)", eval_batch_limit
+            )
         stage_name = "enriched text embeddings from cached features"
         qfeats = []
         processed_items = 0
@@ -714,19 +726,23 @@ class Evaluator:
         offset = 0
         for batch_idx, batch_size in enumerate(batch_sizes, 1):
             end = offset + batch_size
-            host_text_feat = host_text_features[offset:end].to(device)
-            grab_text_feat = None
-            if needs_grab:
-                if grab_text_features is None:
-                    raise ValueError("Target enrichment requires cached GRAB text features")
-                grab_text_feat = grab_text_features[offset:end].to(device)
-            text_feat = self._enrich_text_features_adaptive(
-                model,
-                target_cache,
-                host_text_feat,
-                grab_text_feat,
-            )
-            qfeats.append(text_feat)
+            cursor = offset
+            while cursor < end:
+                sub_end = min(cursor + self._eval_enrich_batch_limit, end)
+                host_text_feat = host_text_features[cursor:sub_end].to(device)
+                grab_text_feat = None
+                if needs_grab:
+                    if grab_text_features is None:
+                        raise ValueError("Target enrichment requires cached GRAB text features")
+                    grab_text_feat = grab_text_features[cursor:sub_end].to(device)
+                text_feat = self._enrich_text_features_adaptive(
+                    model,
+                    target_cache,
+                    host_text_feat,
+                    grab_text_feat,
+                )
+                qfeats.append(text_feat)
+                cursor = sub_end
             processed_items += int(batch_size)
             offset = end
 

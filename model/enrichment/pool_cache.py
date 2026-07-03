@@ -120,7 +120,7 @@ class TargetPoolCacheMixin:
             max(1, getattr(self.args, "test_batch_size", 1)),
             max(1, query_features.shape[0]),
         )
-        with torch.inference_mode():
+        with torch.no_grad():
             for start in range(0, query_features.shape[0], batch_size):
                 query_chunk = query_features[start:start + batch_size]
                 query_chunk = F.normalize(query_chunk.float(), p=2, dim=-1)
@@ -302,7 +302,10 @@ class TargetPoolCacheMixin:
 
         chunks = []
         try:
-            with torch.inference_mode():
+            # These cache tensors feed trainable target-enrichment layers later.
+            # no_grad avoids host graph construction without creating PyTorch
+            # inference tensors that autograd refuses to save for projection grads.
+            with torch.no_grad():
                 for _, _, images in loader:
                     images = images.to(device)
                     chunk = core_model.encode_target_image_cache(images, cache_prototypes=cache_prototypes)
@@ -347,7 +350,7 @@ class TargetPoolCacheMixin:
 
         chunks = []
         try:
-            with torch.inference_mode():
+            with torch.no_grad():
                 for _, _, captions in loader:
                     captions = captions.to(device)
                     chunks.append(core_model.encode_text(captions).detach().cpu())
@@ -384,7 +387,7 @@ class TargetPoolCacheMixin:
 
         chunks = []
         try:
-            with torch.inference_mode():
+            with torch.no_grad():
                 for _, _, captions in loader:
                     captions = captions.to(device)
                     chunks.append(core_model.encode_text_grab(captions).detach().cpu())
