@@ -177,6 +177,10 @@ class TargetPrototypeEnricher(nn.Module):
             # when only top-M rows are needed for this batch.
             gathered = bank.detach().cpu().index_select(0, flat_indices.detach().cpu())
             gathered = gathered.to(device=top_indices.device, non_blocking=True)
+        if torch.is_inference(gathered):
+            # Gathered evidence flows through trainable projection layers during
+            # target-enrichment training, so it must be a normal tensor.
+            gathered = gathered.clone()
         return gathered.view(*top_indices.shape, *trailing_shape)
 
     def _cache_chunk(self, pool_cache, key, start, end, device):
