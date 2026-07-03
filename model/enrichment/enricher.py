@@ -22,6 +22,16 @@ def _masked_logsumexp(values, mask, dim):
     return torch.logsumexp(values.masked_fill(~mask, neg_inf), dim=dim)
 
 
+def _normal_tensor_for_trainable_op(tensor):
+    if not torch.is_inference(tensor):
+        return tensor
+    # Cached target-bank tensors are detached, but trainable Linear/LayerNorm
+    # modules still save their inputs for weight gradients. Cloning keeps the
+    # exact values while converting stale inference tensors to normal tensors.
+    with torch.inference_mode(False):
+        return tensor.clone()
+
+
 class _ResidualGateMLP(nn.Module):
     def __init__(self, dim, hidden_dim, initial_value=DEFAULT_RESIDUAL_GATE_INIT):
         super().__init__()
@@ -155,10 +165,11 @@ class TargetPrototypeEnricher(nn.Module):
             )
 
     def _project_prototypes(self, prototypes, space):
+        prototypes = _normal_tensor_for_trainable_op(prototypes.float())
         if space == "grab":
             self._require_grab()
-            prototypes = self.proto_to_grab(prototypes.float())
-        return F.normalize(prototypes.float(), p=2, dim=-1)
+            prototypes = self.proto_to_grab(prototypes)
+        return F.normalize(_normal_tensor_for_trainable_op(prototypes.float()), p=2, dim=-1)
 
     def _cache_tensor(self, pool_cache, key, device, dtype=torch.float32):
         # Target caches are detached banks. Keeping storage on CPU is safe because
@@ -286,7 +297,7 @@ class TargetPrototypeEnricher(nn.Module):
         return best_indices
 
     def _project_raw_vector_evidence(self, values):
-        values = values.float()
+        values = _normal_tensor_for_trainable_op(values.float())
         if values.shape[-1] == self.embed_dim:
             return values
         if not hasattr(self, "raw_vector_evidence_to_proto"):
@@ -306,7 +317,7 @@ class TargetPrototypeEnricher(nn.Module):
                 "call finalize_target_cache after merging the full target pool"
             )
 
-        updated = gathered.clone()
+        updated = _normal_tensor_for_trainable_op(gathered.float()).clone()
         vector_keys = {
             "retrieval_backbone": "retrieval_backbone_features",
             "cluster": "cluster_features",
@@ -317,7 +328,9 @@ class TargetPrototypeEnricher(nn.Module):
                 continue
             slot = self.evidence_slot_indices[mode][0]
             bank = pool_cache[key].detach()
-            selected = self._gather_bank(bank, top_indices, (bank.shape[-1],)).float()
+            selected = _normal_tensor_for_trainable_op(
+                self._gather_bank(bank, top_indices, (bank.shape[-1],)).float()
+            )
             projected = self._project_raw_vector_evidence(selected)
             updated[:, :, slot, :] = F.normalize(projected.float(), p=2, dim=-1)
 
@@ -329,17 +342,20 @@ class TargetPrototypeEnricher(nn.Module):
                 )
             slot = self.evidence_slot_indices[mode][0]
             bank = pool_cache[key].detach()
-            selected = self._gather_bank(bank, top_indices, (1,)).float()
-            projected = projector(selected.float())
+            selected = _normal_tensor_for_trainable_op(
+                self._gather_bank(bank, top_indices, (1,)).float()
+            )
+            projected = projector(selected)
             updated[:, :, slot, :] = F.normalize(projected.float(), p=2, dim=-1)
         return updated
 
     def _context(self, query_features, selected_prototypes, space):
+        selected_prototypes = _normal_tensor_for_trainable_op(selected_prototypes.float())
         if space == "grab":
             self._require_grab()
-            return self.grab_context(query_features.float(), selected_prototypes.float())
+            return self.grab_context(query_features.float(), selected_prototypes)
         self._require_global()
-        return self.global_context(query_features.float(), selected_prototypes.float())
+        return self.global_context(query_features.float(), selected_prototypes)
 
     def _context_diagnostics(self, space):
         if space == "grab":
