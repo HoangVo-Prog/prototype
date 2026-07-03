@@ -6,45 +6,6 @@ from utils.reproducibility import seed_worker, seeded_generator
 from .pool_common import _PoolImageDataset, _PoolTextDataset, _unwrap_model
 
 
-def _cache_tensor_summary(cache):
-    keys = (
-        "host_image_features",
-        "retrieval_features",
-        "grab_image_features",
-        "evidence_bank",
-        "prototypes",
-        "pids",
-        "top_indices",
-    )
-    parts = []
-    for key in keys:
-        value = cache.get(key)
-        if torch.is_tensor(value):
-            parts.append(
-                "{} shape={} device={} dtype={}".format(
-                    key,
-                    tuple(value.shape),
-                    value.device,
-                    value.dtype,
-                )
-            )
-    return "; ".join(parts)
-
-
-def _log_cuda_memory(logger, label):
-    if logger is None or not torch.cuda.is_available():
-        return
-    device = torch.cuda.current_device()
-    mib = 1024.0 ** 2
-    logger.info(
-        "CUDA memory %s: allocated=%.1fMiB reserved=%.1fMiB max_allocated=%.1fMiB",
-        label,
-        torch.cuda.memory_allocated(device) / mib,
-        torch.cuda.memory_reserved(device) / mib,
-        torch.cuda.max_memory_allocated(device) / mib,
-    )
-
-
 class TargetPoolCacheMixin:
     def _frozen_index_ready(self):
         return (
@@ -59,19 +20,18 @@ class TargetPoolCacheMixin:
         if not self.query_records:
             raise ValueError("Cannot build frozen indices from an empty training query set")
 
-        if self.logger is not None:
-            self.logger.info("Frozen target-pool cache miss: building full-gallery index")
         cache = self._encode_records(model, self.records, cache_prototypes=True)
+        device = cache["host_image_features"].device
         gallery_image_ids = torch.tensor(
             [record["image_id"] for record in self.records],
             dtype=torch.long,
             device="cpu",
         )
-        cache["image_ids"] = gallery_image_ids
+        cache["image_ids"] = gallery_image_ids.to(device)
         cache["pids"] = torch.tensor(
             [record["pid"] for record in self.records],
             dtype=torch.long,
-            device="cpu",
+            device=device,
         )
 
         rank_space = getattr(self.args, "topm_rank_space", "host_global")
@@ -122,10 +82,10 @@ class TargetPoolCacheMixin:
         )
         with torch.no_grad():
             for start in range(0, query_features.shape[0], batch_size):
-                query_chunk = query_features[start:start + batch_size]
+                query_chunk = query_features[start:start + batch_size].to(device)
                 query_chunk = F.normalize(query_chunk.float(), p=2, dim=-1)
                 if rank_space == "hybrid_global_grab":
-                    grab_query_chunk = grab_query_features[start:start + batch_size]
+                    grab_query_chunk = grab_query_features[start:start + batch_size].to(device)
                     grab_query_chunk = F.normalize(grab_query_chunk.float(), p=2, dim=-1)
                     global_scores = query_chunk @ host_image_features.t()
                     grab_scores = grab_query_chunk @ grab_image_features.t()
@@ -150,8 +110,6 @@ class TargetPoolCacheMixin:
                     rank_depth,
                 )
             )
-            self.logger.info("Frozen target-pool cache tensors: %s", _cache_tensor_summary(self.frozen_cache))
-            _log_cuda_memory(self.logger, "after frozen target-pool build")
 
     def _coerce_frozen_query_indices(self, query_indices):
         if not torch.is_tensor(query_indices):
@@ -186,17 +144,11 @@ class TargetPoolCacheMixin:
     def _frozen_batch_cache(self, batch):
         if self.frozen_cache is None:
             raise ValueError("Frozen full-gallery cache is not available")
-        if self.logger is not None:
-            self.logger.debug(
-                "Frozen target-pool cache hit: requests={} images={}".format(
-                    self.frozen_cache_requests,
-                    self.frozen_cache["pids"].numel(),
-                )
-            )
+        device = self.frozen_cache["host_image_features"].device
         query_indices = self._frozen_query_indices(batch)
 
         top_m = min(int(getattr(self.args, "top_m", 1)), self.frozen_index_depth)
-        top_indices = self.frozen_rank_indices.index_select(0, query_indices)[:, :top_m]
+        top_indices = self.frozen_rank_indices.index_select(0, query_indices)[:, :top_m].to(device)
 
         diagnostics = {
             "pool_interval_id": 0.0,
@@ -214,21 +166,7 @@ class TargetPoolCacheMixin:
 
     def _full_training_set_cache(self, model, epoch, step):
         if self._should_refresh_full_training_set_cache(epoch, step):
-            if self.logger is not None:
-                self.logger.info(
-                    "Target-pool cache miss: interval={} previous_interval={}".format(
-                        self._interval_id(epoch, step),
-                        self.full_training_interval_id,
-                    )
-                )
             self._build_full_training_set_cache(model, epoch, step)
-        elif self.logger is not None:
-            self.logger.debug(
-                "Target-pool cache hit: interval={} images={}".format(
-                    self.full_training_interval_id,
-                    len(self.records),
-                )
-            )
 
         diagnostics = dict(self.full_training_cache["diagnostics"])
         diagnostics["pool_interval_reused"] = float(self.full_training_cache_requests > 0)
@@ -254,16 +192,17 @@ class TargetPoolCacheMixin:
 
         interval_id = self._interval_id(epoch, step)
         cache = self._encode_records(model, self.records, cache_prototypes=True)
+        device = cache["host_image_features"].device
         cache_size = len(self.records)
         cache["image_ids"] = torch.tensor(
             [record["image_id"] for record in self.records],
             dtype=torch.long,
-            device="cpu",
+            device=device,
         )
         cache["pids"] = torch.tensor(
             [record["pid"] for record in self.records],
             dtype=torch.long,
-            device="cpu",
+            device=device,
         )
         cache["diagnostics"] = {
             "pool_interval_id": float(interval_id),
@@ -282,8 +221,6 @@ class TargetPoolCacheMixin:
                     getattr(self.args, "top_m", 1),
                 )
             )
-            self.logger.info("Target-pool cache tensors: %s", _cache_tensor_summary(self.full_training_cache))
-            _log_cuda_memory(self.logger, "after target-pool cache build")
 
     def _encode_records(self, model, records, cache_prototypes=True):
         core_model = _unwrap_model(model)
@@ -301,20 +238,13 @@ class TargetPoolCacheMixin:
         )
 
         chunks = []
-        try:
-            # These cache tensors feed trainable target-enrichment layers later.
-            # no_grad avoids host graph construction without creating PyTorch
-            # inference tensors that autograd refuses to save for projection grads.
-            with torch.no_grad():
-                for _, _, images in loader:
-                    images = images.to(device)
-                    chunk = core_model.encode_target_image_cache(images, cache_prototypes=cache_prototypes)
-                    # The pool cache is a detached target bank. Store chunks on CPU
-                    # immediately so repeated target-cache use does not pin GPU memory.
-                    chunks.append({key: value.detach().cpu() for key, value in chunk.items()})
-        finally:
-            if was_training:
-                core_model.train()
+        with torch.no_grad():
+            for _, _, images in loader:
+                images = images.to(device)
+                chunks.append(core_model.encode_target_image_cache(images, cache_prototypes=cache_prototypes))
+
+        if was_training:
+            core_model.train()
 
         merged = {}
         for key in chunks[0].keys():
@@ -349,14 +279,13 @@ class TargetPoolCacheMixin:
         )
 
         chunks = []
-        try:
-            with torch.no_grad():
-                for _, _, captions in loader:
-                    captions = captions.to(device)
-                    chunks.append(core_model.encode_text(captions).detach().cpu())
-        finally:
-            if was_training:
-                core_model.train()
+        with torch.no_grad():
+            for _, _, captions in loader:
+                captions = captions.to(device)
+                chunks.append(core_model.encode_text(captions).detach().cpu())
+
+        if was_training:
+            core_model.train()
 
         return torch.cat(chunks, dim=0)
 
@@ -386,13 +315,12 @@ class TargetPoolCacheMixin:
         )
 
         chunks = []
-        try:
-            with torch.no_grad():
-                for _, _, captions in loader:
-                    captions = captions.to(device)
-                    chunks.append(core_model.encode_text_grab(captions).detach().cpu())
-        finally:
-            if was_training:
-                core_model.train()
+        with torch.no_grad():
+            for _, _, captions in loader:
+                captions = captions.to(device)
+                chunks.append(core_model.encode_text_grab(captions).detach().cpu())
+
+        if was_training:
+            core_model.train()
 
         return torch.cat(chunks, dim=0)

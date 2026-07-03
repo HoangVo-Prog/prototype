@@ -267,10 +267,6 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             model.eval(),
             use_target_enrichment=_target_enrichment_active(args, start_epoch),
         )
-        # Evaluation builds full-gallery score tables; clear the allocator once
-        # those local tensors have been released.
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         if get_rank() == 0:
             initial_metrics = dict(getattr(evaluator, "last_metrics", {}))
             initial_metrics["eval/top_R1"] = initial_top1
@@ -408,8 +404,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 if "eval/ablation_best_R1" in eval_metrics:
                     eval_metrics["eval/best_ablation_R1"] = now_top1
                 log_wandb(wandb_run, eval_metrics, step=current_steps, epoch=epoch)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
                 if best_top1 < top1:
                     best_top1 = top1
                     arguments["epoch"] = epoch
@@ -421,8 +416,6 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
  
     if get_rank() == 0:
         logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
-
-                   
 def do_inference(model, test_img_loader, test_txt_loader, args):
 
     logger = logging.getLogger("ITSELF.test")
@@ -430,5 +423,3 @@ def do_inference(model, test_img_loader, test_txt_loader, args):
 
     evaluator = Evaluator(test_img_loader, test_txt_loader, args)
     _ = evaluator.eval(model.eval())
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()

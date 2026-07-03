@@ -131,47 +131,6 @@ def _clear_cuda_cache_if_available():
         torch.cuda.empty_cache()
 
 
-def _log_cuda_memory(logger, label):
-    if not torch.cuda.is_available():
-        return
-    device = torch.cuda.current_device()
-    mib = 1024.0 ** 2
-    logger.info(
-        "CUDA memory %s: allocated=%.1fMiB reserved=%.1fMiB max_allocated=%.1fMiB",
-        label,
-        torch.cuda.memory_allocated(device) / mib,
-        torch.cuda.memory_reserved(device) / mib,
-        torch.cuda.max_memory_allocated(device) / mib,
-    )
-
-
-def _log_cache_tensors(logger, label, cache):
-    if not isinstance(cache, dict):
-        return
-    keys = (
-        "host_image_features",
-        "retrieval_features",
-        "grab_image_features",
-        "evidence_bank",
-        "prototypes",
-        "pids",
-    )
-    parts = []
-    for key in keys:
-        value = cache.get(key)
-        if torch.is_tensor(value):
-            parts.append(
-                "{} shape={} device={} dtype={}".format(
-                    key,
-                    tuple(value.shape),
-                    value.device,
-                    value.dtype,
-                )
-            )
-    if parts:
-        logger.info("%s cache tensors: %s", label, "; ".join(parts))
-
-
 class Evaluator:
     def __init__(self, img_loader, txt_loader, args):
         self.img_loader = img_loader
@@ -259,7 +218,7 @@ class Evaluator:
 
         for batch_idx, (pid, payload) in enumerate(loader, 1):
             payload = payload.to(device)
-            with torch.inference_mode():
+            with torch.no_grad():
                 feat = encoder_fn(payload).cpu()
             ids.append(pid.view(-1))
             features.append(feat)
@@ -320,14 +279,11 @@ class Evaluator:
             target_cache[key] = torch.cat(
                 [chunk[key] for chunk in cache_chunks],
                 dim=0,
-            ).detach().cpu()
-        # The target gallery is an inference-only bank. CPU storage prevents
-        # ablation scoring from retaining a full gallery cache on GPU.
-        target_cache["pids"] = gids.detach().cpu()
+            ).to(device)
+        target_cache["pids"] = gids.to(device)
         core_model = self._core_model(model)
         if hasattr(core_model, "finalize_target_cache"):
             target_cache = core_model.finalize_target_cache(target_cache)
-        _log_cache_tensors(self.logger, "Evaluation target gallery", target_cache)
         return target_cache
 
     def _branch_stage_name(self, modality, include_grab, include_target_cache=False):
@@ -362,7 +318,7 @@ class Evaluator:
 
         for batch_idx, (pid, caption) in enumerate(self.txt_loader, 1):
             caption = caption.to(device)
-            with torch.inference_mode():
+            with torch.no_grad():
                 if hasattr(core_model, "encode_eval_text_bundle"):
                     bundle = core_model.encode_eval_text_bundle(
                         caption,
@@ -456,7 +412,7 @@ class Evaluator:
 
         for batch_idx, (pid, img) in enumerate(self.img_loader, 1):
             img = img.to(device)
-            with torch.inference_mode():
+            with torch.no_grad():
                 if hasattr(core_model, "encode_eval_image_bundle"):
                     bundle = core_model.encode_eval_image_bundle(
                         img,
@@ -571,7 +527,7 @@ class Evaluator:
 
         for batch_idx, (pid, caption) in enumerate(self.txt_loader, 1):
             caption = caption.to(device)
-            with torch.inference_mode():
+            with torch.no_grad():
                 host_text_feat = model.encode_text(caption)
                 grab_text_feat = None
                 if (
@@ -631,7 +587,7 @@ class Evaluator:
         grab_text_feat,
     ):
         query_feat = grab_text_feat if self.args.enrichment_space == "grab" else host_text_feat
-        with torch.inference_mode():
+        with torch.no_grad():
             return model.enrich_text_features(
                 query_feat,
                 host_text_feat,
@@ -661,8 +617,6 @@ class Evaluator:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             split = batch_size // 2
-            current_limit = getattr(self, "_eval_enrich_batch_limit", batch_size)
-            self._eval_enrich_batch_limit = max(1, min(int(current_limit), int(split)))
             self.logger.warning(
                 "CUDA OOM during enriched text evaluation for batch size {}; "
                 "retrying as {} + {}".format(batch_size, split, batch_size - split)
@@ -699,16 +653,6 @@ class Evaluator:
             self.args.enrichment_space == "grab"
             or getattr(self.args, "topm_rank_space", "host_global") == "hybrid_global_grab"
         )
-        default_limit = 128 if needs_grab else max(batch_sizes)
-        configured_limit = getattr(self.args, "target_query_batch_size", None)
-        if configured_limit is None:
-            configured_limit = getattr(self, "_eval_enrich_batch_limit", default_limit)
-        eval_batch_limit = max(1, int(configured_limit))
-        self._eval_enrich_batch_limit = eval_batch_limit
-        if eval_batch_limit < max(batch_sizes):
-            self.logger.info(
-                "Target enrichment eval batch cap: %d query item(s)", eval_batch_limit
-            )
         stage_name = "enriched text embeddings from cached features"
         qfeats = []
         processed_items = 0
@@ -726,23 +670,19 @@ class Evaluator:
         offset = 0
         for batch_idx, batch_size in enumerate(batch_sizes, 1):
             end = offset + batch_size
-            cursor = offset
-            while cursor < end:
-                sub_end = min(cursor + self._eval_enrich_batch_limit, end)
-                host_text_feat = host_text_features[cursor:sub_end].to(device)
-                grab_text_feat = None
-                if needs_grab:
-                    if grab_text_features is None:
-                        raise ValueError("Target enrichment requires cached GRAB text features")
-                    grab_text_feat = grab_text_features[cursor:sub_end].to(device)
-                text_feat = self._enrich_text_features_adaptive(
-                    model,
-                    target_cache,
-                    host_text_feat,
-                    grab_text_feat,
-                )
-                qfeats.append(text_feat)
-                cursor = sub_end
+            host_text_feat = host_text_features[offset:end].to(device)
+            grab_text_feat = None
+            if needs_grab:
+                if grab_text_features is None:
+                    raise ValueError("Target enrichment requires cached GRAB text features")
+                grab_text_feat = grab_text_features[offset:end].to(device)
+            text_feat = self._enrich_text_features_adaptive(
+                model,
+                target_cache,
+                host_text_feat,
+                grab_text_feat,
+            )
+            qfeats.append(text_feat)
             processed_items += int(batch_size)
             offset = end
 
@@ -818,7 +758,6 @@ class Evaluator:
             use_target_enrichment = getattr(self.args, "target_enrichment", False)
 
         self.logger.info("Starting evaluation feature extraction")
-        _log_cuda_memory(self.logger, "before evaluation")
         include_grab = not self.args.only_global
         host_qfeats, grab_qfeats, qids, text_batch_sizes = self._compute_text_branches(
             model,
@@ -838,7 +777,6 @@ class Evaluator:
                 gfeats.shape[0],
             )
         )
-        _log_cuda_memory(self.logger, "after evaluation feature extraction")
 
         sims_grab = None
         if include_grab:
@@ -867,7 +805,6 @@ class Evaluator:
             _clear_cuda_cache_if_available()
             self.logger.info("Released target gallery cache from GPU memory")
             self.logger.info("Target-aware similarity matrix ready")
-            _log_cuda_memory(self.logger, "after target gallery release")
 
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP", "rSum"])
 
@@ -883,7 +820,7 @@ class Evaluator:
         total_eval_tasks = len(base_tasks)
         if sims_target is not None:
             total_eval_tasks *= 1 + len(_prototype_lambdas())
-        self.logger.info("Scoring {} evaluation tasks sequentially".format(total_eval_tasks))
+        self.logger.info("Scoring {} evaluation tasks".format(total_eval_tasks))
         task_start_time = time.monotonic()
         last_task_log_time = task_start_time
 
@@ -1011,6 +948,4 @@ class Evaluator:
         if best_task is not None:
             self.logger.info("best R1 row = {}".format(best_task))
 
-        _clear_cuda_cache_if_available()
-        _log_cuda_memory(self.logger, "after evaluation")
         return top1

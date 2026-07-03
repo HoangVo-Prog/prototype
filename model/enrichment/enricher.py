@@ -22,16 +22,6 @@ def _masked_logsumexp(values, mask, dim):
     return torch.logsumexp(values.masked_fill(~mask, neg_inf), dim=dim)
 
 
-def _normal_tensor_for_trainable_op(tensor):
-    if not torch.is_inference(tensor):
-        return tensor
-    # Cached target-bank tensors are detached, but trainable Linear/LayerNorm
-    # modules still save their inputs for weight gradients. Cloning keeps the
-    # exact values while converting stale inference tensors to normal tensors.
-    with torch.inference_mode(False):
-        return tensor.clone()
-
-
 class _ResidualGateMLP(nn.Module):
     def __init__(self, dim, hidden_dim, initial_value=DEFAULT_RESIDUAL_GATE_INIT):
         super().__init__()
@@ -90,16 +80,6 @@ class TargetPrototypeEnricher(nn.Module):
             raise ValueError("--topm_rank_space hybrid_global_grab requires GRAB features; remove --only_global")
         self.enable_global = self.enrichment_space == "global"
         self.enable_grab = self.enrichment_space == "grab"
-        self.rank_chunk_size = max(
-            1,
-            int(
-                getattr(
-                    args,
-                    "target_rank_chunk_size",
-                    getattr(args, "target_cache_batch_size", getattr(args, "test_batch_size", 512)),
-                )
-            ),
-        )
 
         self.extractor_mode = getattr(args, "extractor_mode", "global,horizontal")
         self.num_parts = getattr(args, "num_parts", 6)
@@ -165,139 +145,18 @@ class TargetPrototypeEnricher(nn.Module):
             )
 
     def _project_prototypes(self, prototypes, space):
-        prototypes = _normal_tensor_for_trainable_op(prototypes.float())
         if space == "grab":
             self._require_grab()
-            prototypes = self.proto_to_grab(prototypes)
-        return F.normalize(_normal_tensor_for_trainable_op(prototypes.float()), p=2, dim=-1)
-
-    def _cache_tensor(self, pool_cache, key, device, dtype=torch.float32):
-        # Target caches are detached banks. Keeping storage on CPU is safe because
-        # no gradients should flow into cached gallery features.
-        tensor = pool_cache[key].detach()
-        if torch.is_inference(tensor):
-            tensor = tensor.clone()
-        return tensor.to(device=device, dtype=dtype, non_blocking=True)
+            prototypes = self.proto_to_grab(prototypes.float())
+        return F.normalize(prototypes.float(), p=2, dim=-1)
 
     def _gather_bank(self, bank, top_indices, trailing_shape):
-        flat_indices = top_indices.reshape(-1)
-        if bank.device == top_indices.device:
-            gathered = bank.detach().index_select(0, flat_indices)
-        else:
-            # Select from CPU first so a full evidence bank is not copied to GPU
-            # when only top-M rows are needed for this batch.
-            gathered = bank.detach().cpu().index_select(0, flat_indices.detach().cpu())
-            gathered = gathered.to(device=top_indices.device, non_blocking=True)
-        if torch.is_inference(gathered):
-            # Gathered evidence flows through trainable projection layers during
-            # target-enrichment training, so it must be a normal tensor.
-            gathered = gathered.clone()
+        bank = bank.to(device=top_indices.device)
+        gathered = bank.index_select(0, top_indices.reshape(-1))
         return gathered.view(*top_indices.shape, *trailing_shape)
 
-    def _cache_chunk(self, pool_cache, key, start, end, device):
-        tensor = pool_cache[key][start:end].detach()
-        if torch.is_inference(tensor):
-            tensor = tensor.clone()
-        return tensor.to(device=device, dtype=torch.float32, non_blocking=True)
-
-    def _chunked_top_indices_from_cache(
-        self,
-        query_features,
-        host_text_features,
-        pool_cache,
-        space,
-        grab_text_features=None,
-    ):
-        pool_size = int(pool_cache["host_image_features"].shape[0])
-        top_m = min(self.top_m, pool_size)
-        if top_m < 1:
-            raise ValueError("target pool must contain at least one image")
-
-        supplied = pool_cache.get("top_indices")
-        if supplied is not None:
-            top_indices = supplied.long()
-            if top_indices.dim() != 2:
-                raise ValueError("pool_cache['top_indices'] must have shape [batch, top_m]")
-            if top_indices.shape[0] != host_text_features.shape[0]:
-                raise ValueError("pool_cache['top_indices'] batch size must match query batch size")
-            top_indices = top_indices[:, :min(top_m, top_indices.shape[1])].to(host_text_features.device)
-            if int(top_indices.min().item()) < 0 or int(top_indices.max().item()) >= pool_size:
-                raise ValueError("pool_cache['top_indices'] contains indices outside the target pool")
-            return top_indices
-
-        device = host_text_features.device
-        best_scores = None
-        best_indices = None
-        with torch.no_grad():
-            for start in range(0, pool_size, self.rank_chunk_size):
-                end = min(start + self.rank_chunk_size, pool_size)
-                host_chunk = F.normalize(
-                    self._cache_chunk(pool_cache, "host_image_features", start, end, device),
-                    p=2,
-                    dim=-1,
-                )
-                if self.topm_rank_space == "host_global":
-                    scores = host_text_features @ host_chunk.t()
-                elif self.topm_rank_space == "retrieval":
-                    retrieval_chunk = F.normalize(
-                        self._cache_chunk(pool_cache, "retrieval_features", start, end, device),
-                        p=2,
-                        dim=-1,
-                    )
-                    if query_features.shape[-1] != retrieval_chunk.shape[-1]:
-                        raise ValueError(
-                            "--topm_rank_space retrieval requires query_features and "
-                            "pool_cache['retrieval_features'] to have the same dimension"
-                        )
-                    scores = query_features @ retrieval_chunk.t()
-                else:
-                    if grab_text_features is None:
-                        if space == "grab":
-                            grab_text_features = query_features
-                        else:
-                            raise ValueError(
-                                "--topm_rank_space hybrid_global_grab requires GRAB text features"
-                            )
-                    grab_key = "grab_image_features"
-                    if grab_key not in pool_cache:
-                        grab_key = "retrieval_features"
-                    grab_chunk = F.normalize(
-                        self._cache_chunk(pool_cache, grab_key, start, end, device),
-                        p=2,
-                        dim=-1,
-                    )
-                    grab_text = F.normalize(grab_text_features.float(), p=2, dim=-1)
-                    if grab_text.shape[-1] != grab_chunk.shape[-1]:
-                        raise ValueError(
-                            "--topm_rank_space hybrid_global_grab requires GRAB text/image "
-                            "features to have the same dimension"
-                        )
-                    global_scores = host_text_features @ host_chunk.t()
-                    grab_scores = grab_text @ grab_chunk.t()
-                    scores = self.topm_rank_lambda * global_scores + (1.0 - self.topm_rank_lambda) * grab_scores
-
-                chunk_k = min(top_m, scores.shape[1])
-                chunk_scores, chunk_indices = scores.topk(k=chunk_k, dim=1, largest=True, sorted=True)
-                chunk_indices = chunk_indices + start
-                if best_scores is None:
-                    best_scores = chunk_scores
-                    best_indices = chunk_indices
-                else:
-                    merged_scores = torch.cat([best_scores, chunk_scores], dim=1)
-                    merged_indices = torch.cat([best_indices, chunk_indices], dim=1)
-                    keep_scores, keep_positions = merged_scores.topk(
-                        k=min(top_m, merged_scores.shape[1]),
-                        dim=1,
-                        largest=True,
-                        sorted=True,
-                    )
-                    best_scores = keep_scores
-                    best_indices = merged_indices.gather(1, keep_positions)
-                del scores, chunk_scores, chunk_indices, host_chunk
-        return best_indices
-
     def _project_raw_vector_evidence(self, values):
-        values = _normal_tensor_for_trainable_op(values.float())
+        values = values.float()
         if values.shape[-1] == self.embed_dim:
             return values
         if not hasattr(self, "raw_vector_evidence_to_proto"):
@@ -317,7 +176,7 @@ class TargetPrototypeEnricher(nn.Module):
                 "call finalize_target_cache after merging the full target pool"
             )
 
-        updated = _normal_tensor_for_trainable_op(gathered.float()).clone()
+        updated = gathered.clone()
         vector_keys = {
             "retrieval_backbone": "retrieval_backbone_features",
             "cluster": "cluster_features",
@@ -327,10 +186,8 @@ class TargetPrototypeEnricher(nn.Module):
             if mode not in self.evidence_slot_indices or key not in pool_cache:
                 continue
             slot = self.evidence_slot_indices[mode][0]
-            bank = pool_cache[key].detach()
-            selected = _normal_tensor_for_trainable_op(
-                self._gather_bank(bank, top_indices, (bank.shape[-1],)).float()
-            )
+            bank = pool_cache[key].float()
+            selected = self._gather_bank(bank, top_indices, (bank.shape[-1],))
             projected = self._project_raw_vector_evidence(selected)
             updated[:, :, slot, :] = F.normalize(projected.float(), p=2, dim=-1)
 
@@ -341,21 +198,18 @@ class TargetPrototypeEnricher(nn.Module):
                     f"--extractor_mode {mode} requires finalized target cache key '{key}'"
                 )
             slot = self.evidence_slot_indices[mode][0]
-            bank = pool_cache[key].detach()
-            selected = _normal_tensor_for_trainable_op(
-                self._gather_bank(bank, top_indices, (1,)).float()
-            )
-            projected = projector(selected)
+            bank = pool_cache[key].float()
+            selected = self._gather_bank(bank, top_indices, (1,))
+            projected = projector(selected.float())
             updated[:, :, slot, :] = F.normalize(projected.float(), p=2, dim=-1)
         return updated
 
     def _context(self, query_features, selected_prototypes, space):
-        selected_prototypes = _normal_tensor_for_trainable_op(selected_prototypes.float())
         if space == "grab":
             self._require_grab()
-            return self.grab_context(query_features.float(), selected_prototypes)
+            return self.grab_context(query_features.float(), selected_prototypes.float())
         self._require_global()
-        return self.global_context(query_features.float(), selected_prototypes)
+        return self.global_context(query_features.float(), selected_prototypes.float())
 
     def _context_diagnostics(self, space):
         if space == "grab":
@@ -430,10 +284,6 @@ class TargetPrototypeEnricher(nn.Module):
                     "--topm_rank_space hybrid_global_grab requires "
                     "pool_cache['grab_image_features']"
                 )
-        grab_image_features = grab_image_features.detach().to(
-            device=grab_text_features.device,
-            non_blocking=True,
-        )
         grab_text_features = F.normalize(grab_text_features.float(), p=2, dim=-1)
         grab_image_features = F.normalize(grab_image_features.float(), p=2, dim=-1)
         if grab_text_features.shape[-1] != grab_image_features.shape[-1]:
@@ -485,22 +335,10 @@ class TargetPrototypeEnricher(nn.Module):
             return host_scores.topk(k=top_m, dim=1, largest=True, sorted=True).indices
 
     def forward(self, query_features, host_text_features, query_pids, pool_cache, space, grab_text_features=None):
-        device = query_features.device
-        host_image_features = F.normalize(
-            self._cache_tensor(pool_cache, "host_image_features", device),
-            p=2,
-            dim=-1,
-        )
-        retrieval_features = F.normalize(
-            self._cache_tensor(pool_cache, "retrieval_features", device),
-            p=2,
-            dim=-1,
-        )
-        prototypes = pool_cache.get("evidence_bank")
-        if prototypes is None:
-            prototypes = pool_cache["prototypes"]
-        prototypes = prototypes.detach()
-        pool_pids = self._cache_tensor(pool_cache, "pids", device, dtype=torch.long)
+        host_image_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
+        retrieval_features = F.normalize(pool_cache["retrieval_features"].float(), p=2, dim=-1)
+        prototypes = pool_cache.get("evidence_bank", pool_cache["prototypes"]).float()
+        pool_pids = pool_cache["pids"].long()
 
         normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
         host_text_features = F.normalize(host_text_features.float(), p=2, dim=-1)
@@ -514,11 +352,7 @@ class TargetPrototypeEnricher(nn.Module):
             grab_text_features=grab_text_features,
         )
 
-        gathered = self._gather_bank(
-            prototypes,
-            top_indices,
-            (prototypes.shape[1], prototypes.shape[2]),
-        ).float()
+        gathered = prototypes[top_indices]
         gathered = self._apply_auxiliary_evidence(gathered, top_indices, pool_cache)
         selected_prototypes = self._project_prototypes(gathered, space)
 
@@ -553,28 +387,22 @@ class TargetPrototypeEnricher(nn.Module):
         }
 
     def enrich_only(self, query_features, host_text_features, pool_cache, space, grab_text_features=None):
-        prototypes = pool_cache.get("evidence_bank")
-        if prototypes is None:
-            prototypes = pool_cache["prototypes"]
-        prototypes = prototypes.detach()
+        host_image_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
+        retrieval_features = F.normalize(pool_cache["retrieval_features"].float(), p=2, dim=-1)
+        prototypes = pool_cache.get("evidence_bank", pool_cache["prototypes"]).float()
         normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
         host_text_features = F.normalize(host_text_features.float(), p=2, dim=-1)
-        # Evaluation/inference needs only enriched text features. Streaming the
-        # full-gallery ranking keeps the same candidate set without keeping the
-        # full GRAB gallery bank resident on GPU.
-        top_indices = self._chunked_top_indices_from_cache(
+        top_indices = self._top_indices(
             query_features=normalized_query,
             host_text_features=host_text_features,
+            host_image_features=host_image_features,
+            retrieval_features=retrieval_features,
             pool_cache=pool_cache,
             space=space,
             grab_text_features=grab_text_features,
         )
 
-        gathered = self._gather_bank(
-            prototypes,
-            top_indices,
-            (prototypes.shape[1], prototypes.shape[2]),
-        ).float()
+        gathered = prototypes[top_indices]
         gathered = self._apply_auxiliary_evidence(gathered, top_indices, pool_cache)
         selected_prototypes = self._project_prototypes(gathered, space)
         context = self._context(normalized_query, selected_prototypes, space)
