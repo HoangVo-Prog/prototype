@@ -112,6 +112,52 @@ def _ablation_lambda_from_key(key):
     return float(match.group(1)) if match else 0.0
 
 
+def _clear_cuda_cache_if_available():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _log_cuda_memory(logger, label):
+    if not torch.cuda.is_available():
+        return
+    device = torch.cuda.current_device()
+    mib = 1024.0 ** 2
+    logger.info(
+        "CUDA memory %s: allocated=%.1fMiB reserved=%.1fMiB max_allocated=%.1fMiB",
+        label,
+        torch.cuda.memory_allocated(device) / mib,
+        torch.cuda.memory_reserved(device) / mib,
+        torch.cuda.max_memory_allocated(device) / mib,
+    )
+
+
+def _log_cache_tensors(logger, label, cache):
+    if not isinstance(cache, dict):
+        return
+    keys = (
+        "host_image_features",
+        "retrieval_features",
+        "grab_image_features",
+        "evidence_bank",
+        "prototypes",
+        "pids",
+    )
+    parts = []
+    for key in keys:
+        value = cache.get(key)
+        if torch.is_tensor(value):
+            parts.append(
+                "{} shape={} device={} dtype={}".format(
+                    key,
+                    tuple(value.shape),
+                    value.device,
+                    value.dtype,
+                )
+            )
+    if parts:
+        logger.info("%s cache tensors: %s", label, "; ".join(parts))
+
+
 class Evaluator():
     def __init__(self, img_loader, txt_loader, args):
         self.img_loader = img_loader # gallery
@@ -133,11 +179,14 @@ class Evaluator():
             target_cache[key] = torch.cat(
                 [chunk[key] for chunk in cache_chunks],
                 dim=0,
-            ).to(device)
-        target_cache["pids"] = gids.to(device)
+            ).detach().cpu()
+        # The evaluator only needs a detached gallery bank. Keeping it on CPU
+        # avoids retaining gallery-sized tensors on GPU across ablation rows.
+        target_cache["pids"] = gids.detach().cpu()
         core_model = self._core_model(model)
         if hasattr(core_model, "finalize_target_cache"):
             target_cache = core_model.finalize_target_cache(target_cache)
+        _log_cache_tensors(self.logger, "Evaluation target gallery", target_cache)
         return target_cache
 
     def _compute_text_branches(self, model, include_grab=False):
@@ -148,7 +197,7 @@ class Evaluator():
         qids, host_feats, grab_feats, batch_sizes = [], [], [], []
         for pid, caption in self.txt_loader:
             caption = caption.to(device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 if hasattr(core_model, "encode_eval_text_bundle"):
                     bundle = core_model.encode_eval_text_bundle(
                         caption,
@@ -191,7 +240,7 @@ class Evaluator():
         gids, host_feats, grab_feats, cache_chunks = [], [], [], []
         for pid, img in self.img_loader:
             img = img.to(device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 if hasattr(core_model, "encode_eval_image_bundle"):
                     bundle = core_model.encode_eval_image_bundle(
                         img,
@@ -268,7 +317,7 @@ class Evaluator():
         qids, qfeats = [], []
         for pid, caption in self.txt_loader:
             caption = caption.to(device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 host_text_feat = model.encode_text(caption)
                 grab_text_feat = None
                 if (
@@ -301,7 +350,7 @@ class Evaluator():
         grab_text_feat,
     ):
         query_feat = grab_text_feat if self.args.enrichment_space == "grab" else host_text_feat
-        with torch.no_grad():
+        with torch.inference_mode():
             return model.enrich_text_features(
                 query_feat,
                 host_text_feat,
@@ -431,6 +480,8 @@ class Evaluator():
         if use_target_enrichment is None:
             use_target_enrichment = getattr(self.args, "target_enrichment", False)
 
+        self.logger.info("Starting evaluation feature extraction")
+        _log_cuda_memory(self.logger, "before evaluation")
         include_grab = not self.args.only_global
         host_qfeats, grab_qfeats, qids, text_batch_sizes = self._compute_text_branches(
             model,
@@ -444,6 +495,13 @@ class Evaluator():
         qfeats = F.normalize(host_qfeats, p=2, dim=1) # text features
         gfeats = F.normalize(host_gfeats, p=2, dim=1) # image features
         sims_global = qfeats @ gfeats.t()
+        self.logger.info(
+            "Global similarity matrix ready on CPU: {} queries x {} gallery".format(
+                qfeats.shape[0],
+                gfeats.shape[0],
+            )
+        )
+        _log_cuda_memory(self.logger, "after evaluation feature extraction")
 
         sims_grab = None
         if include_grab:
@@ -466,6 +524,9 @@ class Evaluator():
             target_gfeats = F.normalize(target_cache["retrieval_features"].detach().cpu(), p=2, dim=1)
             sims_target = target_qfeats @ target_gfeats.t()
             qids = target_qids
+            del target_cache
+            _clear_cuda_cache_if_available()
+            _log_cuda_memory(self.logger, "after target gallery release")
 
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP","rSum"])
 
@@ -479,7 +540,12 @@ class Evaluator():
         t2i_metric_cache = {}
         i2t_metric_cache = {}
 
-        for key, sims in self._iter_eval_tasks(base_tasks, sims_target):
+        total_eval_tasks = len(base_tasks)
+        if sims_target is not None:
+            total_eval_tasks *= 1 + len(_prototype_lambdas())
+        self.logger.info("Scoring %d evaluation tasks sequentially", total_eval_tasks)
+        for task_idx, (key, sims) in enumerate(self._iter_eval_tasks(base_tasks, sims_target), 1):
+            self.logger.debug("Evaluation task %d/%d start: %s", task_idx, total_eval_tasks, key)
             t2i_name = f'{key}-t2i'
             cache_key = id(sims) if sims_target is not None and sims is sims_target else None
             if cache_key is not None and cache_key in t2i_metric_cache:
@@ -518,6 +584,7 @@ class Evaluator():
             if "+proto(" in key and (best_ablation_row is None or rs[1] > best_ablation_row[1]):
                 best_ablation_task = key
                 best_ablation_row = rs
+            self.logger.debug("Evaluation task %d/%d end: %s", task_idx, total_eval_tasks, key)
 
         if best_ablation_row is not None:
             top1 = float(best_ablation_row[1])
@@ -557,4 +624,6 @@ class Evaluator():
         if best_task is not None:
             self.logger.info("best R1 row = {}".format(best_task))
 
+        _clear_cuda_cache_if_available()
+        _log_cuda_memory(self.logger, "after evaluation")
         return top1

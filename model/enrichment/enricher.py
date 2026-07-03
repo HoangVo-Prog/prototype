@@ -150,9 +150,20 @@ class TargetPrototypeEnricher(nn.Module):
             prototypes = self.proto_to_grab(prototypes.float())
         return F.normalize(prototypes.float(), p=2, dim=-1)
 
+    def _cache_tensor(self, pool_cache, key, device, dtype=torch.float32):
+        # Target caches are detached banks. Keeping storage on CPU is safe because
+        # no gradients should flow into cached gallery features.
+        return pool_cache[key].detach().to(device=device, dtype=dtype, non_blocking=True)
+
     def _gather_bank(self, bank, top_indices, trailing_shape):
-        bank = bank.to(device=top_indices.device)
-        gathered = bank.index_select(0, top_indices.reshape(-1))
+        flat_indices = top_indices.reshape(-1)
+        if bank.device == top_indices.device:
+            gathered = bank.detach().index_select(0, flat_indices)
+        else:
+            # Select from CPU first so a full evidence bank is not copied to GPU
+            # when only top-M rows are needed for this batch.
+            gathered = bank.detach().cpu().index_select(0, flat_indices.detach().cpu())
+            gathered = gathered.to(device=top_indices.device, non_blocking=True)
         return gathered.view(*top_indices.shape, *trailing_shape)
 
     def _project_raw_vector_evidence(self, values):
@@ -186,8 +197,8 @@ class TargetPrototypeEnricher(nn.Module):
             if mode not in self.evidence_slot_indices or key not in pool_cache:
                 continue
             slot = self.evidence_slot_indices[mode][0]
-            bank = pool_cache[key].float()
-            selected = self._gather_bank(bank, top_indices, (bank.shape[-1],))
+            bank = pool_cache[key].detach()
+            selected = self._gather_bank(bank, top_indices, (bank.shape[-1],)).float()
             projected = self._project_raw_vector_evidence(selected)
             updated[:, :, slot, :] = F.normalize(projected.float(), p=2, dim=-1)
 
@@ -198,8 +209,8 @@ class TargetPrototypeEnricher(nn.Module):
                     f"--extractor_mode {mode} requires finalized target cache key '{key}'"
                 )
             slot = self.evidence_slot_indices[mode][0]
-            bank = pool_cache[key].float()
-            selected = self._gather_bank(bank, top_indices, (1,))
+            bank = pool_cache[key].detach()
+            selected = self._gather_bank(bank, top_indices, (1,)).float()
             projected = projector(selected.float())
             updated[:, :, slot, :] = F.normalize(projected.float(), p=2, dim=-1)
         return updated
@@ -284,6 +295,10 @@ class TargetPrototypeEnricher(nn.Module):
                     "--topm_rank_space hybrid_global_grab requires "
                     "pool_cache['grab_image_features']"
                 )
+        grab_image_features = grab_image_features.detach().to(
+            device=grab_text_features.device,
+            non_blocking=True,
+        )
         grab_text_features = F.normalize(grab_text_features.float(), p=2, dim=-1)
         grab_image_features = F.normalize(grab_image_features.float(), p=2, dim=-1)
         if grab_text_features.shape[-1] != grab_image_features.shape[-1]:
@@ -335,10 +350,19 @@ class TargetPrototypeEnricher(nn.Module):
             return host_scores.topk(k=top_m, dim=1, largest=True, sorted=True).indices
 
     def forward(self, query_features, host_text_features, query_pids, pool_cache, space, grab_text_features=None):
-        host_image_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
-        retrieval_features = F.normalize(pool_cache["retrieval_features"].float(), p=2, dim=-1)
-        prototypes = pool_cache.get("evidence_bank", pool_cache["prototypes"]).float()
-        pool_pids = pool_cache["pids"].long()
+        device = query_features.device
+        host_image_features = F.normalize(
+            self._cache_tensor(pool_cache, "host_image_features", device),
+            p=2,
+            dim=-1,
+        )
+        retrieval_features = F.normalize(
+            self._cache_tensor(pool_cache, "retrieval_features", device),
+            p=2,
+            dim=-1,
+        )
+        prototypes = pool_cache.get("evidence_bank", pool_cache["prototypes"]).detach()
+        pool_pids = self._cache_tensor(pool_cache, "pids", device, dtype=torch.long)
 
         normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
         host_text_features = F.normalize(host_text_features.float(), p=2, dim=-1)
@@ -352,7 +376,11 @@ class TargetPrototypeEnricher(nn.Module):
             grab_text_features=grab_text_features,
         )
 
-        gathered = prototypes[top_indices]
+        gathered = self._gather_bank(
+            prototypes,
+            top_indices,
+            (prototypes.shape[1], prototypes.shape[2]),
+        ).float()
         gathered = self._apply_auxiliary_evidence(gathered, top_indices, pool_cache)
         selected_prototypes = self._project_prototypes(gathered, space)
 
@@ -387,9 +415,18 @@ class TargetPrototypeEnricher(nn.Module):
         }
 
     def enrich_only(self, query_features, host_text_features, pool_cache, space, grab_text_features=None):
-        host_image_features = F.normalize(pool_cache["host_image_features"].float(), p=2, dim=-1)
-        retrieval_features = F.normalize(pool_cache["retrieval_features"].float(), p=2, dim=-1)
-        prototypes = pool_cache.get("evidence_bank", pool_cache["prototypes"]).float()
+        device = query_features.device
+        host_image_features = F.normalize(
+            self._cache_tensor(pool_cache, "host_image_features", device),
+            p=2,
+            dim=-1,
+        )
+        retrieval_features = F.normalize(
+            self._cache_tensor(pool_cache, "retrieval_features", device),
+            p=2,
+            dim=-1,
+        )
+        prototypes = pool_cache.get("evidence_bank", pool_cache["prototypes"]).detach()
         normalized_query = F.normalize(query_features.float(), p=2, dim=-1)
         host_text_features = F.normalize(host_text_features.float(), p=2, dim=-1)
         top_indices = self._top_indices(
@@ -402,7 +439,11 @@ class TargetPrototypeEnricher(nn.Module):
             grab_text_features=grab_text_features,
         )
 
-        gathered = prototypes[top_indices]
+        gathered = self._gather_bank(
+            prototypes,
+            top_indices,
+            (prototypes.shape[1], prototypes.shape[2]),
+        ).float()
         gathered = self._apply_auxiliary_evidence(gathered, top_indices, pool_cache)
         selected_prototypes = self._project_prototypes(gathered, space)
         context = self._context(normalized_query, selected_prototypes, space)
