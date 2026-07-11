@@ -167,6 +167,19 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _log(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print("[gallery-conditioned {}] {}".format(timestamp, message), flush=True)
+
+
+def _should_log_progress(index: int, total: Optional[int], interval: int) -> bool:
+    if index <= 1:
+        return True
+    if interval > 0 and index % interval == 0:
+        return True
+    return total is not None and index >= total
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
@@ -1009,6 +1022,7 @@ def _extract_features(
     txt_loader: Any,
     args: SimpleNamespace,
     repo_root: Path,
+    log_interval: int = 50,
 ) -> FeatureBundle:
     import torch
 
@@ -1016,13 +1030,21 @@ def _extract_features(
     core = _core_model(model)
     device = next(core.parameters()).device
     include_alt = _needs_alt_features(spec, args)
+    text_total = len(txt_loader) if hasattr(txt_loader, "__len__") else None
+    image_total = len(img_loader) if hasattr(img_loader, "__len__") else None
+    _log(
+        "Encoding text features: batches={} include_alt={}".format(
+            text_total if text_total is not None else "unknown",
+            include_alt,
+        )
+    )
 
     qids = []
     host_text = []
     alt_text = []
     batch_sizes = []
     with torch.inference_mode():
-        for pid, caption in txt_loader:
+        for batch_index, (pid, caption) in enumerate(txt_loader, start=1):
             caption = caption.to(device)
             if hasattr(core, "encode_eval_text_bundle") and spec.repo_kind != "rde":
                 bundle = core.encode_eval_text_bundle(caption, include_grab=include_alt)
@@ -1042,17 +1064,33 @@ def _extract_features(
                     raise ValueError("Alternate text feature branch was requested but not returned")
                 alt_text.append(alt.detach().cpu())
             batch_sizes.append(int(flat_pid.numel()))
+            if _should_log_progress(batch_index, text_total, log_interval):
+                _log(
+                    "Encoded text batch {}/{} (queries={})".format(
+                        batch_index,
+                        text_total if text_total is not None else "?",
+                        sum(batch_sizes),
+                    )
+                )
 
     qids_t = torch.cat(qids, dim=0).cpu()
     host_text_t = torch.cat(host_text, dim=0).cpu()
     alt_text_t = torch.cat(alt_text, dim=0).cpu() if include_alt else None
+    _log("Text feature extraction complete: queries={}".format(int(qids_t.numel())))
 
     gids = []
     host_image = []
     alt_image = []
     cache_chunks: List[Dict[str, Any]] = []
+    image_seen = 0
+    _log(
+        "Encoding image/gallery features: batches={} include_alt={}".format(
+            image_total if image_total is not None else "unknown",
+            include_alt,
+        )
+    )
     with torch.inference_mode():
-        for pid, image in img_loader:
+        for batch_index, (pid, image) in enumerate(img_loader, start=1):
             image = image.to(device)
             if hasattr(core, "encode_eval_image_bundle") and spec.repo_kind != "rde":
                 bundle = core.encode_eval_image_bundle(
@@ -1079,6 +1117,15 @@ def _extract_features(
                     raise ValueError("Alternate image feature branch was requested but not returned")
                 alt_image.append(alt.detach().cpu())
             cache_chunks.append({key: value.detach().cpu() for key, value in cache.items()})
+            image_seen += int(pid.view(-1).numel())
+            if _should_log_progress(batch_index, image_total, log_interval):
+                _log(
+                    "Encoded image batch {}/{} (gallery_images={})".format(
+                        batch_index,
+                        image_total if image_total is not None else "?",
+                        image_seen,
+                    )
+                )
 
     gids_t = torch.cat(gids, dim=0).cpu()
     host_image_t = torch.cat(host_image, dim=0).cpu()
@@ -1086,6 +1133,7 @@ def _extract_features(
     raw_cache: Dict[str, Any] = {}
     for key in cache_chunks[0].keys():
         raw_cache[key] = torch.cat([chunk[key] for chunk in cache_chunks], dim=0).cpu()
+    _log("Image feature extraction complete: gallery_images={}".format(int(gids_t.numel())))
 
     return FeatureBundle(
         qids=qids_t,
@@ -1230,13 +1278,26 @@ def _enrich_all_queries(
     host_text: Any,
     alt_text: Optional[Any],
     batch_size: int,
+    stage_name: str = "all queries",
+    log_interval: int = 50,
 ) -> Tuple[Any, List[Any]]:
     import torch
 
     chunks = []
     top_chunks = []
-    for start in range(0, active_queries.shape[0], int(batch_size)):
-        end = min(active_queries.shape[0], start + int(batch_size))
+    total_queries = int(active_queries.shape[0])
+    step = max(1, int(batch_size))
+    total_batches = int(math.ceil(total_queries / float(step))) if total_queries else 0
+    _log(
+        "Enriching {}: queries={} batch_size={} batches={}".format(
+            stage_name,
+            total_queries,
+            step,
+            total_batches,
+        )
+    )
+    for batch_index, start in enumerate(range(0, total_queries, step), start=1):
+        end = min(total_queries, start + step)
         active = active_queries[start:end]
         host = host_text[start:end]
         alt = alt_text[start:end] if alt_text is not None else None
@@ -1244,6 +1305,16 @@ def _enrich_all_queries(
         enriched = _enrich_query_features(spec, core, args, target_cache, active, host, alt, top_indices)
         chunks.append(enriched)
         top_chunks.append(top_indices)
+        if _should_log_progress(batch_index, total_batches, log_interval):
+            _log(
+                "Enriched {} batch {}/{} (queries_done={}/{})".format(
+                    stage_name,
+                    batch_index,
+                    total_batches,
+                    end,
+                    total_queries,
+                )
+            )
     return torch.cat(chunks, dim=0).cpu(), top_chunks
 
 
@@ -1893,10 +1964,14 @@ def _run_official_reproduction(
     evaluator_cls = metrics_module.Evaluator
     official: Dict[str, Any] = {}
     try:
+        _log("Official reproduction check: running frozen-base evaluator")
         base_eval = evaluator_cls(img_loader, txt_loader, args)
         base_top1 = base_eval.eval(model, i2t_metric=False, use_target_enrichment=False)
+        _log("Official reproduction check: frozen-base evaluator complete (best R1={:.4f})".format(float(base_top1)))
+        _log("Official reproduction check: running GATE evaluator")
         gate_eval = evaluator_cls(img_loader, txt_loader, args)
         gate_top1 = gate_eval.eval(model, i2t_metric=False, use_target_enrichment=True)
+        _log("Official reproduction check: GATE evaluator complete (best R1={:.4f})".format(float(gate_top1)))
         official = {
             "status": "ok",
             "base_best_R1_percent": float(base_top1),
@@ -2000,6 +2075,7 @@ def _parse_args(spec: RepoSpec, argv: Optional[Sequence[str]]) -> argparse.Names
     parser.add_argument("--query-batch-size", type=int, default=512)
     parser.add_argument("--gallery-chunk-size", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--log-interval", type=int, default=50, help="progress log interval for batches and queries")
     parser.add_argument("--save-context-manifest", action="store_true")
     parser.add_argument("--save-features", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -2007,6 +2083,7 @@ def _parse_args(spec: RepoSpec, argv: Optional[Sequence[str]]) -> argparse.Names
 
 
 def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] = None) -> None:
+    started_at = time.time()
     spec = RepoSpec(
         repository_name=spec.repository_name,
         repo_kind=spec.repo_kind,
@@ -2020,6 +2097,15 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         sys.path.insert(0, str(spec.code_root))
     repo_root = _repo_root_from_spec(spec).resolve()
     cli_args = _parse_args(spec, argv)
+    log_interval = max(1, int(cli_args.log_interval))
+    _log(
+        "Starting {} gallery-conditioned query evaluation (host_model={}, data={}, split={})".format(
+            spec.repository_name,
+            cli_args.host_model,
+            cli_args.data,
+            cli_args.split,
+        )
+    )
     output_dir = Path(cli_args.output_dir).expanduser().resolve()
     if output_dir.exists() and any(output_dir.iterdir()) and not cli_args.overwrite:
         raise FileExistsError("Output directory exists and is not empty; pass --overwrite: {}".format(output_dir))
@@ -2028,10 +2114,13 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
     config_path = Path(cli_args.config).expanduser().resolve()
     base_checkpoint = Path(cli_args.base_checkpoint).expanduser().resolve()
     gate_checkpoint = Path(cli_args.gate_checkpoint).expanduser().resolve()
+    _log("Output directory: {}".format(output_dir))
+    _log("Checking inputs: base={} gate={} config={}".format(base_checkpoint, gate_checkpoint, config_path))
     for label, path in (("gate config", config_path), ("base checkpoint", base_checkpoint), ("gate checkpoint", gate_checkpoint)):
         if not path.is_file():
             raise FileNotFoundError("{} not found: {}".format(label, path))
 
+    _log("Loading host defaults/checkpoint metadata and GATE config")
     host_args, host_metadata_values, host_settings_source = _load_host_args(base_checkpoint)
     resolved_host_args = _namespace_from_mapping(vars(host_args))
     gate_args, gate_config_values = _load_config(config_path)
@@ -2043,6 +2132,17 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
     args.gate_checkpoint = str(gate_checkpoint)
     args.eval_output_dir = str(output_dir)
     _ensure_eval_defaults(args, spec, cli_args)
+    _log(
+        "Dataset resolved: requested={} loader_root={} dataset_dir={} annotation={} image_root={} queries={} gallery_images={}".format(
+            getattr(args, "requested_dataset", None),
+            getattr(args, "resolved_root_dir", None),
+            getattr(args, "resolved_dataset_dir", None),
+            getattr(args, "resolved_annotation_path", None),
+            getattr(args, "resolved_image_root", None),
+            getattr(args, "number_of_queries", None),
+            getattr(args, "number_of_gallery_images", None),
+        )
+    )
     _configure_reproducibility(
         int(getattr(args, "seed", 1)),
         deterministic=bool(getattr(args, "deterministic", True)),
@@ -2053,31 +2153,47 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
     import torch.nn.functional as F
 
     device = _resolve_device(cli_args.device)
+    _log("Using device: {}".format(device))
+    _log("Loading base checkpoint metadata for num_classes inference")
     first_checkpoint = _torch_load_checkpoint(base_checkpoint)
     first_state, _, _ = _unwrap_state_dict(first_checkpoint)
     num_classes = _infer_num_classes_from_state_dict(first_state, getattr(args, "num_classes", None))
+    _log("Building model with num_classes={}".format(num_classes))
     build_model = importlib.import_module("model").build_model
     model = build_model(args, num_classes)
     model.to(device)
+    _log("Loading base and GATE checkpoint weights")
     checkpoint_reports = _load_base_and_gate(model, base_checkpoint, gate_checkpoint)
     _freeze_and_eval(model)
     _atomic_write_json(output_dir / "checkpoint_load_report.json", checkpoint_reports)
     _atomic_write_text(output_dir / "resolved_config.yaml", _resolved_config_yaml(args))
     _atomic_write_text(output_dir / "resolved_gate_config.yaml", _resolved_config_yaml(gate_args))
+    _log("Checkpoint loading complete; model is frozen/eval")
 
+    _log("Building official dataloaders")
     img_loader, txt_loader = _build_eval_loaders(args, cli_args.split)
     _validate_loaded_eval_loaders(img_loader, txt_loader, args)
+    _log(
+        "Dataloaders ready: image_batches={} text_batches={}".format(
+            len(img_loader) if hasattr(img_loader, "__len__") else "unknown",
+            len(txt_loader) if hasattr(txt_loader, "__len__") else "unknown",
+        )
+    )
     core = _core_model(model)
-    features = _extract_features(spec, model, img_loader, txt_loader, args, repo_root)
+    features = _extract_features(spec, model, img_loader, txt_loader, args, repo_root, log_interval=log_interval)
+    _log("Feature extraction complete: queries={} gallery_images={}".format(len(features.query_ids), len(features.image_ids)))
     active_queries = _active_query_features(spec, args, features.host_text, features.alt_text)
 
     all_gallery_indices = list(range(int(features.gids.numel())))
+    _log("Building and finalizing full-gallery target cache")
     full_cache = _subset_and_finalize_cache(core, features.raw_target_cache, features.gids, all_gallery_indices, device)
     full_retrieval = _cache_retrieval_features(full_cache)
+    _log("Computing full-gallery frozen-base scores")
     active_queries_norm = F.normalize(active_queries.float(), p=2, dim=1)
     frozen_base_queries = F.normalize(features.host_text.float(), p=2, dim=1)
     frozen_base_gallery = F.normalize(features.host_image.float(), p=2, dim=1)
     frozen_base_scores = _score_matrix(frozen_base_queries, frozen_base_gallery, int(cli_args.gallery_chunk_size))
+    _log("Computing full-gallery GATE-enriched scores")
     full_enriched, _ = _enrich_all_queries(
         spec,
         core,
@@ -2087,15 +2203,19 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         features.host_text,
         features.alt_text,
         int(cli_args.query_batch_size),
+        stage_name="full-gallery sanity",
+        log_interval=log_interval,
     )
     full_enriched_norm = F.normalize(full_enriched.float(), p=2, dim=1)
     full_gate_scores = _score_matrix(full_enriched_norm, full_retrieval, int(cli_args.gallery_chunk_size))
     protocol_full_base = _matrix_metrics(frozen_base_scores, features.qids, features.gids, features.image_ids)
     protocol_full_gate = _matrix_metrics(full_gate_scores, features.qids, features.gids, features.image_ids)
+    _log("Full-gallery protocol metrics computed")
 
     official_reproduction = _run_official_reproduction(spec, model, img_loader, txt_loader, args)
     reproduction_check = _compare_reproduction(spec, protocol_full_base, protocol_full_gate, official_reproduction)
     if official_reproduction.get("status") == "failed" or reproduction_check.get("status") == "failed":
+        _log("Full-gallery reproduction check failed; writing failure summary")
         _atomic_write_json(
             output_dir / "summary.json",
             {
@@ -2108,8 +2228,10 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
             },
         )
         raise RuntimeError("Full-gallery reproduction check failed; see summary.json")
+    _log("Full-gallery reproduction check status: {}".format(reproduction_check.get("status")))
 
     if cli_args.save_features:
+        _log("Saving raw feature tensors")
         _save_features(output_dir / "features.pt", features, active_queries, full_retrieval)
 
     dataset = str(getattr(args, "dataset_name", "unknown"))
@@ -2122,6 +2244,16 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
     exclusions: List[Dict[str, Any]] = []
     included_queries = set()
 
+    total_queries = len(features.query_ids)
+    total_seed_evals = total_queries * len(cli_args.split_seeds)
+    processed_seed_evals = 0
+    _log(
+        "Starting matched/mismatched context protocol: queries={} seeds={} expected query-seed contexts={}".format(
+            total_queries,
+            len(cli_args.split_seeds),
+            total_seed_evals,
+        )
+    )
     for query_index, (query_id, query_pid) in enumerate(zip(features.query_ids, qids_list)):
         full_base_for_query = [float(v) for v in frozen_base_scores[query_index].detach().cpu().tolist()]
         positive_count = sum(1 for pid in gids_list if int(pid) == int(query_pid))
@@ -2142,6 +2274,7 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         alt_query = features.alt_text[query_index:query_index + 1] if features.alt_text is not None else None
 
         for split_seed in cli_args.split_seeds:
+            processed_seed_evals += 1
             a_indices, b_indices, manifest_rows, balance = _build_contexts_for_query(
                 dataset,
                 host_model,
@@ -2221,15 +2354,29 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
             del cache_a, cache_b
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            if _should_log_progress(processed_seed_evals, total_seed_evals, log_interval):
+                elapsed = time.time() - started_at
+                _log(
+                    "Context protocol progress: query {}/{} seed_eval {}/{} rows={} elapsed={:.1f}s".format(
+                        query_index + 1,
+                        total_queries,
+                        processed_seed_evals,
+                        total_seed_evals,
+                        len(per_query_rows),
+                        elapsed,
+                    )
+                )
 
     if not per_query_rows:
         raise RuntimeError("No query rows were produced; all queries were excluded")
 
+    _log("Aggregating per-query rows and bootstrap confidence intervals")
     summary = _summary_from_rows(per_query_rows)
     summary["gallery_cardinality_mean"] = _mean(row.get("gallery_cardinality") for row in per_query_rows)
     bootstrap_ci = _bootstrap_ci(per_query_rows, int(cli_args.bootstrap_seed), int(cli_args.bootstrap_resamples))
     per_seed = _per_seed_summary(per_query_rows)
     fallbacks: Dict[str, str] = {}
+    _log("Writing output tables and manifests")
     _write_table(output_dir / "per_query_metrics.parquet", per_query_rows, fallbacks)
     _write_table(output_dir / "context_manifest.parquet", context_manifest_rows, fallbacks)
     _atomic_write_jsonl(output_dir / "exclusions.jsonl", exclusions)
@@ -2341,4 +2488,5 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         output_dir,
     )
     _atomic_write_text(output_dir / "console_report.txt", console_report)
-    print(console_report)
+    _log("Evaluation complete in {:.1f}s".format(time.time() - started_at))
+    print(console_report, flush=True)
