@@ -1725,49 +1725,91 @@ def _summary_from_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     return summary
 
 
-def _bootstrap_ci(rows: Sequence[Dict[str, Any]], seed: int, resamples: int) -> Dict[str, Any]:
+def _bootstrap_ci(rows: Sequence[Dict[str, Any]], seed: int, resamples: int, log_interval: int = 50) -> Dict[str, Any]:
     import numpy as np
 
     if not rows or resamples <= 0:
         return {}
+    started = time.time()
     by_query: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
         by_query.setdefault(row["query_id"], []).append(row)
     query_ids = sorted(by_query)
+    query_count = len(query_ids)
+    _log(
+        "Bootstrap CI: query-cluster resampling queries={} resamples={}".format(
+            query_count,
+            int(resamples),
+        )
+    )
     rng = np.random.default_rng(int(seed))
 
-    def stat(sampled_rows: Sequence[Dict[str, Any]], name: str) -> Optional[float]:
-        summary = _summary_from_rows(sampled_rows)
-        return summary.get(name)
+    counts = np.zeros(query_count, dtype=np.float64)
+    sums: Dict[str, Any] = {
+        "base_r1": np.zeros(query_count, dtype=np.float64),
+        "matched_r1": np.zeros(query_count, dtype=np.float64),
+        "mismatched_r1": np.zeros(query_count, dtype=np.float64),
+        "base_ap": np.zeros(query_count, dtype=np.float64),
+        "matched_ap": np.zeros(query_count, dtype=np.float64),
+        "mismatched_ap": np.zeros(query_count, dtype=np.float64),
+        "d_AB": np.zeros(query_count, dtype=np.float64),
+    }
+    for index, query_id in enumerate(query_ids):
+        query_rows = by_query[query_id]
+        counts[index] = float(len(query_rows))
+        for row in query_rows:
+            for key, array in sums.items():
+                value = row.get(key)
+                if value is not None:
+                    array[index] += float(value)
 
-    stat_names = [
-        "delta_ctx_R1",
-        "delta_ctx_mAP",
-        "matched_gain_over_base_R1",
-        "matched_gain_over_base_mAP",
-        "mean_gallery_induced_query_displacement",
-    ]
-    values = {name: [] for name in stat_names}
-    for _ in range(int(resamples)):
-        sampled_rows: List[Dict[str, Any]] = []
-        sampled_ids = rng.choice(query_ids, size=len(query_ids), replace=True)
-        for query_id in sampled_ids:
-            sampled_rows.extend(by_query[str(query_id)])
-        for name in stat_names:
-            value = stat(sampled_rows, name)
-            if value is not None:
-                values[name].append(float(value))
+    values = {
+        "delta_ctx_R1": [],
+        "delta_ctx_mAP": [],
+        "matched_gain_over_base_R1": [],
+        "matched_gain_over_base_mAP": [],
+        "mean_gallery_induced_query_displacement": [],
+    }
+    total_resamples = int(resamples)
+    chunk_size = min(max(int(log_interval), 1), 256)
+    done = 0
+    while done < total_resamples:
+        current = min(chunk_size, total_resamples - done)
+        sampled = rng.integers(0, query_count, size=(current, query_count))
+        sampled_count = counts[sampled].sum(axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            base_r1 = sums["base_r1"][sampled].sum(axis=1) / sampled_count
+            matched_r1 = sums["matched_r1"][sampled].sum(axis=1) / sampled_count
+            mismatched_r1 = sums["mismatched_r1"][sampled].sum(axis=1) / sampled_count
+            base_ap = sums["base_ap"][sampled].sum(axis=1) / sampled_count
+            matched_ap = sums["matched_ap"][sampled].sum(axis=1) / sampled_count
+            mismatched_ap = sums["mismatched_ap"][sampled].sum(axis=1) / sampled_count
+            displacement = sums["d_AB"][sampled].sum(axis=1) / sampled_count
+        values["delta_ctx_R1"].extend((matched_r1 - mismatched_r1).tolist())
+        values["delta_ctx_mAP"].extend((matched_ap - mismatched_ap).tolist())
+        values["matched_gain_over_base_R1"].extend((matched_r1 - base_r1).tolist())
+        values["matched_gain_over_base_mAP"].extend((matched_ap - base_ap).tolist())
+        values["mean_gallery_induced_query_displacement"].extend(displacement.tolist())
+        done += current
+        if _should_log_progress(done, total_resamples, max(chunk_size, int(log_interval))):
+            _log("Bootstrap CI progress: {}/{} resamples".format(done, total_resamples))
+
     ci = {}
     for name, items in values.items():
         if not items:
             ci[name] = None
             continue
+        finite_items = [float(item) for item in items if math.isfinite(float(item))]
+        if not finite_items:
+            ci[name] = None
+            continue
         ci[name] = {
-            "lower_2p5": float(np.percentile(items, 2.5)),
-            "upper_97p5": float(np.percentile(items, 97.5)),
+            "lower_2p5": float(np.percentile(finite_items, 2.5)),
+            "upper_97p5": float(np.percentile(finite_items, 97.5)),
             "resamples": int(resamples),
             "cluster": "query_id",
         }
+    _log("Bootstrap CI complete in {:.1f}s".format(time.time() - started))
     return ci
 
 
@@ -2373,7 +2415,12 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
     _log("Aggregating per-query rows and bootstrap confidence intervals")
     summary = _summary_from_rows(per_query_rows)
     summary["gallery_cardinality_mean"] = _mean(row.get("gallery_cardinality") for row in per_query_rows)
-    bootstrap_ci = _bootstrap_ci(per_query_rows, int(cli_args.bootstrap_seed), int(cli_args.bootstrap_resamples))
+    bootstrap_ci = _bootstrap_ci(
+        per_query_rows,
+        int(cli_args.bootstrap_seed),
+        int(cli_args.bootstrap_resamples),
+        log_interval=log_interval,
+    )
     per_seed = _per_seed_summary(per_query_rows)
     fallbacks: Dict[str, str] = {}
     _log("Writing output tables and manifests")
