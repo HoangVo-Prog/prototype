@@ -1295,7 +1295,9 @@ def _official_target_tasks(
         proto_value = _format_lambda(proto_lambda)
         for base in base_tasks:
             task = "{}+proto({})".format(base["task"], proto_value)
-            if abs(proto_lambda - 1.0) < 1e-12 and spec.repo_kind in {"prototype", "adapter"}:
+            if abs(proto_lambda) < 1e-12:
+                scores = base["scores"]
+            elif abs(proto_lambda - 1.0) < 1e-12 and spec.repo_kind in {"prototype", "adapter"}:
                 scores = sims_target
             else:
                 scaled_base = _scale_scores_like(base["scores"], sims_target)
@@ -1367,6 +1369,7 @@ def _score_ablation_description(spec: RepoSpec, args: SimpleNamespace) -> Dict[s
         "global_grab_lambdas": _global_grab_lambdas() if spec.repo_kind == "prototype" and not bool(getattr(args, "only_global", False)) else [],
         "scale_formula": "scale(scores_like_reference)=rowwise_minmax(scores) mapped to rowwise min/max(reference)",
         "proto_fusion_formula": "fused=(1-lambda)*scale(base_like_target)+lambda*target",
+        "lambda_zero_context_canonicalization": "lambda=0 uses the exact base score tensor in decomposed context/control scoring so matched and mismatched tensors are exactly identical on the same gallery; this preserves official ranks/AP because the evaluator's scaled lambda=0 row is a positive row-wise affine transform of base",
         "official_best_policy": "select the best existing full-gallery +proto(lambda) ablation row by official R@1; do not select by Delta_ctx",
     }
 
@@ -1575,6 +1578,54 @@ def _ranked_metrics_for_query(scores: Sequence[float], query_pid: int, gallery_p
             float(highest_positive - highest_negative) if highest_negative is not None else None
         ),
     }
+
+
+def _assert_metric_dict_equal(left: Dict[str, Any], right: Dict[str, Any], label: str) -> None:
+    keys = [
+        "best_positive_rank",
+        "r1",
+        "r5",
+        "r10",
+        "ap",
+        "minp",
+        "highest_positive_score",
+        "highest_non_positive_score",
+        "positive_minus_hardest_negative_margin",
+    ]
+    for key in keys:
+        left_value = left.get(key)
+        right_value = right.get(key)
+        if left_value is None or right_value is None:
+            if left_value != right_value:
+                raise AssertionError("{} lambda=0 metric {} mismatch: {} != {}".format(label, key, left_value, right_value))
+            continue
+        if isinstance(left_value, float) or isinstance(right_value, float):
+            if float(left_value) != float(right_value):
+                raise AssertionError("{} lambda=0 metric {} mismatch: {} != {}".format(label, key, left_value, right_value))
+        elif left_value != right_value:
+            raise AssertionError("{} lambda=0 metric {} mismatch: {} != {}".format(label, key, left_value, right_value))
+
+
+def _assert_lambda_zero_pair(
+    label: str,
+    matched_scores: Any,
+    mismatched_scores: Any,
+    query_pid: int,
+    gallery_pids: Sequence[int],
+    gallery_image_ids: Sequence[str],
+) -> None:
+    import torch
+
+    matched_cpu = matched_scores.detach().cpu()
+    mismatched_cpu = mismatched_scores.detach().cpu()
+    if not torch.equal(matched_cpu, mismatched_cpu):
+        max_abs = float((matched_cpu - mismatched_cpu).abs().max().item())
+        raise AssertionError("{} lambda=0 score tensor mismatch; max_abs_diff={}".format(label, max_abs))
+    matched_list = _score_tensor_to_list(matched_cpu)
+    mismatched_list = _score_tensor_to_list(mismatched_cpu)
+    matched_metrics = _ranked_metrics_for_query(matched_list, query_pid, gallery_pids, gallery_image_ids)
+    mismatched_metrics = _ranked_metrics_for_query(mismatched_list, query_pid, gallery_pids, gallery_image_ids)
+    _assert_metric_dict_equal(matched_metrics, mismatched_metrics, label)
 
 
 def _matrix_metrics(scores: Any, qids: Any, gids: Any, image_ids: Sequence[str]) -> Dict[str, float]:
@@ -1857,6 +1908,136 @@ def _context_direction_row(
     return row
 
 
+def _union_control_row(
+    dataset: str,
+    host_model: str,
+    score_task: str,
+    score_base_task: Optional[str],
+    score_proto_lambda: Optional[float],
+    is_official_best_score_task: bool,
+    query_id: str,
+    query_pid: int,
+    seed: int,
+    union_indices: Sequence[int],
+    base_scores: Sequence[float],
+    enriched_a_scores: Sequence[float],
+    enriched_b_scores: Sequence[float],
+    gids: Sequence[int],
+    image_ids: Sequence[str],
+    query_measurements: Dict[str, Any],
+) -> Dict[str, Any]:
+    gallery_pids = [int(gids[idx]) for idx in union_indices]
+    gallery_image_ids = [image_ids[idx] for idx in union_indices]
+    row = {
+        "dataset": dataset,
+        "host_model": host_model,
+        "score_task": str(score_task),
+        "score_base_task": score_base_task,
+        "score_proto_lambda": score_proto_lambda,
+        "is_official_best_score_task": bool(is_official_best_score_task),
+        "query_id": query_id,
+        "query_pid": int(query_pid),
+        "split_seed": int(seed),
+        "evaluation_gallery": "A_union_B",
+        "gallery_cardinality": int(len(union_indices)),
+    }
+    row.update(_row_with_prefixed_metrics("base", _ranked_metrics_for_query(base_scores, query_pid, gallery_pids, gallery_image_ids)))
+    row.update(_row_with_prefixed_metrics("enriched_A", _ranked_metrics_for_query(enriched_a_scores, query_pid, gallery_pids, gallery_image_ids)))
+    row.update(_row_with_prefixed_metrics("enriched_B", _ranked_metrics_for_query(enriched_b_scores, query_pid, gallery_pids, gallery_image_ids)))
+    row.update(query_measurements)
+    return row
+
+
+def _context_negative_ids(indices: Sequence[int], query_pid: int, gids: Sequence[int], image_ids: Sequence[str]) -> List[str]:
+    return [image_ids[idx] for idx in indices if int(gids[idx]) != int(query_pid)]
+
+
+def _topm_negative_records(
+    audit: Dict[str, Any],
+    query_pid: int,
+    context_indices: Sequence[int],
+    gids: Sequence[int],
+    image_ids: Sequence[str],
+    full_base_scores: Sequence[float],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    image_id_to_index = {image_ids[idx]: idx for idx in context_indices}
+    records = []
+    for image_id in audit.get("topm_ids", []):
+        full_index = image_id_to_index.get(image_id)
+        if full_index is None or int(gids[full_index]) == int(query_pid):
+            continue
+        records.append(
+            {
+                "image_id": image_id,
+                "pid": int(gids[full_index]),
+                "full_index": int(full_index),
+                "base_score": float(full_base_scores[full_index]),
+            }
+        )
+        if len(records) >= int(limit):
+            break
+    return records
+
+
+def _hardest_negative_record(
+    scores: Sequence[float],
+    context_indices: Sequence[int],
+    query_pid: int,
+    gids: Sequence[int],
+    image_ids: Sequence[str],
+    enrichment_indices: Sequence[int],
+) -> Optional[Dict[str, Any]]:
+    enrichment_set = set(int(idx) for idx in enrichment_indices)
+    best_local = None
+    best_score = None
+    for local_index, full_index in enumerate(context_indices):
+        if int(gids[full_index]) == int(query_pid):
+            continue
+        score = float(scores[local_index])
+        if best_score is None or score > best_score:
+            best_local = int(local_index)
+            best_score = score
+    if best_local is None:
+        return None
+    full_index = int(context_indices[best_local])
+    return {
+        "image_id": image_ids[full_index],
+        "pid": int(gids[full_index]),
+        "full_index": full_index,
+        "score": float(best_score),
+        "belongs_to_enrichment_context": bool(full_index in enrichment_set),
+    }
+
+
+def _cell_metrics_for_audit(
+    scores: Sequence[float],
+    context_indices: Sequence[int],
+    query_pid: int,
+    gids: Sequence[int],
+    image_ids: Sequence[str],
+    enrichment_indices: Sequence[int],
+) -> Dict[str, Any]:
+    gallery_pids = [int(gids[idx]) for idx in context_indices]
+    gallery_image_ids = [image_ids[idx] for idx in context_indices]
+    metrics = _ranked_metrics_for_query(scores, query_pid, gallery_pids, gallery_image_ids)
+    return {
+        "best_positive_rank": metrics.get("best_positive_rank"),
+        "ap": metrics.get("ap"),
+        "highest_positive_score": metrics.get("highest_positive_score"),
+        "highest_non_positive_score": metrics.get("highest_non_positive_score"),
+        "positive_minus_hardest_negative_margin": metrics.get("positive_minus_hardest_negative_margin"),
+        "hardest_negative": _hardest_negative_record(
+            scores,
+            context_indices,
+            query_pid,
+            gids,
+            image_ids,
+            enrichment_indices,
+        ),
+    }
+
+
 def _query_measurements(active_query: Any, enriched_a: Any, enriched_b: Any) -> Dict[str, Any]:
     import torch
     import torch.nn.functional as F
@@ -2061,6 +2242,50 @@ def _score_task_summaries(rows: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str,
     return output
 
 
+def _union_summary_from_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {"metrics_unit": "fraction"}
+    for metric_name in ("r1", "r5", "r10", "ap", "minp"):
+        metric_label = "mAP" if metric_name == "ap" else ("mINP" if metric_name == "minp" else metric_name.upper())
+        base = _mean(row.get(f"base_{metric_name}") for row in rows)
+        enriched_a = _mean(row.get(f"enriched_A_{metric_name}") for row in rows)
+        enriched_b = _mean(row.get(f"enriched_B_{metric_name}") for row in rows)
+        summary[f"union_base_{metric_label}"] = base
+        summary[f"union_enriched_A_{metric_label}"] = enriched_a
+        summary[f"union_enriched_B_{metric_label}"] = enriched_b
+        summary[f"union_delta_A_minus_B_{metric_label}"] = (
+            enriched_a - enriched_b if enriched_a is not None and enriched_b is not None else None
+        )
+    margin_diffs = []
+    for row in rows:
+        left = row.get("enriched_A_positive_minus_hardest_negative_margin")
+        right = row.get("enriched_B_positive_minus_hardest_negative_margin")
+        if left is not None and right is not None:
+            margin_diffs.append(float(left) - float(right))
+    summary.update(
+        {
+            "union_positive_margin_difference_A_minus_B_mean": _mean(margin_diffs),
+            "mean_gallery_induced_query_displacement": _mean(row.get("d_AB") for row in rows),
+            "median_gallery_induced_query_displacement": _median([row["d_AB"] for row in rows if row.get("d_AB") is not None]),
+            "row_count": int(len(rows)),
+            "query_count": int(len(set(row["query_id"] for row in rows))),
+            "query_seed_count": int(len(rows)),
+        }
+    )
+    return summary
+
+
+def _union_score_task_summaries(rows: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    output: Dict[str, Dict[str, Any]] = {}
+    for task in sorted(set(str(row.get("score_task", "")) for row in rows)):
+        task_rows = [row for row in rows if str(row.get("score_task", "")) == task]
+        summary = _union_summary_from_rows(task_rows)
+        summary["score_task"] = task
+        summary["score_base_task"] = task_rows[0].get("score_base_task") if task_rows else None
+        summary["score_proto_lambda"] = task_rows[0].get("score_proto_lambda") if task_rows else None
+        output[task] = summary
+    return output
+
+
 def _flatten(prefix: str, value: Any, out: Dict[str, Any]) -> None:
     if isinstance(value, dict):
         for key, subvalue in value.items():
@@ -2124,6 +2349,7 @@ def _console_report(
     counts: Dict[str, Any],
     full_gallery: Dict[str, Any],
     summary: Dict[str, Any],
+    union_summary: Dict[str, Any],
     ci: Dict[str, Any],
     output_dir: Path,
 ) -> str:
@@ -2162,6 +2388,10 @@ def _console_report(
             _format_ci(ci.get("delta_ctx_R1")),
             _format_percent(summary.get("delta_ctx_mAP")),
             _format_ci(ci.get("delta_ctx_mAP")),
+        ),
+        "Union control A-vs-B: R@1 delta={} mAP delta={}".format(
+            _format_percent(union_summary.get("union_delta_A_minus_B_R1")),
+            _format_percent(union_summary.get("union_delta_A_minus_B_mAP")),
         ),
         "Matched gain over base: R@1={}{} mAP={}{}".format(
             _format_percent(summary.get("matched_gain_over_base_R1")),
@@ -2342,6 +2572,8 @@ def _parse_args(spec: RepoSpec, argv: Optional[Sequence[str]]) -> argparse.Names
     parser.add_argument("--gallery-chunk-size", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-interval", type=int, default=50, help="progress log interval for batches and queries")
+    parser.add_argument("--audit-query-limit", type=int, default=10, help="number of deterministic first-seed queries to write to structural_audit_examples.jsonl")
+    parser.add_argument("--audit-top-k", type=int, default=10, help="maximum number of hardest/top-M negative records per audit example")
     parser.add_argument("--save-context-manifest", action="store_true")
     parser.add_argument("--save-features", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -2556,7 +2788,9 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
     qids_list = [int(v) for v in features.qids.detach().cpu().view(-1).tolist()]
 
     per_query_rows: List[Dict[str, Any]] = []
+    union_control_rows: List[Dict[str, Any]] = []
     context_manifest_rows: List[Dict[str, Any]] = []
+    structural_audit_examples: List[Dict[str, Any]] = []
     exclusions: List[Dict[str, Any]] = []
     included_queries = set()
 
@@ -2626,9 +2860,15 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
             target_bb_scores = enriched_b_norm @ retrieval_b.t()
             target_ab_scores = enriched_a_norm @ retrieval_b.t()
             matched_a_tasks = _official_target_tasks(spec, base_tasks_a, target_aa_scores)
+            matched_a_by_task = _scores_by_task(matched_a_tasks)
             mismatched_a_by_task = _scores_by_task(_official_target_tasks(spec, base_tasks_a, target_ba_scores))
             matched_b_tasks = _official_target_tasks(spec, base_tasks_b, target_bb_scores)
+            matched_b_by_task = _scores_by_task(matched_b_tasks)
             mismatched_b_by_task = _scores_by_task(_official_target_tasks(spec, base_tasks_b, target_ab_scores))
+            gallery_pids_a = [int(gids_list[idx]) for idx in a_indices]
+            gallery_ids_a = [features.image_ids[idx] for idx in a_indices]
+            gallery_pids_b = [int(gids_list[idx]) for idx in b_indices]
+            gallery_ids_b = [features.image_ids[idx] for idx in b_indices]
 
             audit_a = _topm_audit(top_a, a_indices, int(query_pid), gids_list, features.image_ids, full_base_for_query)
             audit_b = _topm_audit(top_b, b_indices, int(query_pid), gids_list, features.image_ids, full_base_for_query)
@@ -2639,6 +2879,15 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
             for task_info in matched_a_tasks:
                 task_name = str(task_info["task"])
                 mismatch_info = mismatched_a_by_task[task_name]
+                if abs(float(task_info.get("proto_lambda") or 0.0)) < 1e-12:
+                    _assert_lambda_zero_pair(
+                        "{} query={} seed={} gallery=A task={}".format(dataset, query_id, int(split_seed), task_name),
+                        task_info["scores"],
+                        mismatch_info["scores"],
+                        int(query_pid),
+                        gallery_pids_a,
+                        gallery_ids_a,
+                    )
                 base_scores_tensor = task_info.get("base_scores")
                 if base_scores_tensor is None:
                     base_scores_tensor = base_tasks_a[0]["scores"]
@@ -2669,6 +2918,15 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
             for task_info in matched_b_tasks:
                 task_name = str(task_info["task"])
                 mismatch_info = mismatched_b_by_task[task_name]
+                if abs(float(task_info.get("proto_lambda") or 0.0)) < 1e-12:
+                    _assert_lambda_zero_pair(
+                        "{} query={} seed={} gallery=B task={}".format(dataset, query_id, int(split_seed), task_name),
+                        task_info["scores"],
+                        mismatch_info["scores"],
+                        int(query_pid),
+                        gallery_pids_b,
+                        gallery_ids_b,
+                    )
                 base_scores_tensor = task_info.get("base_scores")
                 if base_scores_tensor is None:
                     base_scores_tensor = base_tasks_b[0]["scores"]
@@ -2696,7 +2954,106 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
                         audit_b,
                     )
                 )
-            del cache_a, cache_b
+            union_indices = sorted(set(int(idx) for idx in a_indices) | set(int(idx) for idx in b_indices))
+            cache_union = _subset_and_finalize_cache(core, features.raw_target_cache, features.gids, union_indices, device)
+            retrieval_union = _cache_retrieval_features(cache_union)
+            index_union = torch.as_tensor(union_indices, dtype=torch.long)
+            host_gallery_union = features.host_image.index_select(0, index_union)
+            alt_gallery_union = features.alt_image.index_select(0, index_union) if features.alt_image is not None else None
+            base_tasks_union = _context_base_tasks(spec, args, host_query, host_gallery_union, alt_query, alt_gallery_union)
+            target_a_union_scores = enriched_a_norm @ retrieval_union.t()
+            target_b_union_scores = enriched_b_norm @ retrieval_union.t()
+            union_a_tasks = _official_target_tasks(spec, base_tasks_union, target_a_union_scores)
+            union_b_by_task = _scores_by_task(_official_target_tasks(spec, base_tasks_union, target_b_union_scores))
+            gallery_pids_union = [int(gids_list[idx]) for idx in union_indices]
+            gallery_ids_union = [features.image_ids[idx] for idx in union_indices]
+            for task_info in union_a_tasks:
+                task_name = str(task_info["task"])
+                union_b_info = union_b_by_task[task_name]
+                if abs(float(task_info.get("proto_lambda") or 0.0)) < 1e-12:
+                    _assert_lambda_zero_pair(
+                        "{} query={} seed={} gallery=A_union_B task={}".format(dataset, query_id, int(split_seed), task_name),
+                        task_info["scores"],
+                        union_b_info["scores"],
+                        int(query_pid),
+                        gallery_pids_union,
+                        gallery_ids_union,
+                    )
+                base_scores_tensor = task_info.get("base_scores")
+                if base_scores_tensor is None:
+                    base_scores_tensor = base_tasks_union[0]["scores"]
+                union_control_rows.append(
+                    _union_control_row(
+                        dataset,
+                        host_model,
+                        task_name,
+                        task_info.get("base_task"),
+                        task_info.get("proto_lambda"),
+                        task_name == official_gate_task,
+                        query_id,
+                        int(query_pid),
+                        int(split_seed),
+                        union_indices,
+                        _score_tensor_to_list(base_scores_tensor),
+                        _score_tensor_to_list(task_info["scores"]),
+                        _score_tensor_to_list(union_b_info["scores"]),
+                        gids_list,
+                        features.image_ids,
+                        query_measurements,
+                    )
+                )
+            if (
+                int(cli_args.audit_query_limit) > 0
+                and len(structural_audit_examples) < int(cli_args.audit_query_limit)
+                and int(split_seed) == int(cli_args.split_seeds[0])
+            ):
+                task_audits: Dict[str, Any] = {}
+                audit_task_names = sorted(matched_a_by_task.keys())
+                for task_name in audit_task_names:
+                    aa_scores = _score_tensor_to_list(matched_a_by_task[task_name]["scores"])
+                    ba_scores = _score_tensor_to_list(mismatched_a_by_task[task_name]["scores"])
+                    bb_scores = _score_tensor_to_list(matched_b_by_task[task_name]["scores"])
+                    ab_scores = _score_tensor_to_list(mismatched_b_by_task[task_name]["scores"])
+                    task_audits[task_name] = {
+                        "score_proto_lambda": matched_a_by_task[task_name].get("proto_lambda"),
+                        "AA": _cell_metrics_for_audit(aa_scores, a_indices, int(query_pid), gids_list, features.image_ids, a_indices),
+                        "BA": _cell_metrics_for_audit(ba_scores, a_indices, int(query_pid), gids_list, features.image_ids, b_indices),
+                        "BB": _cell_metrics_for_audit(bb_scores, b_indices, int(query_pid), gids_list, features.image_ids, b_indices),
+                        "AB": _cell_metrics_for_audit(ab_scores, b_indices, int(query_pid), gids_list, features.image_ids, a_indices),
+                    }
+                structural_audit_examples.append(
+                    {
+                        "dataset": dataset,
+                        "host_model": host_model,
+                        "query_id": query_id,
+                        "query_pid": int(query_pid),
+                        "split_seed": int(split_seed),
+                        "A_negative_ids": _context_negative_ids(a_indices, int(query_pid), gids_list, features.image_ids),
+                        "B_negative_ids": _context_negative_ids(b_indices, int(query_pid), gids_list, features.image_ids),
+                        "A_topm_ids": audit_a.get("topm_ids", []),
+                        "B_topm_ids": audit_b.get("topm_ids", []),
+                        "A_hardest_negatives_affecting_enrichment": _topm_negative_records(
+                            audit_a,
+                            int(query_pid),
+                            a_indices,
+                            gids_list,
+                            features.image_ids,
+                            full_base_for_query,
+                            int(cli_args.audit_top_k),
+                        ),
+                        "B_hardest_negatives_affecting_enrichment": _topm_negative_records(
+                            audit_b,
+                            int(query_pid),
+                            b_indices,
+                            gids_list,
+                            features.image_ids,
+                            full_base_for_query,
+                            int(cli_args.audit_top_k),
+                        ),
+                        "score_tasks": task_audits,
+                    }
+                )
+            del cache_a, cache_b, cache_union
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             if _should_log_progress(processed_seed_evals, total_seed_evals, log_interval):
@@ -2724,6 +3081,11 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
     summary["score_task"] = selected_score_task
     summary["official_best_score_task"] = official_gate_task
     summary["score_task_selection_policy"] = "official full-gallery +proto(lambda) ablation best R@1; not selected by Delta_ctx"
+    union_score_ablation_summaries = _union_score_task_summaries(union_control_rows)
+    selected_union_rows = [row for row in union_control_rows if str(row.get("score_task")) == selected_score_task]
+    union_summary = _union_summary_from_rows(selected_union_rows) if selected_union_rows else {}
+    union_summary["score_task"] = selected_score_task
+    union_summary["control_name"] = "A_union_B_candidate_gallery"
     bootstrap_ci = _bootstrap_ci(
         selected_rows,
         int(cli_args.bootstrap_seed),
@@ -2735,9 +3097,12 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
     _log("Writing output tables and manifests")
     _write_table(output_dir / "per_query_metrics.parquet", per_query_rows, fallbacks)
     _write_table(output_dir / "context_manifest.parquet", context_manifest_rows, fallbacks)
+    _write_table(output_dir / "union_control_metrics.parquet", union_control_rows, fallbacks)
     _atomic_write_jsonl(output_dir / "exclusions.jsonl", exclusions)
+    _atomic_write_jsonl(output_dir / "structural_audit_examples.jsonl", structural_audit_examples)
     _atomic_write_csv(output_dir / "per_seed_summary.csv", per_seed)
     _atomic_write_csv(output_dir / "per_score_ablation_summary.csv", list(score_ablation_summaries.values()))
+    _atomic_write_csv(output_dir / "union_score_ablation_summary.csv", list(union_score_ablation_summaries.values()))
 
     base_hash = _sha256_file(base_checkpoint)
     gate_hash = _sha256_file(gate_checkpoint)
@@ -2751,6 +3116,9 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         "per_query_rows": int(len(per_query_rows)),
         "selected_score_task_rows": int(len(selected_rows)),
         "score_ablation_task_count": int(len(score_ablation_summaries)),
+        "union_control_rows": int(len(union_control_rows)),
+        "selected_union_control_rows": int(len(selected_union_rows)),
+        "structural_audit_example_count": int(len(structural_audit_examples)),
     }
     full_gallery = {
         "protocol_base_metrics_fraction": protocol_full_base,
@@ -2812,6 +3180,18 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         "selected_context_summary_score_task": selected_score_task,
         "score_ablation_tasks": list(score_ablation_summaries.keys()),
         "score_ablation_formula": _score_ablation_description(spec, args),
+        "structural_audit": {
+            "lambda_zero_assertions": "enabled for scores, ranks, AP, positive/hardest-negative scores, and margins on each same-gallery comparison",
+            "audit_query_limit": int(cli_args.audit_query_limit),
+            "audit_top_k": int(cli_args.audit_top_k),
+            "examples_path": str(output_dir / "structural_audit_examples.jsonl"),
+        },
+        "union_control": {
+            "enabled": True,
+            "description": "Evaluates enriched_A and enriched_B on the same G_A union G_B candidate gallery for every official score-ablation task.",
+            "metrics_path": str(output_dir / "union_control_metrics.parquet"),
+            "summary_path": str(output_dir / "union_score_ablation_summary.csv"),
+        },
         "enabled_evidence_providers": str(getattr(args, "extractor_mode", "")),
         "clustering_settings": {
             "target_relative_space": getattr(args, "target_relative_space", None),
@@ -2837,6 +3217,10 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         "counts": counts,
         "aggregate": summary,
         "score_ablation_summaries": score_ablation_summaries,
+        "union_control": {
+            "aggregate": union_summary,
+            "score_ablation_summaries": union_score_ablation_summaries,
+        },
         "bootstrap_ci_95": bootstrap_ci,
         "full_gallery_reproduction": full_gallery,
         "output_fallbacks": fallbacks,
@@ -2855,6 +3239,7 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         counts,
         full_gallery,
         summary,
+        union_summary,
         bootstrap_ci,
         output_dir,
     )
