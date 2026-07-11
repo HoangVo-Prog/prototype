@@ -35,6 +35,38 @@ PROTOCOL_VERSION = "gallery_conditioned_query_v1"
 DEFAULT_SPLIT_SEEDS = [20260711, 20260712, 20260713, 20260714, 20260715]
 DEFAULT_BOOTSTRAP_SEED = 20260801
 DEFAULT_BOOTSTRAP_RESAMPLES = 1000
+DATASET_CHOICES = ("CUHK-PEDES", "ICFG-PEDES", "RSTPReid")
+DATASET_NAME_ALIASES = {
+    "cuhk-pedes": "CUHK-PEDES",
+    "cuhk_pedes": "CUHK-PEDES",
+    "cuhkpedes": "CUHK-PEDES",
+    "icfg-pedes": "ICFG-PEDES",
+    "icfg_pedes": "ICFG-PEDES",
+    "icfgpedes": "ICFG-PEDES",
+    "rstpreid": "RSTPReid",
+    "rstp-reid": "RSTPReid",
+    "rstp_reid": "RSTPReid",
+}
+DATASET_LAYOUTS = {
+    "CUHK-PEDES": {
+        "dataset_dir": "CUHK-PEDES",
+        "annotation": "reid_raw.json",
+        "image_dir": "imgs",
+        "image_key": "file_path",
+    },
+    "ICFG-PEDES": {
+        "dataset_dir": "ICFG-PEDES",
+        "annotation": "ICFG-PEDES.json",
+        "image_dir": "imgs",
+        "image_key": "file_path",
+    },
+    "RSTPReid": {
+        "dataset_dir": "RSTPReid",
+        "annotation": "data_captions.json",
+        "image_dir": "imgs",
+        "image_key": "img_path",
+    },
+}
 
 
 GATE_CONFIG_KEYS = {
@@ -317,6 +349,166 @@ def _load_host_args(base_checkpoint: Path) -> Tuple[SimpleNamespace, Dict[str, A
     return SimpleNamespace(**merged), metadata_values, metadata_source
 
 
+def _canonical_dataset_name(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text in DATASET_CHOICES:
+        return text
+    return DATASET_NAME_ALIASES.get(text.lower())
+
+
+def _dataset_validation_error(
+    reason: str,
+    selected_dataset: str,
+    provided_root_dir: Path,
+    resolved_dataset_dir: Path,
+    expected_annotation: Path,
+    expected_image_root: Path,
+) -> ValueError:
+    return ValueError(
+        "\n".join(
+            [
+                "Dataset validation failed: {}".format(reason),
+                "Selected dataset: {}".format(selected_dataset),
+                "Provided root directory: {}".format(provided_root_dir),
+                "Resolved dataset directory: {}".format(resolved_dataset_dir),
+                "Expected annotation locations: {}".format(expected_annotation),
+                "Expected image directory: {}".format(expected_image_root),
+            ]
+        )
+    )
+
+
+def _validate_gate_dataset_compatibility(gate_config_values: Dict[str, Any], requested_dataset: str) -> None:
+    for key in ("dataset_name", "dataset", "data"):
+        if key not in gate_config_values:
+            continue
+        configured = _canonical_dataset_name(gate_config_values.get(key))
+        if configured is None:
+            continue
+        if configured != requested_dataset:
+            raise ValueError(
+                "GATE config dataset conflict: --data is {}, but --config contains {}={} "
+                "({}). Use a GATE checkpoint/config trained for the requested dataset.".format(
+                    requested_dataset,
+                    key,
+                    gate_config_values.get(key),
+                    configured,
+                )
+            )
+
+
+def _split_counts_from_annotation(annotation_path: Path, split: str) -> Tuple[int, int]:
+    with annotation_path.open("r", encoding="utf-8") as handle:
+        annotations = json.load(handle)
+    if not isinstance(annotations, list):
+        raise ValueError("annotation JSON must contain a list of records")
+    rows = [row for row in annotations if isinstance(row, dict) and str(row.get("split")) == split]
+    gallery_count = len(rows)
+    query_count = 0
+    for row in rows:
+        captions = row.get("captions")
+        if isinstance(captions, list):
+            query_count += len(captions)
+    return query_count, gallery_count
+
+
+def _resolve_dataset_root(requested_dataset: str, root_dir: Path, split: str) -> Dict[str, Any]:
+    root_dir = root_dir.expanduser().resolve()
+    layout = DATASET_LAYOUTS[requested_dataset]
+    dataset_dir_name = layout["dataset_dir"]
+
+    if not root_dir.exists():
+        candidate = root_dir / dataset_dir_name
+        raise _dataset_validation_error(
+            "provided --root-dir does not exist",
+            requested_dataset,
+            root_dir,
+            candidate,
+            candidate / layout["annotation"],
+            candidate / layout["image_dir"],
+        )
+    if not root_dir.is_dir():
+        candidate = root_dir / dataset_dir_name
+        raise _dataset_validation_error(
+            "provided --root-dir is not a directory",
+            requested_dataset,
+            root_dir,
+            candidate,
+            candidate / layout["annotation"],
+            candidate / layout["image_dir"],
+        )
+
+    parent_convention_dir = root_dir / dataset_dir_name
+    parent_annotation = parent_convention_dir / layout["annotation"]
+    parent_image_root = parent_convention_dir / layout["image_dir"]
+    direct_annotation = root_dir / layout["annotation"]
+    direct_image_root = root_dir / layout["image_dir"]
+
+    if parent_annotation.is_file() and parent_image_root.is_dir():
+        loader_root = root_dir
+        dataset_dir = parent_convention_dir
+        annotation_path = parent_annotation
+        image_root = parent_image_root
+        dataset_dir_override = None
+        root_convention = "parent_contains_dataset_dir"
+    elif direct_annotation.is_file() and direct_image_root.is_dir():
+        loader_root = root_dir.parent
+        dataset_dir = root_dir
+        annotation_path = direct_annotation
+        image_root = direct_image_root
+        dataset_dir_override = str(dataset_dir) if root_dir.name != dataset_dir_name else None
+        root_convention = "direct_dataset_dir"
+    else:
+        raise _dataset_validation_error(
+            "expected annotation file and image directory were not found",
+            requested_dataset,
+            root_dir,
+            parent_convention_dir,
+            parent_annotation,
+            parent_image_root,
+        )
+
+    try:
+        query_count, gallery_count = _split_counts_from_annotation(annotation_path, split)
+    except Exception as error:
+        raise _dataset_validation_error(
+            "could not read {} split from annotation: {}".format(split, error),
+            requested_dataset,
+            root_dir,
+            dataset_dir,
+            annotation_path,
+            image_root,
+        ) from error
+    if query_count <= 0 or gallery_count <= 0:
+        raise _dataset_validation_error(
+            "{} split has no valid queries or gallery images".format(split),
+            requested_dataset,
+            root_dir,
+            dataset_dir,
+            annotation_path,
+            image_root,
+        )
+
+    return {
+        "requested_dataset": requested_dataset,
+        "resolved_dataset_name": requested_dataset,
+        "provided_root_dir": str(root_dir),
+        "resolved_root_dir": str(loader_root.resolve()),
+        "resolved_dataset_dir": str(dataset_dir.resolve()),
+        "resolved_annotation_path": str(annotation_path.resolve()),
+        "resolved_image_root": str(image_root.resolve()),
+        "dataset_split": split,
+        "number_of_queries": int(query_count),
+        "number_of_gallery_images": int(gallery_count),
+        "root_convention": root_convention,
+        "dataset_dir_override": dataset_dir_override,
+    }
+
+
 def _apply_gate_config_overlay(host_args: SimpleNamespace, gate_args: SimpleNamespace, gate_config_values: Dict[str, Any]) -> Tuple[SimpleNamespace, List[str]]:
     applied_keys: List[str] = []
     gate_keys_from_file = set(gate_config_values.keys())
@@ -347,7 +539,6 @@ def _apply_gate_config_overlay(host_args: SimpleNamespace, gate_args: SimpleName
 
 
 def _ensure_eval_defaults(args: SimpleNamespace, spec: RepoSpec, cli_args: argparse.Namespace) -> None:
-    _set_if_missing(args, "root_dir", "data")
     _set_if_missing(args, "test_batch_size", 512)
     _set_if_missing(args, "batch_size", getattr(args, "test_batch_size", 512))
     _set_if_missing(args, "num_workers", 4)
@@ -388,6 +579,28 @@ def _ensure_eval_defaults(args: SimpleNamespace, spec: RepoSpec, cli_args: argpa
     _set_if_missing(args, "eval_score_chunk_size", 0)
     _set_if_missing(args, "target_cache_batch_size", getattr(args, "test_batch_size", 512))
     _set_if_missing(args, "target_query_batch_size", getattr(args, "test_batch_size", 512))
+
+    dataset_resolution = _resolve_dataset_root(
+        cli_args.data,
+        Path(cli_args.root_dir),
+        cli_args.split,
+    )
+    args.dataset_name = cli_args.data
+    args.data = cli_args.data
+    args.root_dir = dataset_resolution["resolved_root_dir"]
+    args.requested_dataset = dataset_resolution["requested_dataset"]
+    args.resolved_dataset_name = dataset_resolution["resolved_dataset_name"]
+    args.provided_root_dir = dataset_resolution["provided_root_dir"]
+    args.resolved_root_dir = dataset_resolution["resolved_root_dir"]
+    args.resolved_dataset_dir = dataset_resolution["resolved_dataset_dir"]
+    args.resolved_annotation_path = dataset_resolution["resolved_annotation_path"]
+    args.resolved_image_root = dataset_resolution["resolved_image_root"]
+    args.dataset_split = dataset_resolution["dataset_split"]
+    args.number_of_queries = dataset_resolution["number_of_queries"]
+    args.number_of_gallery_images = dataset_resolution["number_of_gallery_images"]
+    args.dataset_root_convention = dataset_resolution["root_convention"]
+    args.dataset_dir_override = dataset_resolution["dataset_dir_override"]
+    args._dataset_resolution = dataset_resolution
 
     if isinstance(args.img_size, list):
         args.img_size = tuple(args.img_size)
@@ -619,6 +832,25 @@ def _freeze_and_eval(model: Any) -> None:
 
 def _build_eval_loaders(args: SimpleNamespace, split: str) -> Tuple[Any, Any]:
     build_dataloader = importlib.import_module("datasets").build_dataloader
+    dataset_class = None
+    old_dataset_dir = None
+    dataset_dir_override = getattr(args, "dataset_dir_override", None)
+    if dataset_dir_override:
+        try:
+            build_module = importlib.import_module("datasets.build")
+            factory = getattr(build_module, "__factory", None)
+            if isinstance(factory, dict):
+                dataset_class = factory.get(getattr(args, "dataset_name"))
+                if dataset_class is not None:
+                    old_dataset_dir = getattr(dataset_class, "dataset_dir", None)
+                    dataset_class.dataset_dir = str(dataset_dir_override)
+        except Exception as error:
+            raise RuntimeError(
+                "Could not apply direct-dataset --root-dir override for {}: {}".format(
+                    getattr(args, "dataset_name", "unknown"),
+                    error,
+                )
+            ) from error
     old_training = getattr(args, "training", False)
     old_val_dataset = getattr(args, "val_dataset", None)
     old_batch_size = getattr(args, "batch_size", None)
@@ -642,6 +874,51 @@ def _build_eval_loaders(args: SimpleNamespace, split: str) -> Tuple[Any, Any]:
             args.val_dataset = old_val_dataset
         if old_batch_size is not None:
             args.batch_size = old_batch_size
+        if dataset_class is not None and old_dataset_dir is not None:
+            dataset_class.dataset_dir = old_dataset_dir
+
+
+def _validate_loaded_eval_loaders(img_loader: Any, txt_loader: Any, args: SimpleNamespace) -> None:
+    image_dataset = getattr(img_loader, "dataset", None)
+    text_dataset = getattr(txt_loader, "dataset", None)
+    image_count = len(image_dataset) if image_dataset is not None and hasattr(image_dataset, "__len__") else 0
+    query_count = len(text_dataset) if text_dataset is not None and hasattr(text_dataset, "__len__") else 0
+    if image_count <= 0 or query_count <= 0:
+        resolution = getattr(args, "_dataset_resolution", {})
+        raise ValueError(
+            "\n".join(
+                [
+                    "Dataset loader validation failed: official loader returned an empty split",
+                    "Selected dataset: {}".format(getattr(args, "dataset_name", None)),
+                    "Provided root directory: {}".format(resolution.get("provided_root_dir")),
+                    "Resolved dataset directory: {}".format(resolution.get("resolved_dataset_dir")),
+                    "Expected annotation locations: {}".format(resolution.get("resolved_annotation_path")),
+                    "Expected image directory: {}".format(resolution.get("resolved_image_root")),
+                ]
+            )
+        )
+    resolution = getattr(args, "_dataset_resolution", {})
+    expected_root = resolution.get("resolved_image_root")
+    img_paths = getattr(image_dataset, "img_paths", None)
+    if expected_root and img_paths:
+        expected_path = Path(expected_root).resolve()
+        first_path = Path(str(img_paths[0])).expanduser().resolve()
+        try:
+            first_path.relative_to(expected_path)
+        except ValueError as error:
+            raise ValueError(
+                "\n".join(
+                    [
+                        "Dataset loader validation failed: loaded image path is outside the selected dataset image root",
+                        "Selected dataset: {}".format(getattr(args, "dataset_name", None)),
+                        "Provided root directory: {}".format(resolution.get("provided_root_dir")),
+                        "Resolved dataset directory: {}".format(resolution.get("resolved_dataset_dir")),
+                        "Expected annotation locations: {}".format(resolution.get("resolved_annotation_path")),
+                        "Expected image directory: {}".format(resolution.get("resolved_image_root")),
+                        "First loaded image path: {}".format(first_path),
+                    ]
+                )
+            ) from error
 
 
 def _core_model(model: Any) -> Any:
@@ -1698,6 +1975,18 @@ def _parse_args(spec: RepoSpec, argv: Optional[Sequence[str]]) -> argparse.Names
     parser.add_argument("--base-checkpoint", required=True, help="trained frozen TBPS host checkpoint")
     parser.add_argument("--gate-checkpoint", required=True, help="trained GATE checkpoint")
     parser.add_argument("--config", required=True, help="GATE training/evaluation config")
+    parser.add_argument(
+        "--data",
+        required=True,
+        choices=list(DATASET_CHOICES),
+        help="Dataset used for evaluation.",
+    )
+    parser.add_argument(
+        "--root-dir",
+        required=True,
+        type=Path,
+        help="Root directory of the selected evaluation dataset.",
+    )
     parser.add_argument("--output-dir", default="gallery_conditioned_query_eval")
     parser.add_argument("--device", default="auto", help="cuda when available, cpu, cuda, or cuda:N")
     if spec.supports_host_model:
@@ -1746,6 +2035,7 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
     host_args, host_metadata_values, host_settings_source = _load_host_args(base_checkpoint)
     resolved_host_args = _namespace_from_mapping(vars(host_args))
     gate_args, gate_config_values = _load_config(config_path)
+    _validate_gate_dataset_compatibility(gate_config_values, cli_args.data)
     args, applied_gate_keys = _apply_gate_config_overlay(host_args, gate_args, gate_config_values)
     args.gate_config_file = str(config_path)
     args.config_file = str(config_path)
@@ -1776,6 +2066,7 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
     _atomic_write_text(output_dir / "resolved_gate_config.yaml", _resolved_config_yaml(gate_args))
 
     img_loader, txt_loader = _build_eval_loaders(args, cli_args.split)
+    _validate_loaded_eval_loaders(img_loader, txt_loader, args)
     core = _core_model(model)
     features = _extract_features(spec, model, img_loader, txt_loader, args, repo_root)
     active_queries = _active_query_features(spec, args, features.host_text, features.alt_text)
@@ -1961,6 +2252,7 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         "official_reproduction": official_reproduction,
         "reproduction_check": reproduction_check,
     }
+    dataset_resolution = getattr(args, "_dataset_resolution", {})
     run_manifest = {
         "protocol_name": PROTOCOL_NAME,
         "protocol_version": PROTOCOL_VERSION,
@@ -1968,6 +2260,16 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         "host_model": host_model,
         "dataset": dataset,
         "split": cli_args.split,
+        "requested_dataset": dataset_resolution.get("requested_dataset"),
+        "resolved_dataset_name": dataset_resolution.get("resolved_dataset_name"),
+        "provided_root_dir": dataset_resolution.get("provided_root_dir"),
+        "resolved_root_dir": dataset_resolution.get("resolved_root_dir"),
+        "resolved_dataset_dir": dataset_resolution.get("resolved_dataset_dir"),
+        "resolved_annotation_path": dataset_resolution.get("resolved_annotation_path"),
+        "resolved_image_root": dataset_resolution.get("resolved_image_root"),
+        "dataset_split": dataset_resolution.get("dataset_split"),
+        "number_of_queries": dataset_resolution.get("number_of_queries"),
+        "number_of_gallery_images": dataset_resolution.get("number_of_gallery_images"),
         "input_paths": {
             "base_checkpoint": str(base_checkpoint),
             "gate_checkpoint": str(gate_checkpoint),

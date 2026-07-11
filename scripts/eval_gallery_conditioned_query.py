@@ -6,6 +6,8 @@ Examples:
         --base-checkpoint path/to/base_host.pth \
         --gate-checkpoint path/to/gate.pth \
         --config path/to/clip_gate_run/configs.yaml \
+        --data CUHK-PEDES \
+        --root-dir path/to/data_root \
         --output-dir runs/gallery_conditioned_clip
 
     python scripts/eval_gallery_conditioned_query.py \
@@ -13,6 +15,8 @@ Examples:
         --base-checkpoint path/to/base_host.pth \
         --gate-checkpoint path/to/gate.pth \
         --config path/to/itself_gate_run/configs.yaml \
+        --data RSTPReid \
+        --root-dir path/to/data_root \
         --output-dir runs/gallery_conditioned_itself
 """
 
