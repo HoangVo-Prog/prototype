@@ -18,6 +18,7 @@ import math
 import os
 import platform
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -1190,6 +1191,221 @@ def _score_matrix(query_features: Any, gallery_features: Any, chunk_size: int = 
     return torch.cat(chunks, dim=0)
 
 
+def _score_tensor_to_list(scores: Any) -> List[float]:
+    return [float(v) for v in scores.detach().cpu().view(-1).tolist()]
+
+
+def _scale_scores_like(scores: Any, reference: Any, eps: float = 1e-12) -> Any:
+    score_min = scores.min(dim=1, keepdim=True).values
+    score_max = scores.max(dim=1, keepdim=True).values
+    ref_min = reference.min(dim=1, keepdim=True).values
+    ref_max = reference.max(dim=1, keepdim=True).values
+    score_range = (score_max - score_min).clamp_min(eps)
+    ref_range = ref_max - ref_min
+    return (scores - score_min) / score_range * ref_range + ref_min
+
+
+def _format_lambda(value: float) -> str:
+    if abs(float(value) - round(float(value))) < 1e-12:
+        return str(int(round(float(value))))
+    return "{:.2f}".format(float(value)).rstrip("0").rstrip(".")
+
+
+def _prototype_lambdas() -> List[float]:
+    return [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+
+def _global_grab_lambdas() -> List[float]:
+    return [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.68, 0.32]
+
+
+def _metric_task_name(task: str) -> str:
+    task = str(task).replace("+", "_plus_")
+    task = task.replace("(", "_").replace(")", "")
+    task = task.replace(".", "p")
+    return re.sub(r"[^A-Za-z0-9_/-]+", "_", task).strip("_")
+
+
+def _task_metric_key(task: str, metric: str) -> str:
+    return "eval/{}-t2i/{}".format(_metric_task_name(task), metric)
+
+
+def _task_proto_lambda(task: str) -> Optional[float]:
+    match = re.search(r"\(([-+]?\d*\.?\d+)\)$", str(task))
+    return float(match.group(1)) if match else None
+
+
+def _official_base_tasks(spec: RepoSpec, args: SimpleNamespace, sims_global: Any, sims_alt: Optional[Any]) -> List[Dict[str, Any]]:
+    if spec.repo_kind == "rde":
+        if sims_alt is None:
+            raise ValueError("RDE official evaluation requires TSE/retrieval score components")
+        return [
+            {"task": "BGE", "scores": sims_global, "base_task": "BGE"},
+            {"task": "TSE", "scores": sims_alt, "base_task": "TSE"},
+            {"task": "BGE+TSE", "scores": (sims_global + sims_alt) / 2.0, "base_task": "BGE+TSE"},
+        ]
+    if spec.repo_kind == "irra":
+        if sims_alt is None:
+            raise ValueError("IRRA official evaluation requires retrieval score components")
+        return [
+            {"task": "global", "scores": sims_global, "base_task": "global"},
+            {"task": "retrieval", "scores": sims_alt, "base_task": "retrieval"},
+        ]
+    if spec.repo_kind == "adapter":
+        return [{"task": "global", "scores": sims_global, "base_task": "global"}]
+
+    base_tasks = [{"task": "global", "scores": sims_global, "base_task": "global"}]
+    if bool(getattr(args, "only_global", False)):
+        return base_tasks
+    if sims_alt is None:
+        raise ValueError("Prototype official non-global evaluation requires GRAB/TSE score components")
+    base_tasks.append({"task": "grab", "scores": sims_alt, "base_task": "grab"})
+    scaled_alt = _scale_scores_like(sims_alt, sims_global)
+    for lambda_value in _global_grab_lambdas():
+        task = "global+grab({})".format(_format_lambda(lambda_value))
+        base_tasks.append(
+            {
+                "task": task,
+                "scores": float(lambda_value) * sims_global + (1.0 - float(lambda_value)) * scaled_alt,
+                "base_task": task,
+            }
+        )
+    return base_tasks
+
+
+def _official_target_tasks(
+    spec: RepoSpec,
+    base_tasks: Sequence[Dict[str, Any]],
+    sims_target: Any,
+) -> List[Dict[str, Any]]:
+    tasks: List[Dict[str, Any]] = []
+    if spec.repo_kind == "irra":
+        base_reference = base_tasks[0] if base_tasks else {"task": "global", "scores": sims_target}
+        tasks.append(
+            {
+                "task": "target+proto(1)",
+                "scores": sims_target,
+                "base_task": base_reference["task"],
+                "base_scores": base_reference["scores"],
+                "proto_lambda": 1.0,
+            }
+        )
+
+    for proto_lambda in _prototype_lambdas():
+        proto_value = _format_lambda(proto_lambda)
+        for base in base_tasks:
+            task = "{}+proto({})".format(base["task"], proto_value)
+            if abs(proto_lambda - 1.0) < 1e-12 and spec.repo_kind in {"prototype", "adapter"}:
+                scores = sims_target
+            else:
+                scaled_base = _scale_scores_like(base["scores"], sims_target)
+                scores = (1.0 - float(proto_lambda)) * scaled_base + float(proto_lambda) * sims_target
+            tasks.append(
+                {
+                    "task": task,
+                    "scores": scores,
+                    "base_task": base["task"],
+                    "base_scores": base["scores"],
+                    "proto_lambda": float(proto_lambda),
+                }
+            )
+    return tasks
+
+
+def _official_score_tasks(
+    spec: RepoSpec,
+    args: SimpleNamespace,
+    sims_global: Any,
+    sims_alt: Optional[Any],
+    sims_target: Optional[Any] = None,
+    include_base: bool = True,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    base_tasks = _official_base_tasks(spec, args, sims_global, sims_alt)
+    output = list(base_tasks) if include_base else []
+    if sims_target is not None:
+        output.extend(_official_target_tasks(spec, base_tasks, sims_target))
+    return output, base_tasks
+
+
+def _context_base_tasks(
+    spec: RepoSpec,
+    args: SimpleNamespace,
+    host_query: Any,
+    host_gallery: Any,
+    alt_query: Optional[Any],
+    alt_gallery: Optional[Any],
+) -> List[Dict[str, Any]]:
+    import torch.nn.functional as F
+
+    sims_global = F.normalize(host_query.float(), p=2, dim=1) @ F.normalize(host_gallery.float(), p=2, dim=1).t()
+    sims_alt = None
+    if alt_query is not None and alt_gallery is not None:
+        sims_alt = F.normalize(alt_query.float(), p=2, dim=1) @ F.normalize(alt_gallery.float(), p=2, dim=1).t()
+    return _official_base_tasks(spec, args, sims_global, sims_alt)
+
+
+def _scores_by_task(tasks: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {str(task["task"]): task for task in tasks}
+
+
+def _score_ablation_description(spec: RepoSpec, args: SimpleNamespace) -> Dict[str, Any]:
+    if spec.repo_kind == "rde":
+        base_components = ["BGE", "TSE", "BGE+TSE=(BGE+TSE)/2"]
+    elif spec.repo_kind == "irra":
+        base_components = ["global", "retrieval"]
+    elif spec.repo_kind == "adapter":
+        base_components = ["global"]
+    else:
+        base_components = ["global"]
+        if not bool(getattr(args, "only_global", False)):
+            base_components.extend(
+                ["grab", "global+grab(lambda)=lambda*global+(1-lambda)*scale(grab_like_global)"]
+            )
+    return {
+        "base_components": base_components,
+        "proto_lambdas": _prototype_lambdas(),
+        "global_grab_lambdas": _global_grab_lambdas() if spec.repo_kind == "prototype" and not bool(getattr(args, "only_global", False)) else [],
+        "scale_formula": "scale(scores_like_reference)=rowwise_minmax(scores) mapped to rowwise min/max(reference)",
+        "proto_fusion_formula": "fused=(1-lambda)*scale(base_like_target)+lambda*target",
+        "official_best_policy": "select the best existing full-gallery +proto(lambda) ablation row by official R@1; do not select by Delta_ctx",
+    }
+
+
+def _best_task_from_metrics(
+    spec: RepoSpec,
+    task_metrics: Dict[str, Dict[str, float]],
+    prefer_ablation: bool = False,
+) -> Optional[str]:
+    best_task = None
+    best_r1 = None
+    for task, metrics in task_metrics.items():
+        if prefer_ablation and "+proto(" not in task:
+            continue
+        r1 = metrics.get("R1")
+        if r1 is None:
+            continue
+        if best_r1 is None:
+            best_task = task
+            best_r1 = float(r1)
+            continue
+        if spec.repo_kind == "rde":
+            is_better = float(r1) >= best_r1
+        else:
+            is_better = float(r1) > best_r1
+        if is_better:
+            best_task = task
+            best_r1 = float(r1)
+    return best_task
+
+
+def _select_task_metrics(task_metrics: Dict[str, Dict[str, float]], task: Optional[str]) -> Dict[str, float]:
+    if task and task in task_metrics:
+        return task_metrics[task]
+    if task_metrics:
+        return next(iter(task_metrics.values()))
+    return {}
+
+
 def _compute_top_indices(
     spec: RepoSpec,
     core: Any,
@@ -1319,7 +1535,9 @@ def _enrich_all_queries(
 
 
 def _ranked_metrics_for_query(scores: Sequence[float], query_pid: int, gallery_pids: Sequence[int], image_ids: Sequence[str]) -> Dict[str, Any]:
-    order = sorted(range(len(scores)), key=lambda idx: (-float(scores[idx]), str(image_ids[idx])))
+    import torch
+
+    order = [int(idx) for idx in torch.argsort(torch.as_tensor(scores, dtype=torch.float32), descending=True).tolist()]
     positives = [idx for idx, pid in enumerate(gallery_pids) if int(pid) == int(query_pid)]
     positive_set = set(positives)
     if not positive_set:
@@ -1593,6 +1811,10 @@ def _row_with_prefixed_metrics(prefix: str, metrics: Dict[str, Any]) -> Dict[str
 def _context_direction_row(
     dataset: str,
     host_model: str,
+    score_task: str,
+    score_base_task: Optional[str],
+    score_proto_lambda: Optional[float],
+    is_official_best_score_task: bool,
     query_id: str,
     query_pid: int,
     seed: int,
@@ -1613,6 +1835,10 @@ def _context_direction_row(
     row = {
         "dataset": dataset,
         "host_model": host_model,
+        "score_task": str(score_task),
+        "score_base_task": score_base_task,
+        "score_proto_lambda": score_proto_lambda,
+        "is_official_best_score_task": bool(is_official_best_score_task),
         "query_id": query_id,
         "query_pid": int(query_pid),
         "split_seed": int(seed),
@@ -1823,6 +2049,18 @@ def _per_seed_summary(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return output
 
 
+def _score_task_summaries(rows: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    output: Dict[str, Dict[str, Any]] = {}
+    for task in sorted(set(str(row.get("score_task", "")) for row in rows)):
+        task_rows = [row for row in rows if str(row.get("score_task", "")) == task]
+        summary = _summary_from_rows(task_rows)
+        summary["score_task"] = task
+        summary["score_base_task"] = task_rows[0].get("score_base_task") if task_rows else None
+        summary["score_proto_lambda"] = task_rows[0].get("score_proto_lambda") if task_rows else None
+        output[task] = summary
+    return output
+
+
 def _flatten(prefix: str, value: Any, out: Dict[str, Any]) -> None:
     if isinstance(value, dict):
         for key, subvalue in value.items():
@@ -1906,6 +2144,7 @@ def _console_report(
             summary.get("gallery_cardinality_mean"),
             summary.get("balance_A_B_base_score_ks_mean"),
         ),
+        "Official score setting for headline context metrics: {}".format(summary.get("score_task")),
         "Matched metrics: R@1={} R@5={} R@10={} mAP={}".format(
             _format_percent(summary.get("matched_R1")),
             _format_percent(summary.get("matched_R5")),
@@ -2030,48 +2269,33 @@ def _run_official_reproduction(
 
 def _compare_reproduction(
     spec: RepoSpec,
-    protocol_base: Dict[str, float],
-    protocol_gate: Dict[str, float],
+    protocol_base_by_task: Dict[str, Dict[str, float]],
+    protocol_gate_by_task: Dict[str, Dict[str, float]],
     official: Dict[str, Any],
 ) -> Dict[str, Any]:
     if official.get("status") != "ok":
         return {"status": "not_checked", "reason": official.get("error", "official reproduction failed")}
-    base_keys = {
-        "irra": "eval/global-t2i/{}",
-        "rde": "eval/BGE-t2i/{}",
-        "adapter": "eval/global-t2i/{}",
-        "prototype": "eval/global-t2i/{}",
-    }
-    gate_keys = {
-        "irra": "eval/target_plus_proto_1-t2i/{}",
-        "rde": "eval/BGE_plus_proto_1-t2i/{}",
-        "adapter": "eval/global_plus_proto_1-t2i/{}",
-        "prototype": "eval/global_plus_proto_1-t2i/{}",
-    }
-    base_template = base_keys.get(spec.repo_kind)
-    gate_template = gate_keys.get(spec.repo_kind)
     checks = []
-    for metric in ("R1", "R5", "R10", "mAP"):
-        official_base_value = official.get("base_metrics_percent", {}).get(base_template.format(metric)) if base_template else None
-        official_gate_value = official.get("gate_metrics_percent", {}).get(gate_template.format(metric)) if gate_template else None
-        if official_base_value is not None and metric in protocol_base:
-            checks.append(
-                {
-                    "name": "base_{}".format(metric),
-                    "protocol_percent": 100.0 * protocol_base[metric],
-                    "official_percent": float(official_base_value),
-                    "abs_diff_pp": abs(100.0 * protocol_base[metric] - float(official_base_value)),
-                }
-            )
-        if official_gate_value is not None and metric in protocol_gate:
-            checks.append(
-                {
-                    "name": "gate_{}".format(metric),
-                    "protocol_percent": 100.0 * protocol_gate[metric],
-                    "official_percent": float(official_gate_value),
-                    "abs_diff_pp": abs(100.0 * protocol_gate[metric] - float(official_gate_value)),
-                }
-            )
+    for group_name, protocol_by_task, official_key in [
+        ("base", protocol_base_by_task, "base_metrics_percent"),
+        ("gate", protocol_gate_by_task, "gate_metrics_percent"),
+    ]:
+        official_metrics = official.get(official_key, {})
+        for task, protocol_metrics in protocol_by_task.items():
+            for metric in ("R1", "R5", "R10", "mAP"):
+                official_value = official_metrics.get(_task_metric_key(task, metric))
+                if official_value is None or metric not in protocol_metrics:
+                    continue
+                checks.append(
+                    {
+                        "name": "{}_{}_{}".format(group_name, task, metric),
+                        "score_task": task,
+                        "metric": metric,
+                        "protocol_percent": 100.0 * protocol_metrics[metric],
+                        "official_percent": float(official_value),
+                        "abs_diff_pp": abs(100.0 * protocol_metrics[metric] - float(official_value)),
+                    }
+                )
     if not checks:
         return {"status": "not_checked", "reason": "no comparable official metric keys found"}
     tolerance = 0.02
@@ -2230,12 +2454,18 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
     _log("Building and finalizing full-gallery target cache")
     full_cache = _subset_and_finalize_cache(core, features.raw_target_cache, features.gids, all_gallery_indices, device)
     full_retrieval = _cache_retrieval_features(full_cache)
-    _log("Computing full-gallery frozen-base scores")
-    active_queries_norm = F.normalize(active_queries.float(), p=2, dim=1)
-    frozen_base_queries = F.normalize(features.host_text.float(), p=2, dim=1)
-    frozen_base_gallery = F.normalize(features.host_image.float(), p=2, dim=1)
-    frozen_base_scores = _score_matrix(frozen_base_queries, frozen_base_gallery, int(cli_args.gallery_chunk_size))
-    _log("Computing full-gallery GATE-enriched scores")
+    _log("Computing full-gallery official base score components")
+    host_queries_norm = F.normalize(features.host_text.float(), p=2, dim=1)
+    host_gallery_norm = F.normalize(features.host_image.float(), p=2, dim=1)
+    full_global_scores = _score_matrix(host_queries_norm, host_gallery_norm, int(cli_args.gallery_chunk_size))
+    full_alt_scores = None
+    if features.alt_text is not None and features.alt_image is not None:
+        full_alt_scores = _score_matrix(
+            F.normalize(features.alt_text.float(), p=2, dim=1),
+            F.normalize(features.alt_image.float(), p=2, dim=1),
+            int(cli_args.gallery_chunk_size),
+        )
+    _log("Computing full-gallery GATE-enriched target score component")
     full_enriched, _ = _enrich_all_queries(
         spec,
         core,
@@ -2249,13 +2479,48 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         log_interval=log_interval,
     )
     full_enriched_norm = F.normalize(full_enriched.float(), p=2, dim=1)
-    full_gate_scores = _score_matrix(full_enriched_norm, full_retrieval, int(cli_args.gallery_chunk_size))
-    protocol_full_base = _matrix_metrics(frozen_base_scores, features.qids, features.gids, features.image_ids)
-    protocol_full_gate = _matrix_metrics(full_gate_scores, features.qids, features.gids, features.image_ids)
-    _log("Full-gallery protocol metrics computed")
+    full_target_scores = _score_matrix(full_enriched_norm, full_retrieval, int(cli_args.gallery_chunk_size))
+    full_gate_tasks, full_base_tasks = _official_score_tasks(
+        spec,
+        args,
+        full_global_scores,
+        full_alt_scores,
+        full_target_scores,
+        include_base=True,
+    )
+    protocol_full_base_by_task = {
+        task["task"]: _matrix_metrics(task["scores"], features.qids, features.gids, features.image_ids)
+        for task in full_base_tasks
+    }
+    protocol_full_gate_by_task = {
+        task["task"]: _matrix_metrics(task["scores"], features.qids, features.gids, features.image_ids)
+        for task in full_gate_tasks
+    }
+    full_base_score_by_task = {task["task"]: task["scores"] for task in full_base_tasks}
+    _log(
+        "Full-gallery protocol metrics computed: base_tasks={} gate_tasks={}".format(
+            len(protocol_full_base_by_task),
+            len(protocol_full_gate_by_task),
+        )
+    )
 
     official_reproduction = _run_official_reproduction(spec, model, img_loader, txt_loader, args)
-    reproduction_check = _compare_reproduction(spec, protocol_full_base, protocol_full_gate, official_reproduction)
+    official_base_task = official_reproduction.get("base_best_task")
+    if official_base_task not in protocol_full_base_by_task:
+        official_base_task = _best_task_from_metrics(spec, protocol_full_base_by_task)
+    official_gate_eval_best_task = official_reproduction.get("gate_best_task")
+    official_gate_task = _best_task_from_metrics(spec, protocol_full_gate_by_task, prefer_ablation=True)
+    if official_gate_task not in protocol_full_gate_by_task:
+        official_gate_task = official_gate_eval_best_task if official_gate_eval_best_task in protocol_full_gate_by_task else None
+    protocol_full_base = _select_task_metrics(protocol_full_base_by_task, official_base_task)
+    protocol_full_gate = _select_task_metrics(protocol_full_gate_by_task, official_gate_task)
+    frozen_base_scores = full_base_score_by_task.get(str(official_base_task), next(iter(full_base_score_by_task.values())))
+    reproduction_check = _compare_reproduction(
+        spec,
+        protocol_full_base_by_task,
+        protocol_full_gate_by_task,
+        official_reproduction,
+    )
     if official_reproduction.get("status") == "failed" or reproduction_check.get("status") == "failed":
         _log("Full-gallery reproduction check failed; writing failure summary")
         _atomic_write_json(
@@ -2265,12 +2530,21 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
                 "reason": "full-gallery reproduction check failed",
                 "reproduction_check": reproduction_check,
                 "official_reproduction": official_reproduction,
-                "protocol_full_base": protocol_full_base,
-                "protocol_full_gate": protocol_full_gate,
+                "protocol_full_base_by_task": protocol_full_base_by_task,
+                "protocol_full_gate_by_task": protocol_full_gate_by_task,
+                "official_base_task": official_base_task,
+                "official_gate_task": official_gate_task,
+                "official_gate_eval_best_task": official_gate_eval_best_task,
             },
         )
         raise RuntimeError("Full-gallery reproduction check failed; see summary.json")
-    _log("Full-gallery reproduction check status: {}".format(reproduction_check.get("status")))
+    _log(
+        "Full-gallery reproduction check status: {}; official_base_task={} official_gate_task={}".format(
+            reproduction_check.get("status"),
+            official_base_task,
+            official_gate_task,
+        )
+    )
 
     if cli_args.save_features:
         _log("Saving raw feature tensors")
@@ -2336,16 +2610,25 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
             enriched_b = _enrich_query_features(spec, core, args, cache_b, active_query, host_query, alt_query, top_b)
             retrieval_a = _cache_retrieval_features(cache_a)
             retrieval_b = _cache_retrieval_features(cache_b)
-            base_query_norm = F.normalize(active_query.float(), p=2, dim=1)
             enriched_a_norm = F.normalize(enriched_a.float(), p=2, dim=1)
             enriched_b_norm = F.normalize(enriched_b.float(), p=2, dim=1)
 
-            base_a_scores = [full_base_for_query[idx] for idx in a_indices]
-            base_b_scores = [full_base_for_query[idx] for idx in b_indices]
-            matched_aa_scores = (enriched_a_norm @ retrieval_a.t()).view(-1).detach().cpu().tolist()
-            mismatched_ba_scores = (enriched_b_norm @ retrieval_a.t()).view(-1).detach().cpu().tolist()
-            matched_bb_scores = (enriched_b_norm @ retrieval_b.t()).view(-1).detach().cpu().tolist()
-            mismatched_ab_scores = (enriched_a_norm @ retrieval_b.t()).view(-1).detach().cpu().tolist()
+            index_a = torch.as_tensor(a_indices, dtype=torch.long)
+            index_b = torch.as_tensor(b_indices, dtype=torch.long)
+            host_gallery_a = features.host_image.index_select(0, index_a)
+            host_gallery_b = features.host_image.index_select(0, index_b)
+            alt_gallery_a = features.alt_image.index_select(0, index_a) if features.alt_image is not None else None
+            alt_gallery_b = features.alt_image.index_select(0, index_b) if features.alt_image is not None else None
+            base_tasks_a = _context_base_tasks(spec, args, host_query, host_gallery_a, alt_query, alt_gallery_a)
+            base_tasks_b = _context_base_tasks(spec, args, host_query, host_gallery_b, alt_query, alt_gallery_b)
+            target_aa_scores = enriched_a_norm @ retrieval_a.t()
+            target_ba_scores = enriched_b_norm @ retrieval_a.t()
+            target_bb_scores = enriched_b_norm @ retrieval_b.t()
+            target_ab_scores = enriched_a_norm @ retrieval_b.t()
+            matched_a_tasks = _official_target_tasks(spec, base_tasks_a, target_aa_scores)
+            mismatched_a_by_task = _scores_by_task(_official_target_tasks(spec, base_tasks_a, target_ba_scores))
+            matched_b_tasks = _official_target_tasks(spec, base_tasks_b, target_bb_scores)
+            mismatched_b_by_task = _scores_by_task(_official_target_tasks(spec, base_tasks_b, target_ab_scores))
 
             audit_a = _topm_audit(top_a, a_indices, int(query_pid), gids_list, features.image_ids, full_base_for_query)
             audit_b = _topm_audit(top_b, b_indices, int(query_pid), gids_list, features.image_ids, full_base_for_query)
@@ -2353,46 +2636,66 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
             audit_b["top_m_configured"] = audit_a["top_m_configured"]
             query_measurements = _query_measurements(active_query, enriched_a, enriched_b)
 
-            per_query_rows.append(
-                _context_direction_row(
-                    dataset,
-                    host_model,
-                    query_id,
-                    int(query_pid),
-                    int(split_seed),
-                    "A",
-                    a_indices,
-                    base_a_scores,
-                    matched_aa_scores,
-                    mismatched_ba_scores,
-                    gids_list,
-                    features.image_ids,
-                    balance,
-                    query_measurements,
-                    audit_a,
-                    audit_b,
+            for task_info in matched_a_tasks:
+                task_name = str(task_info["task"])
+                mismatch_info = mismatched_a_by_task[task_name]
+                base_scores_tensor = task_info.get("base_scores")
+                if base_scores_tensor is None:
+                    base_scores_tensor = base_tasks_a[0]["scores"]
+                per_query_rows.append(
+                    _context_direction_row(
+                        dataset,
+                        host_model,
+                        task_name,
+                        task_info.get("base_task"),
+                        task_info.get("proto_lambda"),
+                        task_name == official_gate_task,
+                        query_id,
+                        int(query_pid),
+                        int(split_seed),
+                        "A",
+                        a_indices,
+                        _score_tensor_to_list(base_scores_tensor),
+                        _score_tensor_to_list(task_info["scores"]),
+                        _score_tensor_to_list(mismatch_info["scores"]),
+                        gids_list,
+                        features.image_ids,
+                        balance,
+                        query_measurements,
+                        audit_a,
+                        audit_b,
+                    )
                 )
-            )
-            per_query_rows.append(
-                _context_direction_row(
-                    dataset,
-                    host_model,
-                    query_id,
-                    int(query_pid),
-                    int(split_seed),
-                    "B",
-                    b_indices,
-                    base_b_scores,
-                    matched_bb_scores,
-                    mismatched_ab_scores,
-                    gids_list,
-                    features.image_ids,
-                    balance,
-                    query_measurements,
-                    audit_a,
-                    audit_b,
+            for task_info in matched_b_tasks:
+                task_name = str(task_info["task"])
+                mismatch_info = mismatched_b_by_task[task_name]
+                base_scores_tensor = task_info.get("base_scores")
+                if base_scores_tensor is None:
+                    base_scores_tensor = base_tasks_b[0]["scores"]
+                per_query_rows.append(
+                    _context_direction_row(
+                        dataset,
+                        host_model,
+                        task_name,
+                        task_info.get("base_task"),
+                        task_info.get("proto_lambda"),
+                        task_name == official_gate_task,
+                        query_id,
+                        int(query_pid),
+                        int(split_seed),
+                        "B",
+                        b_indices,
+                        _score_tensor_to_list(base_scores_tensor),
+                        _score_tensor_to_list(task_info["scores"]),
+                        _score_tensor_to_list(mismatch_info["scores"]),
+                        gids_list,
+                        features.image_ids,
+                        balance,
+                        query_measurements,
+                        audit_a,
+                        audit_b,
+                    )
                 )
-            )
             del cache_a, cache_b
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -2413,21 +2716,28 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         raise RuntimeError("No query rows were produced; all queries were excluded")
 
     _log("Aggregating per-query rows and bootstrap confidence intervals")
-    summary = _summary_from_rows(per_query_rows)
-    summary["gallery_cardinality_mean"] = _mean(row.get("gallery_cardinality") for row in per_query_rows)
+    score_ablation_summaries = _score_task_summaries(per_query_rows)
+    selected_score_task = str(official_gate_task) if official_gate_task in score_ablation_summaries else next(iter(score_ablation_summaries))
+    selected_rows = [row for row in per_query_rows if str(row.get("score_task")) == selected_score_task]
+    summary = _summary_from_rows(selected_rows)
+    summary["gallery_cardinality_mean"] = _mean(row.get("gallery_cardinality") for row in selected_rows)
+    summary["score_task"] = selected_score_task
+    summary["official_best_score_task"] = official_gate_task
+    summary["score_task_selection_policy"] = "official full-gallery +proto(lambda) ablation best R@1; not selected by Delta_ctx"
     bootstrap_ci = _bootstrap_ci(
-        per_query_rows,
+        selected_rows,
         int(cli_args.bootstrap_seed),
         int(cli_args.bootstrap_resamples),
         log_interval=log_interval,
     )
-    per_seed = _per_seed_summary(per_query_rows)
+    per_seed = _per_seed_summary(selected_rows)
     fallbacks: Dict[str, str] = {}
     _log("Writing output tables and manifests")
     _write_table(output_dir / "per_query_metrics.parquet", per_query_rows, fallbacks)
     _write_table(output_dir / "context_manifest.parquet", context_manifest_rows, fallbacks)
     _atomic_write_jsonl(output_dir / "exclusions.jsonl", exclusions)
     _atomic_write_csv(output_dir / "per_seed_summary.csv", per_seed)
+    _atomic_write_csv(output_dir / "per_score_ablation_summary.csv", list(score_ablation_summaries.values()))
 
     base_hash = _sha256_file(base_checkpoint)
     gate_hash = _sha256_file(gate_checkpoint)
@@ -2439,10 +2749,17 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         "gallery_image_count": int(len(features.image_ids)),
         "context_manifest_rows": int(len(context_manifest_rows)),
         "per_query_rows": int(len(per_query_rows)),
+        "selected_score_task_rows": int(len(selected_rows)),
+        "score_ablation_task_count": int(len(score_ablation_summaries)),
     }
     full_gallery = {
         "protocol_base_metrics_fraction": protocol_full_base,
         "protocol_gate_metrics_fraction": protocol_full_gate,
+        "protocol_base_metrics_by_task_fraction": protocol_full_base_by_task,
+        "protocol_gate_metrics_by_task_fraction": protocol_full_gate_by_task,
+        "official_base_task": official_base_task,
+        "official_gate_task": official_gate_task,
+        "official_gate_eval_best_task": official_gate_eval_best_task,
         "official_reproduction": official_reproduction,
         "reproduction_check": reproduction_check,
     }
@@ -2489,6 +2806,12 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         "bootstrap_seed": int(cli_args.bootstrap_seed),
         "bootstrap_resamples": int(cli_args.bootstrap_resamples),
         "top_m": int(getattr(getattr(core, "target_enricher"), "top_m", getattr(args, "top_m", 0))),
+        "official_base_score_task": official_base_task,
+        "official_gate_score_task": official_gate_task,
+        "official_gate_eval_best_task": official_gate_eval_best_task,
+        "selected_context_summary_score_task": selected_score_task,
+        "score_ablation_tasks": list(score_ablation_summaries.keys()),
+        "score_ablation_formula": _score_ablation_description(spec, args),
         "enabled_evidence_providers": str(getattr(args, "extractor_mode", "")),
         "clustering_settings": {
             "target_relative_space": getattr(args, "target_relative_space", None),
@@ -2513,6 +2836,7 @@ def run_gallery_conditioned_query(spec: RepoSpec, argv: Optional[Sequence[str]] 
         "metrics_unit": "fraction",
         "counts": counts,
         "aggregate": summary,
+        "score_ablation_summaries": score_ablation_summaries,
         "bootstrap_ci_95": bootstrap_ci,
         "full_gallery_reproduction": full_gallery,
         "output_fallbacks": fallbacks,
