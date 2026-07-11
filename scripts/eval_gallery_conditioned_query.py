@@ -3,16 +3,18 @@
 Examples:
     python scripts/eval_gallery_conditioned_query.py \
         --host-model clip \
-        --config configs/clip_base.yaml \
         --base-checkpoint path/to/base_host.pth \
+        --base-config path/to/clip_base_run/configs.yaml \
         --gate-checkpoint path/to/gate.pth \
+        --config path/to/clip_gate_run/configs.yaml \
         --output-dir runs/gallery_conditioned_clip
 
     python scripts/eval_gallery_conditioned_query.py \
         --host-model itself \
-        --config configs/itself_base.yaml \
         --base-checkpoint path/to/base_host.pth \
+        --base-config path/to/itself_base_run/configs.yaml \
         --gate-checkpoint path/to/gate.pth \
+        --config path/to/itself_gate_run/configs.yaml \
         --output-dir runs/gallery_conditioned_itself
 """
 
@@ -45,4 +47,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
