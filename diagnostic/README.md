@@ -51,6 +51,52 @@ Required outputs include per-gallery results, paired cue-swap results,
 hardness-matched control results, cue-swap minus control deltas, validity
 counts, and cluster-bootstrap confidence intervals over query clusters.
 
+## Cue Galleries And Hardness Audit
+
+For each valid `(case_id, query_id, trial_id)`, the two Cue galleries share one
+neutral distractor set. Both galleries contain the complete positive set for
+the query identity; only the cue-dense distractor subset differs between
+`a_dense` and `b_dense`.
+
+The HM control approximately matches retriever-score difficulty. Residual
+top-rank mismatch is audited using hardest-negative scores,
+positive-negative margins, and a fixed tight-match robustness subset.
+HM replaces the complete distractor set independently for each direction; it
+does not replace only the cue-dense subset and it does not need to share
+distractors across `hm_a` and `hm_b`.
+
+Per-gallery results report:
+
+```text
+best_positive_score
+max_negative_score
+positive_negative_margin
+negative_score_scale
+```
+
+Paired delta results additionally report signed and normalized Cue-versus-HM
+hardness gaps plus:
+
+```text
+tight_hardness_match
+tight_hardness_z_tolerance
+```
+
+Use:
+
+```bash
+--tight_hardness_z_tolerance 0.10
+```
+
+The default is `0.10`. The tight-hardness subset is a robustness analysis and
+does not replace the primary Cue-minus-HM Top-1 flip result over all valid
+trials. Runs also write:
+
+```text
+hardness_audit_with_ci.csv
+tight_hardness_summary_with_ci.csv
+```
+
 ## Bootstrap Units
 
 The diagnostic supports two cluster-bootstrap units:
