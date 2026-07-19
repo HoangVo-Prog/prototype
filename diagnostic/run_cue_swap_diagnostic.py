@@ -24,6 +24,7 @@ if __package__ is None or __package__ == "":
 
 from diagnostic.audit import (
     build_hardness_audit_with_ci,
+    build_residual_hardness_adjusted_summary_with_ci,
     build_tight_hardness_summary_with_ci,
     log_validity_warnings,
 )
@@ -932,6 +933,7 @@ def main() -> None:
         paired_delta_df,
         bootstrap_iters=args.bootstrap_iters,
         bootstrap_seed=args.bootstrap_seed,
+        retriever_name=args.retriever_name,
     )
     tight_hardness_summary_ci = build_tight_hardness_summary_with_ci(
         paired_delta_df,
@@ -940,10 +942,17 @@ def main() -> None:
         bootstrap_iters=args.bootstrap_iters,
         bootstrap_seed=args.bootstrap_seed,
     )
+    residual_hardness_adjusted_summary_ci = build_residual_hardness_adjusted_summary_with_ci(
+        paired_delta_df,
+        retriever_name=args.retriever_name,
+        bootstrap_iters=args.bootstrap_iters,
+        bootstrap_seed=args.bootstrap_seed,
+    )
     logger.info(
-        "Hardness audit summaries built rows=%d tight_rows=%d tolerance=%.4f",
+        "Hardness audit summaries built rows=%d tight_rows=%d residual_rows=%d tolerance=%.4f",
         len(hardness_audit_ci),
         len(tight_hardness_summary_ci),
+        len(residual_hardness_adjusted_summary_ci),
         args.tight_hardness_z_tolerance,
     )
     write_started = time.perf_counter()
@@ -962,6 +971,7 @@ def main() -> None:
         summary_ci_by_unit,
         hardness_audit_ci,
         tight_hardness_summary_ci,
+        residual_hardness_adjusted_summary_ci,
         skipped_rows,
         gallery_rows,
         args.save_galleries,

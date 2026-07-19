@@ -92,6 +92,9 @@ def paired_hardness_gaps(
         abs(a_normalized_max_negative_gap),
         abs(b_normalized_max_negative_gap),
     )
+    mean_normalized_max_negative_gap = 0.5 * (
+        a_normalized_max_negative_gap + b_normalized_max_negative_gap
+    )
     tight_hardness_match = bool(
         np.isfinite(a_normalized_max_negative_gap)
         and np.isfinite(b_normalized_max_negative_gap)
@@ -108,6 +111,7 @@ def paired_hardness_gaps(
         "mean_abs_max_negative_gap": float(mean_abs_max_negative_gap),
         "a_normalized_max_negative_gap": float(a_normalized_max_negative_gap),
         "b_normalized_max_negative_gap": float(b_normalized_max_negative_gap),
+        "mean_normalized_max_negative_gap": float(mean_normalized_max_negative_gap),
         "max_abs_normalized_max_negative_gap": float(max_abs_normalized),
         "tight_hardness_match": tight_hardness_match,
     }

@@ -34,6 +34,7 @@ OUTPUT_FILES = {
     "summary_ci_case_query": "summary_with_ci_case_query.csv",
     "hardness_audit_ci": "hardness_audit_with_ci.csv",
     "tight_hardness_summary_ci": "tight_hardness_summary_with_ci.csv",
+    "residual_hardness_adjusted_summary_ci": "residual_hardness_adjusted_summary_with_ci.csv",
     "skipped": "skipped_queries.jsonl",
     "galleries": "galleries.jsonl",
 }
@@ -169,6 +170,7 @@ PAIRED_DELTA_COLUMNS = [
     "mean_abs_max_negative_gap",
     "a_normalized_max_negative_gap",
     "b_normalized_max_negative_gap",
+    "mean_normalized_max_negative_gap",
     "max_abs_normalized_max_negative_gap",
     "tight_hardness_match",
     "tight_hardness_z_tolerance",
@@ -181,6 +183,8 @@ HARDNESS_AUDIT_METRICS = (
     "mean_signed_max_negative_gap",
     "mean_signed_margin_gap",
     "mean_abs_max_negative_gap",
+    "mean_signed_normalized_max_negative_gap",
+    "mean_max_abs_normalized_max_negative_gap",
 )
 
 TIGHT_HARDNESS_METRICS = (
@@ -212,6 +216,11 @@ SUMMARY_CI_COLUMNS = [
     "trial_count",
 ]
 
+HARDNESS_AUDIT_COLUMNS = [
+    "retriever",
+    *SUMMARY_CI_COLUMNS,
+]
+
 TIGHT_HARDNESS_SUMMARY_COLUMNS = [
     "retriever",
     "tight_hardness_z_tolerance",
@@ -220,4 +229,29 @@ TIGHT_HARDNESS_SUMMARY_COLUMNS = [
     "tight_case_query_count",
     "tight_trial_rate",
     *SUMMARY_CI_COLUMNS,
+]
+
+RESIDUAL_HARDNESS_ADJUSTED_METRICS = (
+    "raw_delta_r1_flip",
+    "adjusted_delta_r1_flip_at_zero_gap",
+    "hardness_slope_delta_per_z",
+    "adjustment_change",
+)
+
+RESIDUAL_HARDNESS_ADJUSTED_SUMMARY_COLUMNS = [
+    "retriever",
+    "metric",
+    "mean",
+    "ci_low",
+    "ci_high",
+    "bootstrap_iters",
+    "valid_bootstrap_iters",
+    "bootstrap_unit",
+    "cluster_count",
+    "unique_query_count",
+    "case_query_count",
+    "trial_count",
+    "outcome",
+    "covariate",
+    "model",
 ]

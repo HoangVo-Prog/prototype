@@ -78,9 +78,15 @@ Paired delta results additionally report signed and normalized Cue-versus-HM
 hardness gaps plus:
 
 ```text
+mean_normalized_max_negative_gap
 tight_hardness_match
 tight_hardness_z_tolerance
 ```
+
+`mean_normalized_max_negative_gap` is the average of the A and B direction-wise
+hardest-negative gaps on the query-specific normalized retriever-score scale.
+Positive values mean the Cue galleries have harder maximum negatives on
+average; negative values mean the HM galleries are harder.
 
 Use:
 
@@ -95,7 +101,41 @@ trials. Runs also write:
 ```text
 hardness_audit_with_ci.csv
 tight_hardness_summary_with_ci.csv
+residual_hardness_adjusted_summary_with_ci.csv
 ```
+
+The hardness audit includes raw-score residual metrics and normalized rows:
+
+```text
+mean_signed_normalized_max_negative_gap
+mean_max_abs_normalized_max_negative_gap
+```
+
+`residual_hardness_adjusted_summary_with_ci.csv` reports a simple paired linear
+sensitivity adjustment:
+
+```text
+delta_r1_flip = alpha + beta * mean_normalized_max_negative_gap + error
+```
+
+`adjusted_delta_r1_flip_at_zero_gap` is the intercept `alpha`. The adjusted
+intercept estimates the Cue-minus-HM Top-1 flip difference at zero signed
+normalized residual hardness under a linear sensitivity model.
+`hardness_slope_delta_per_z` is the fitted slope in delta-flip units per
+normalized score unit. This is a robustness/sensitivity analysis; it does not
+prove causal removal of hardness confounding, and it does not imply perfect
+hardness matching.
+
+Paper-facing interpretation:
+
+> We report both the unadjusted Cue-minus-HM flip difference and its linearly
+> adjusted estimate at zero normalized residual hardest-negative gap. A similar
+> adjusted estimate indicates that the measured residual hardness imbalance
+> does not account for the observed difference.
+
+A large raw-to-adjusted change would instead indicate sensitivity and should be
+reported directly. The adjustment does not remove every possible notion of
+retrieval difficulty.
 
 ## Bootstrap Units
 

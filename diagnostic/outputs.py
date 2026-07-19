@@ -11,11 +11,13 @@ import pandas as pd
 
 from diagnostic.config import jsonable, write_json
 from diagnostic.constants import (
+    HARDNESS_AUDIT_COLUMNS,
     OUTPUT_FILES,
     PAIRED_CUE_COLUMNS,
     PAIRED_DELTA_COLUMNS,
     PAIRED_HM_COLUMNS,
     PER_GALLERY_COLUMNS,
+    RESIDUAL_HARDNESS_ADJUSTED_SUMMARY_COLUMNS,
     SELECTED_QUERY_COLUMNS,
     SUMMARY_CI_COLUMNS,
     TIGHT_HARDNESS_SUMMARY_COLUMNS,
@@ -68,6 +70,7 @@ def write_run_outputs(
     summary_ci_by_unit: Mapping[str, pd.DataFrame],
     hardness_audit_ci: pd.DataFrame,
     tight_hardness_summary_ci: pd.DataFrame,
+    residual_hardness_adjusted_summary_ci: pd.DataFrame,
     skipped_rows: Sequence[Mapping[str, Any]],
     gallery_rows: Sequence[Mapping[str, Any]],
     save_galleries: bool,
@@ -101,11 +104,16 @@ def write_run_outputs(
         summary_ci_by_unit["case_query"].reindex(columns=SUMMARY_CI_COLUMNS).to_csv(
             output_dir / OUTPUT_FILES["summary_ci_case_query"], index=False
         )
-    hardness_audit_ci.reindex(columns=SUMMARY_CI_COLUMNS).to_csv(
+    hardness_audit_ci.reindex(columns=HARDNESS_AUDIT_COLUMNS).to_csv(
         output_dir / OUTPUT_FILES["hardness_audit_ci"], index=False
     )
     tight_hardness_summary_ci.reindex(columns=TIGHT_HARDNESS_SUMMARY_COLUMNS).to_csv(
         output_dir / OUTPUT_FILES["tight_hardness_summary_ci"], index=False
+    )
+    residual_hardness_adjusted_summary_ci.reindex(
+        columns=RESIDUAL_HARDNESS_ADJUSTED_SUMMARY_COLUMNS
+    ).to_csv(
+        output_dir / OUTPUT_FILES["residual_hardness_adjusted_summary_ci"], index=False
     )
     write_jsonl(output_dir / OUTPUT_FILES["skipped"], skipped_rows)
     if save_galleries:
@@ -123,6 +131,7 @@ def write_run_outputs(
         "summary_ci": summary_ci,
         "hardness_audit_ci": hardness_audit_ci,
         "tight_hardness_summary_ci": tight_hardness_summary_ci,
+        "residual_hardness_adjusted_summary_ci": residual_hardness_adjusted_summary_ci,
     }
 
 
