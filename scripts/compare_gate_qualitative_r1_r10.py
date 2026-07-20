@@ -11,6 +11,8 @@ Example:
       --base_checkpoint /path/to/base_retriever.pth \
       --gate_checkpoint /path/to/gate_best.pth \
       --output_dir /path/to/qualitative_output \
+      --dataset RSTPReid \
+      --root_dir /path/to/dataset_parent \
       --selection_metric R1 \
       --num_figs 30 \
       --top_k 10 \
@@ -236,7 +238,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_json", action="store_true", help="Also save ranking_results.json and selected_results.json.")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--seed", type=int, default=None, help="Explicit seed override. Defaults to the GATE config/checkpoint args.")
-    parser.add_argument("--data", choices=list(DATASET_CHOICES), default=None, help="Explicit dataset override.")
+    parser.add_argument(
+        "--dataset",
+        "--data",
+        dest="data",
+        choices=list(DATASET_CHOICES),
+        default=None,
+        help="Explicit dataset override.",
+    )
     parser.add_argument("--root_dir", type=Path, default=None, help="Explicit dataset root override.")
     parser.add_argument("--split", choices=("test", "val"), default="test")
     parser.add_argument("--host_model", choices=("clip", "itself"), default=None, help="Explicit host-model override.")
