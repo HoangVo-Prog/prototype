@@ -890,7 +890,25 @@ def matrix_gib(rows: int, cols: int, dtype_bytes: int = 4) -> float:
     return float(rows) * float(cols) * float(dtype_bytes) / float(1024**3)
 
 
-def lazy_base_task_specs(args: SimpleNamespace, has_alt_scores: bool) -> List[Dict[str, Any]]:
+def lazy_base_task_specs(spec: RepoSpec, args: SimpleNamespace, has_alt_scores: bool) -> List[Dict[str, Any]]:
+    if spec.repo_kind == "rde":
+        if not has_alt_scores:
+            raise ValueError("RDE official evaluation requires TSE/retrieval score components")
+        return [
+            {"task": "BGE", "base_task": "BGE", "kind": "global"},
+            {"task": "TSE", "base_task": "TSE", "kind": "alt"},
+            {"task": "BGE+TSE", "base_task": "BGE+TSE", "kind": "avg_global_alt"},
+        ]
+    if spec.repo_kind == "irra":
+        if not has_alt_scores:
+            raise ValueError("IRRA official evaluation requires retrieval score components")
+        return [
+            {"task": "global", "base_task": "global", "kind": "global"},
+            {"task": "retrieval", "base_task": "retrieval", "kind": "alt"},
+        ]
+    if spec.repo_kind == "adapter":
+        return [{"task": "global", "base_task": "global", "kind": "global"}]
+
     base_tasks: List[Dict[str, Any]] = [{"task": "global", "base_task": "global", "kind": "global"}]
     if bool(getattr(args, "only_global", False)):
         return base_tasks
@@ -915,9 +933,18 @@ def lazy_gate_task_specs(
     args: SimpleNamespace,
     base_tasks: Sequence[Mapping[str, Any]],
 ) -> List[Dict[str, Any]]:
-    if spec.repo_kind != "prototype":
-        raise ValueError("compare_gate_qualitative_r1_r10.py currently targets the prototype GATE pipeline")
     gate_tasks: List[Dict[str, Any]] = []
+    if spec.repo_kind == "irra":
+        base_reference = dict(base_tasks[0]) if base_tasks else {"task": "global", "base_task": "global", "kind": "global"}
+        gate_tasks.append(
+            {
+                "task": "target+proto(1)",
+                "base_task": str(base_reference["task"]),
+                "base_spec": base_reference,
+                "proto_lambda": 1.0,
+                "kind": "target_only",
+            }
+        )
     for proto_lambda in _prototype_lambdas():
         proto_value = _format_lambda(proto_lambda)
         for base in base_tasks:
@@ -938,12 +965,14 @@ def memory_safe_official_task_specs(
     args: SimpleNamespace,
     components: ScoreComponents,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    base_tasks = lazy_base_task_specs(args, components.alt_scores is not None)
+    base_tasks = lazy_base_task_specs(spec, args, components.alt_scores is not None)
     gate_tasks = lazy_gate_task_specs(spec, args, base_tasks)
     return gate_tasks, base_tasks
 
 
-def get_scaled_alt_like_global(components: ScoreComponents, args: SimpleNamespace) -> Optional[torch.Tensor]:
+def get_scaled_alt_like_global(spec: RepoSpec, components: ScoreComponents, args: SimpleNamespace) -> Optional[torch.Tensor]:
+    if spec.repo_kind != "prototype":
+        return None
     if bool(getattr(args, "only_global", False)):
         return None
     if components.alt_scores is None:
@@ -960,10 +989,14 @@ def compute_base_task_scores(
     kind = str(task.get("kind", "global"))
     if kind == "global":
         return components.global_scores
-    if kind == "grab":
+    if kind in {"grab", "alt"}:
         if components.alt_scores is None:
-            raise ValueError("Base task grab requires alternate/GRAB scores")
+            raise ValueError("Base task {} requires alternate/retrieval scores".format(task.get("task", kind)))
         return components.alt_scores
+    if kind == "avg_global_alt":
+        if components.alt_scores is None:
+            raise ValueError("Base task {} requires alternate/retrieval scores".format(task.get("task", kind)))
+        return ((components.global_scores + components.alt_scores) / 2.0).detach().cpu().float()
     if kind == "global_grab":
         if scaled_alt_like_global is None:
             raise ValueError("Base task global+grab requires scaled alternate scores")
@@ -977,6 +1010,8 @@ def compute_gate_task_scores(
     components: ScoreComponents,
     scaled_alt_like_global: Optional[torch.Tensor],
 ) -> torch.Tensor:
+    if str(task.get("kind", "")) == "target_only":
+        return components.target_scores
     proto_lambda = float(task.get("proto_lambda", 0.0))
     if abs(proto_lambda - 1.0) < 1e-12:
         return components.target_scores
@@ -988,7 +1023,6 @@ def compute_gate_task_scores(
     scaled_base.mul_(1.0 - proto_lambda)
     scaled_base.add_(components.target_scores, alpha=proto_lambda)
     return scaled_base
-
 
 def release_transient_score(score: Optional[torch.Tensor], components: ScoreComponents) -> None:
     if score is None:
@@ -2109,7 +2143,7 @@ def main() -> None:
             g_count,
         )
     )
-    scaled_alt_like_global = get_scaled_alt_like_global(components, args)
+    scaled_alt_like_global = get_scaled_alt_like_global(spec, components, args)
     _log("Building official score-task candidate descriptors")
     gate_tasks, base_tasks = memory_safe_official_task_specs(spec, args, components)
     combinations, filter_metadata = discover_combinations(
