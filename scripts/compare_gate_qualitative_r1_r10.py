@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import hashlib
 import importlib
 import json
@@ -67,22 +68,23 @@ from gallery_conditioned_query_common import (  # noqa: E402
     _ensure_eval_defaults,
     _extract_features,
     _freeze_and_eval,
+    _format_lambda,
+    _global_grab_lambdas,
     _infer_num_classes_from_state_dict,
     _json_safe,
     _load_base_and_gate,
     _load_config,
     _load_host_args,
     _log,
-    _matrix_metrics,
-    _official_score_tasks,
     _repo_root_from_spec,
     _resolve_device,
     _resolve_dataset_root,
     _resolved_config_yaml,
     _run_official_reproduction,
-    _score_ablation_description,
     _score_matrix,
     _sha256_file,
+    _prototype_lambdas,
+    _scale_scores_like,
     _subset_and_finalize_cache,
     _torch_load_checkpoint,
     _validate_gate_dataset_compatibility,
@@ -884,6 +886,119 @@ def task_settings(task: Mapping[str, Any], args: SimpleNamespace) -> Dict[str, A
     return settings
 
 
+def matrix_gib(rows: int, cols: int, dtype_bytes: int = 4) -> float:
+    return float(rows) * float(cols) * float(dtype_bytes) / float(1024**3)
+
+
+def lazy_base_task_specs(args: SimpleNamespace, has_alt_scores: bool) -> List[Dict[str, Any]]:
+    base_tasks: List[Dict[str, Any]] = [{"task": "global", "base_task": "global", "kind": "global"}]
+    if bool(getattr(args, "only_global", False)):
+        return base_tasks
+    if not has_alt_scores:
+        raise ValueError("Prototype ITSELF non-global evaluation requires GRAB/TSE score components")
+    base_tasks.append({"task": "grab", "base_task": "grab", "kind": "grab"})
+    for lambda_value in _global_grab_lambdas():
+        task = "global+grab({})".format(_format_lambda(lambda_value))
+        base_tasks.append(
+            {
+                "task": task,
+                "base_task": task,
+                "kind": "global_grab",
+                "global_grab_lambda": float(lambda_value),
+            }
+        )
+    return base_tasks
+
+
+def lazy_gate_task_specs(
+    spec: RepoSpec,
+    args: SimpleNamespace,
+    base_tasks: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    if spec.repo_kind != "prototype":
+        raise ValueError("compare_gate_qualitative_r1_r10.py currently targets the prototype GATE pipeline")
+    gate_tasks: List[Dict[str, Any]] = []
+    for proto_lambda in _prototype_lambdas():
+        proto_value = _format_lambda(proto_lambda)
+        for base in base_tasks:
+            task = "{}+proto({})".format(base["task"], proto_value)
+            gate_tasks.append(
+                {
+                    "task": task,
+                    "base_task": str(base["task"]),
+                    "base_spec": dict(base),
+                    "proto_lambda": float(proto_lambda),
+                }
+            )
+    return gate_tasks
+
+
+def memory_safe_official_task_specs(
+    spec: RepoSpec,
+    args: SimpleNamespace,
+    components: ScoreComponents,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    base_tasks = lazy_base_task_specs(args, components.alt_scores is not None)
+    gate_tasks = lazy_gate_task_specs(spec, args, base_tasks)
+    return gate_tasks, base_tasks
+
+
+def get_scaled_alt_like_global(components: ScoreComponents, args: SimpleNamespace) -> Optional[torch.Tensor]:
+    if bool(getattr(args, "only_global", False)):
+        return None
+    if components.alt_scores is None:
+        raise ValueError("Cannot build global+grab score tasks without alternate/GRAB scores")
+    _log("Preparing one reusable rowwise-scaled GRAB score matrix for global+grab candidates")
+    return _scale_scores_like(components.alt_scores, components.global_scores).detach().cpu().float()
+
+
+def compute_base_task_scores(
+    task: Mapping[str, Any],
+    components: ScoreComponents,
+    scaled_alt_like_global: Optional[torch.Tensor],
+) -> torch.Tensor:
+    kind = str(task.get("kind", "global"))
+    if kind == "global":
+        return components.global_scores
+    if kind == "grab":
+        if components.alt_scores is None:
+            raise ValueError("Base task grab requires alternate/GRAB scores")
+        return components.alt_scores
+    if kind == "global_grab":
+        if scaled_alt_like_global is None:
+            raise ValueError("Base task global+grab requires scaled alternate scores")
+        lambda_value = float(task["global_grab_lambda"])
+        return (lambda_value * components.global_scores + (1.0 - lambda_value) * scaled_alt_like_global).detach().cpu().float()
+    raise ValueError("Unknown base score-task kind: {}".format(kind))
+
+
+def compute_gate_task_scores(
+    task: Mapping[str, Any],
+    components: ScoreComponents,
+    scaled_alt_like_global: Optional[torch.Tensor],
+) -> torch.Tensor:
+    proto_lambda = float(task.get("proto_lambda", 0.0))
+    if abs(proto_lambda - 1.0) < 1e-12:
+        return components.target_scores
+    base_scores = compute_base_task_scores(task["base_spec"], components, scaled_alt_like_global)
+    if abs(proto_lambda) < 1e-12:
+        return base_scores
+    scaled_base = _scale_scores_like(base_scores, components.target_scores).detach().cpu().float()
+    release_transient_score(base_scores, components)
+    scaled_base.mul_(1.0 - proto_lambda)
+    scaled_base.add_(components.target_scores, alpha=proto_lambda)
+    return scaled_base
+
+
+def release_transient_score(score: Optional[torch.Tensor], components: ScoreComponents) -> None:
+    if score is None:
+        return
+    borrowed = score is components.global_scores or score is components.alt_scores or score is components.target_scores
+    if not borrowed:
+        del score
+        gc.collect()
+
+
 def _extract_combination_names(value: Any) -> List[str]:
     if value is None:
         return []
@@ -994,28 +1109,44 @@ def discover_combinations(
     return resolved, filter_metadata
 
 
-def metrics_percent(scores: torch.Tensor, qids: torch.Tensor, gids: torch.Tensor) -> Dict[str, float]:
+def metrics_percent(scores: torch.Tensor, qids: torch.Tensor, gids: torch.Tensor, query_chunk_size: int = 256) -> Dict[str, float]:
     similarity = scores.detach().cpu().float()
     qids = qids.detach().cpu().long()
     gids = gids.detach().cpu().long()
-    indices = torch.argsort(similarity, dim=1, descending=True)
-    pred_labels = gids[indices.cpu()]
-    matches = pred_labels.eq(qids.view(-1, 1))
-    max_rank = min(10, matches.shape[1])
-    all_cmc = matches[:, :max_rank].cumsum(1)
-    all_cmc[all_cmc > 1] = 1
-    all_cmc = all_cmc.float().mean(0) * 100
-    num_rel = matches.sum(1)
-    if bool((num_rel <= 0).any().item()):
-        raise ValueError("At least one query has no positive gallery image; official retrieval metrics are undefined")
-    tmp_cmc = matches.cumsum(1)
-    last_rel_rank = (tmp_cmc != num_rel.view(-1, 1)).sum(1) + 1
-    m_inp = (num_rel.float() / last_rel_rank.float()).mean() * 100
-    rank_positions = torch.arange(1, tmp_cmc.shape[1] + 1, dtype=torch.float32).view(1, -1)
-    ap_curve = tmp_cmc.float()
-    ap_curve.div_(rank_positions)
-    ap_curve.mul_(matches)
-    m_ap = (ap_curve.sum(1) / num_rel).mean() * 100
+    if similarity.shape[0] != qids.numel() or similarity.shape[1] != gids.numel():
+        raise ValueError("Metric score matrix shape does not match query/gallery ids")
+    max_rank = min(10, similarity.shape[1])
+    cmc_sum = torch.zeros(max_rank, dtype=torch.float64)
+    ap_sum = 0.0
+    minp_sum = 0.0
+    total_queries = int(qids.numel())
+    step = max(1, int(query_chunk_size))
+    rank_positions = torch.arange(1, similarity.shape[1] + 1, dtype=torch.float32).view(1, -1)
+
+    for start in range(0, total_queries, step):
+        end = min(total_queries, start + step)
+        chunk_scores = similarity[start:end]
+        chunk_qids = qids[start:end]
+        indices = torch.argsort(chunk_scores, dim=1, descending=True)
+        pred_labels = gids[indices.cpu()]
+        matches = pred_labels.eq(chunk_qids.view(-1, 1))
+        num_rel = matches.sum(1)
+        if bool((num_rel <= 0).any().item()):
+            raise ValueError("At least one query has no positive gallery image; official retrieval metrics are undefined")
+        all_cmc = matches[:, :max_rank].cumsum(1)
+        all_cmc[all_cmc > 1] = 1
+        cmc_sum += all_cmc.float().sum(0).double()
+        tmp_cmc = matches.cumsum(1)
+        last_rel_rank = (tmp_cmc != num_rel.view(-1, 1)).sum(1) + 1
+        minp_sum += float((num_rel.float() / last_rel_rank.float()).sum().item())
+        ap_curve = tmp_cmc.float()
+        ap_curve.div_(rank_positions)
+        ap_curve.mul_(matches)
+        ap_sum += float((ap_curve.sum(1) / num_rel).sum().item())
+
+    all_cmc = cmc_sum / float(total_queries) * 100.0
+    m_ap = ap_sum / float(total_queries) * 100.0
+    m_inp = minp_sum / float(total_queries) * 100.0
 
     def recall_at(k: int) -> float:
         return float(all_cmc[min(k, max_rank) - 1].item())
@@ -1024,8 +1155,8 @@ def metrics_percent(scores: torch.Tensor, qids: torch.Tensor, gids: torch.Tensor
         "R1": recall_at(1),
         "R5": recall_at(5),
         "R10": recall_at(10),
-        "mAP": float(m_ap.item()),
-        "mINP": float(m_inp.item()),
+        "mAP": float(m_ap),
+        "mINP": float(m_inp),
     }
 
 
@@ -1034,6 +1165,8 @@ def evaluate_combinations(
     qids: torch.Tensor,
     gids: torch.Tensor,
     continue_on_error: bool,
+    components: Optional[ScoreComponents] = None,
+    scaled_alt_like_global: Optional[torch.Tensor] = None,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for index, combination in enumerate(combinations):
@@ -1045,8 +1178,13 @@ def evaluate_combinations(
             "selected": False,
         }
         row.update({key: value for key, value in combination["settings"].items() if key not in {"gate_inference"}})
+        scores = None
         try:
-            metrics = metrics_percent(combination["task"]["scores"], qids, gids)
+            if components is None:
+                scores = combination["task"]["scores"]
+            else:
+                scores = compute_gate_task_scores(combination["task"], components, scaled_alt_like_global)
+            metrics = metrics_percent(scores, qids, gids)
             row.update(metrics)
             row["rSum"] = float(metrics["R1"] + metrics["R5"] + metrics["R10"])
         except Exception as error:
@@ -1054,6 +1192,9 @@ def evaluate_combinations(
                 raise
             row["status"] = "error"
             row["error"] = str(error)
+        finally:
+            if components is not None:
+                release_transient_score(scores, components)
         rows.append(row)
     return rows
 
@@ -1089,6 +1230,8 @@ def select_baseline_task(
     gids: torch.Tensor,
     requested_task: Optional[str],
     official_reproduction: Mapping[str, Any],
+    components: Optional[ScoreComponents] = None,
+    scaled_alt_like_global: Optional[torch.Tensor] = None,
 ) -> Tuple[str, Dict[str, float], torch.Tensor, Dict[str, Any]]:
     base_by_name = {str(task["task"]): task for task in base_tasks}
     if requested_task:
@@ -1104,17 +1247,23 @@ def select_baseline_task(
         else:
             base_rows = []
             for task in base_tasks:
-                metrics = metrics_percent(task["scores"], qids, gids)
+                if components is None:
+                    scores = task["scores"]
+                else:
+                    scores = compute_base_task_scores(task, components, scaled_alt_like_global)
+                metrics = metrics_percent(scores, qids, gids)
+                if components is not None:
+                    release_transient_score(scores, components)
                 base_rows.append({"task": str(task["task"]), **metrics})
             selected = sorted(base_rows, key=lambda row: (-row["R1"], -row["mAP"], -row["R5"], -row["R10"], row["task"]))[0]
             selected_name = selected["task"]
             policy = {"source": "reconstructed_best_base_task", "official_task": official_task}
-    metrics = metrics_percent(base_by_name[selected_name]["scores"], qids, gids)
-    return selected_name, metrics, base_by_name[selected_name]["scores"].detach().cpu().float(), policy
-
-
-def protocol_metrics_by_task(tasks: Sequence[Mapping[str, Any]], qids: torch.Tensor, gids: torch.Tensor, image_ids: Sequence[str]) -> Dict[str, Dict[str, float]]:
-    return {str(task["task"]): _matrix_metrics(task["scores"], qids, gids, image_ids) for task in tasks}
+    if components is None:
+        selected_scores = base_by_name[selected_name]["scores"].detach().cpu().float()
+    else:
+        selected_scores = compute_base_task_scores(base_by_name[selected_name], components, scaled_alt_like_global).detach().cpu().float()
+    metrics = metrics_percent(selected_scores, qids, gids)
+    return selected_name, metrics, selected_scores, policy
 
 
 def top_list_values(
@@ -1226,8 +1375,6 @@ def compute_query_rows(
         raise ValueError("Similarity column count does not match gallery metadata")
 
     display_k = min(display_k, baseline_sim.shape[1])
-    baseline_indices = torch.argsort(baseline_sim, dim=1, descending=True)
-    gate_indices = torch.argsort(gate_sim, dim=1, descending=True)
     rows: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
@@ -1244,9 +1391,11 @@ def compute_query_rows(
             )
             continue
 
+        baseline_order = torch.argsort(baseline_sim[query_index], descending=True)
+        gate_order = torch.argsort(gate_sim[query_index], descending=True)
         baseline_stats = row_stats_for_model(
             baseline_sim[query_index],
-            baseline_indices[query_index],
+            baseline_order,
             query_pid,
             gallery_pids,
             image_paths,
@@ -1254,7 +1403,7 @@ def compute_query_rows(
         )
         gate_stats = row_stats_for_model(
             gate_sim[query_index],
-            gate_indices[query_index],
+            gate_order,
             query_pid,
             gallery_pids,
             image_paths,
@@ -1950,15 +2099,19 @@ def main() -> None:
             cache_status["status"] = "saved"
             _log("Saved inference cache: {}".format(cache_path))
 
-    _log("Building official score-task candidates")
-    gate_tasks, base_tasks = _official_score_tasks(
-        spec,
-        args,
-        components.global_scores,
-        components.alt_scores,
-        components.target_scores,
-        include_base=True,
+    q_count = int(components.qids.numel())
+    g_count = int(components.gids.numel())
+    _log(
+        "One full similarity matrix is {:.2f} GiB at float32 (queries={} gallery={}); "
+        "using memory-safe lazy score-task evaluation".format(
+            matrix_gib(q_count, g_count),
+            q_count,
+            g_count,
+        )
     )
+    scaled_alt_like_global = get_scaled_alt_like_global(components, args)
+    _log("Building official score-task candidate descriptors")
+    gate_tasks, base_tasks = memory_safe_official_task_specs(spec, args, components)
     combinations, filter_metadata = discover_combinations(
         gate_tasks,
         args,
@@ -1972,6 +2125,8 @@ def main() -> None:
         components.qids,
         components.gids,
         cli_args.continue_on_combination_error,
+        components,
+        scaled_alt_like_global,
     )
     selected_row, tie_break = select_best_combination(combination_rows, cli_args.selection_metric)
     for row in combination_rows:
@@ -1984,7 +2139,11 @@ def main() -> None:
 
     combination_by_name = {str(combination["name"]): combination for combination in combinations}
     selected_combination = combination_by_name[str(selected_row["combination_name"])]
-    selected_gate_scores = selected_combination["task"]["scores"].detach().cpu().float()
+    selected_gate_scores = compute_gate_task_scores(
+        selected_combination["task"],
+        components,
+        scaled_alt_like_global,
+    ).detach().cpu().float()
     selected_gate_metrics = {
         key: float(selected_row[key])
         for key in ("R1", "R5", "R10", "mAP", "mINP")
@@ -1995,11 +2154,31 @@ def main() -> None:
     reproduction_check: Dict[str, Any]
     if cli_args.skip_official_check:
         official_reproduction = {"status": "skipped", "reason": "--skip_official_check"}
-        reproduction_check = {"status": "skipped", "reason": "--skip_official_check"}
     else:
         official_reproduction = _run_official_reproduction(spec, model, img_loader, txt_loader, args)
-        protocol_base = protocol_metrics_by_task(base_tasks, components.qids, components.gids, components.image_ids)
-        protocol_gate = protocol_metrics_by_task(gate_tasks, components.qids, components.gids, components.image_ids)
+
+    baseline_task, baseline_metrics, baseline_scores, baseline_policy = select_baseline_task(
+        base_tasks,
+        components.qids,
+        components.gids,
+        cli_args.baseline_task,
+        official_reproduction,
+        components,
+        scaled_alt_like_global,
+    )
+    if cli_args.skip_official_check:
+        reproduction_check = {"status": "skipped", "reason": "--skip_official_check"}
+    else:
+        protocol_base = {baseline_task: {key: float(value) / 100.0 for key, value in baseline_metrics.items() if key in {"R1", "R5", "R10", "mAP", "mINP"}}}
+        protocol_gate = {
+            str(row["score_task"]): {
+                key: float(row[key]) / 100.0
+                for key in ("R1", "R5", "R10", "mAP", "mINP")
+                if key in row and row.get("status") == "ok"
+            }
+            for row in combination_rows
+            if row.get("status") == "ok"
+        }
         reproduction_check = _compare_reproduction(spec, protocol_base, protocol_gate, official_reproduction)
         if official_reproduction.get("status") == "failed" or reproduction_check.get("status") == "failed":
             _atomic_write_json(
@@ -2011,14 +2190,6 @@ def main() -> None:
                 },
             )
             raise RuntimeError("Official evaluator reproduction check failed; see summary.json")
-
-    baseline_task, baseline_metrics, baseline_scores, baseline_policy = select_baseline_task(
-        base_tasks,
-        components.qids,
-        components.gids,
-        cli_args.baseline_task,
-        official_reproduction,
-    )
     selected_cache_info = None
     if cli_args.cache_inference:
         selected_cache_info = save_selected_score_cache(
